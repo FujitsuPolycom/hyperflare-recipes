@@ -4,10 +4,42 @@
 
 """Kimi K3 MXFP4-CSF preparation capacities and serving defaults."""
 
+import json
 from pathlib import Path
 from types import MappingProxyType
 
 from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
+
+
+def _exl3_mxfp8_savings(metadata: Path) -> dict[str, int]:
+    """Estimate Kimi's aligned KDA/attention/shared projection savings by scope for EXL3 checkpoints."""
+    config_path = metadata / "config.json"
+    if not config_path.is_file():
+        return {}
+    raw = json.loads(config_path.read_text())
+    if not isinstance(raw, dict):
+        return {}
+    c = raw.get("text_config", {})
+    if not isinstance(c, dict):
+        return {}
+    quant = raw.get("quantization_config") or c.get("quantization_config")
+    if not isinstance(quant, dict) or quant.get("quant_method") != "exl3":
+        return {}
+    hidden, layers = c["hidden_size"], c["num_hidden_layers"]
+    linear = c["linear_attn_config"]
+    kda_columns = linear["num_heads"] * 128
+    attention_columns = c["num_attention_heads"] * 128
+    kda_layers = len(linear["kda_layers"])
+    kda_input_elements = kda_layers * hidden * (4 * kda_columns + 128 + linear["num_heads"])
+    kda_all_elements = kda_input_elements + kda_layers * hidden * kda_columns
+    all_elements = hidden * (3 * kda_layers * kda_columns
+        + 2 * (kda_layers * kda_columns + (layers - kda_layers) * attention_columns)
+        + 3 * (layers - c["first_k_dense_replace"]) * c["num_shared_experts"] * c["moe_intermediate_size"])
+    return {
+        "kda-input": 2 * kda_input_elements * 7 // 16,
+        "kda-all": 2 * kda_all_elements * 7 // 16,
+        "all": 2 * all_elements * 3 // 8,
+    }
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -90,7 +122,8 @@ RECIPE = Recipe(
     verification_rows=0,
     # KDA, MLA except batched key/value, shared experts, latent MoE projections, and the DSpark
     # draft's context projection, attention outputs and MLPs may load as MXFP8.
-    online_mxfp8=True, online_mxfp8_scopes=("all", "kda-input"),
+    online_mxfp8=True, online_mxfp8_scopes=("all", "kda-input", "kda-all"),
+    replacement_online_mxfp8_savings=_exl3_mxfp8_savings,
     # Decode and verification run each MoE layer's shared experts beside its routing and routed experts.
     stream_overlap=True,
     # Text-only plans, as vLLM serves Kimi K3 with --language-model-only, leave the MoonViT encoder unloaded.
