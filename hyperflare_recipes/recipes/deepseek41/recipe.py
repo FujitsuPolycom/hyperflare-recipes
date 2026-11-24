@@ -39,7 +39,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, kernel_cache=kernel_cache,
         dspark=speculation is not None,
         stream_overlap=plan.stream_overlap, expert_scale_compression=plan.expert_scale_compression,
-        mla_compute_mode=plan.mla_compute_mode, **drafting)
+        mla_compute_mode=plan.mla_compute_mode,
+        row_shard_prefill=plan.row_shard_prefill, **drafting)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
@@ -68,6 +69,7 @@ RECIPE = Recipe(
     # Single-row decode runs the shared expert on an auxiliary stream.
     stream_overlap=True,
     joint_tuning=True, vocabulary_parallel_world_sizes=(4, 6),
+    row_shard_prefill_world_sizes=(4,),
     ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, 8 << 30) for world in (3, 4, 6)}),
     plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, 8 << 30) for world in (3, 4, 6)}),
 )
