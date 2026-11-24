@@ -351,3 +351,16 @@
     `recipes/qwen38/vision.py` binds checkpoint BF16 projections through
     `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
     in `hyperflare_recipes/components/linear.py`; SM103 execution is unqualified.
+
+[ ] Validate DeepSeek V4.1 valid-token MoE routing (`num_valid_tokens` in
+    `recipes/deepseek41/decoder.py`) through a TP4 `deepseek-v4.1-flash` core
+    export and `flare run` serving replay across partial decode, speculative
+    verification, and prefill capacities, and wire `num_valid_tokens` into the
+    remaining `PreparedRouter` recipes (`deepseek4` on non-prefill modes, where
+    prefill currently masks `ids` via `metadata.positions >= 0`; `glm53`,
+    `kimi3`, `mimo_v2`, and `step5`, which pass `correction_bias` without
+    `num_valid_tokens`; and `qwen38`, which calls unbiased `PreparedRouter`
+    without `num_valid_tokens`). Single-GPU SM120 compiled-layer replay is
+    verified in `tests/recipes/test_deepseek41_valid_token_routing_cuda.py`.
+    Close when TP4 `deepseek-v4.1-flash` serving passes on hardware and each
+    remaining recipe forwards `metadata.live_counts[:1]`.

@@ -271,7 +271,8 @@ class PreparedLayer:
                 score_func=text["scoring_func"], renormalize=text["norm_topk_prob"],
                 routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
                 image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
-                image_mask=None if self.image_mask is None else self.image_mask[:h])
+                image_mask=None if self.image_mask is None else self.image_mask[:h],
+                num_valid_tokens=metadata.live_counts[:1])
             self.experts = PreparedRoutedExperts(ffn_hc_scratch.normalized, weights.experts.experts,
                 router_scratch.ids, router_scratch.weights, s.routed[:h], session=session, name=name + ".experts",
                 workspace=workspace, router_plan=self.router.plan)
@@ -324,7 +325,7 @@ class PreparedLayer:
                 score_func=text["scoring_func"], renormalize=text["norm_topk_prob"],
                 routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
                 image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
-                image_mask=self.image_mask)
+                image_mask=self.image_mask, num_valid_tokens=metadata.live_counts[:1])
             self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.experts, s.router.ids,
                 s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
                 router_plan=self.router.plan)
@@ -542,9 +543,10 @@ class PreparedLayer:
             next_mix_a = torch.empty_like(attn_mix_a)
             res_a, post_a, comb_a, norm_a = self.ffn_hc(
                 att_a, res_a, post_a, comb_a, pre_mix=attn_mix_a, pre_out=next_mix_a)
+            valid = metadata.live_counts[:1]
             mask_a = None if image_mask is None else image_mask[:h]
             logits_a = self.router_projection(norm_a)
-            route_a = self.router(logits_a, image_mask=mask_a)
+            route_a = self.router(logits_a, image_mask=mask_a, num_valid_tokens=valid.clamp(0, h))
             routed_a = self.experts(norm_a, route_a.ids, route_a.weights, router_logits=logits_a,
                 selected_logits=route_a.selected_logits, image_mask=mask_a)
             shared_a = self.shared(norm_a)
@@ -557,7 +559,7 @@ class PreparedLayer:
                 att_b, res_b, post_b, comb_b, pre_mix=attn_mix_b, pre_out=next_mix_b)
             mask_b = None if image_mask is None else image_mask[h:]
             logits_b = self.router_projection(norm_b)
-            route_b = self.router(logits_b, image_mask=mask_b)
+            route_b = self.router(logits_b, image_mask=mask_b, num_valid_tokens=(valid - h).clamp(0, h))
             routed_b = self.experts(norm_b, route_b.ids, route_b.weights, router_logits=logits_b,
                 selected_logits=route_b.selected_logits, image_mask=mask_b)
             shared_b = self.shared(norm_b)
@@ -603,7 +605,7 @@ class PreparedLayer:
                 attention_output, residual, post, comb, pre_mix=attn_mix)
             pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
             router_logits = self.router_projection(normalized)
-            route = self.router(router_logits, image_mask=image_mask)
+            route = self.router(router_logits, image_mask=image_mask, num_valid_tokens=metadata.live_counts[:1])
             routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
                                   selected_logits=route.selected_logits, image_mask=image_mask,
                                   prequant_a_values=prequant_v, prequant_a_scales=prequant_s)
@@ -629,7 +631,7 @@ class PreparedLayer:
             pre_mix=attn_mix, pre_out=next_mix)
         pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
         router_logits = self.router_projection(normalized)
-        route = self.router(router_logits, image_mask=image_mask)
+        route = self.router(router_logits, image_mask=image_mask, num_valid_tokens=metadata.live_counts[:1])
         routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
                               selected_logits=route.selected_logits, image_mask=image_mask)
         shared = (self.shared(normalized) if self.concurrent_shared is None
