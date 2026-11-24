@@ -13,9 +13,9 @@ from functools import partial
 import torch
 from b12x.attention import paged_kv_write, qsa
 from b12x.preparation import PreparationSession, PreparedCall
-from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
 
 from hyperflare_recipes.components import sm103
+from hyperflare_recipes.components.head_norm_rope import qk_head_norm_mrope
 from hyperflare_recipes.components.sm103_sparse_attention import PARTIAL_ROWS, SPLIT_ROWS, PreparedSparseAttention
 from hyperflare_recipes.components.linear import ParallelProjections, QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.fixtures import qsa as qsa_fixtures
@@ -188,6 +188,19 @@ class QSAScratch:
                             for field in self.__dataclass_fields__))
 
 
+@dataclass(frozen=True)
+class RowGatherStage:
+    """Local row-split QSA work completed before the cross-rank group-ID gather."""
+
+    gate: torch.Tensor
+    query: torch.Tensor
+    metadata: object
+    bindings: dict
+    dynamic: dict
+    common_constants: list
+    send: torch.Tensor
+
+
 class PreparedAttention:
     """All Python tensor composition executes during warmup and graph capture.
 
@@ -210,6 +223,21 @@ class PreparedAttention:
         self.module, self.scratch, self.state = module, scratch, state
         self.metadata, self.rotary = metadata, rotary
         self.tokens = source.shape[0]
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNorm
+
+        q_norm, k_norm = module.q_norm, module.k_norm
+        if (not isinstance(q_norm, (Qwen4ExpTextRMSNorm, torch.nn.RMSNorm))
+                or type(q_norm) is not type(k_norm)
+                or getattr(q_norm, "group_size", None) is not None
+                or getattr(k_norm, "group_size", None) is not None
+                or type(q_norm.eps) not in (int, float)
+                or not (q_norm.eps >= 0)
+                or q_norm.eps != k_norm.eps):
+            raise ValueError(
+                "QSA fused Q/K RMSNorm requires matching ungrouped Qwen4ExpTextRMSNorm or "
+                "torch.nn.RMSNorm modules with nonnegative numeric eps"
+            )
+        self._qk_norm_zero_centered = isinstance(q_norm, Qwen4ExpTextRMSNorm)
         if source.shape != scratch.output.shape or source.dtype != torch.bfloat16:
             raise ValueError("QSA source must match BF16 [token_capacity, 2560] output")
         if bool((metadata.request_ids != -1).any().item()) or bool((metadata.slot_mapping != -1).any().item()):
@@ -399,7 +427,67 @@ class PreparedAttention:
         self.scratch = self.metadata = self.index_query = self.index_key = None
         self.binding = self.binding_kwargs = self.write_kwargs = self.workspace = None
 
+    def _prepare_qkv_runtime(self, projected_qkv: torch.Tensor, metadata):
+        q_width = self.q_heads * 512
+        kv_width = self.kv_heads * 256
+        gate = projected_qkv[:, :q_width].view(self.tokens, self.q_heads, 512)[..., 256:]
+        value = projected_qkv[:, q_width + kv_width:].view(self.tokens, self.kv_heads, 256)
+        query, key = qk_head_norm_mrope(
+            projected_qkv,
+            self.module.q_norm.weight,
+            self.module.k_norm.weight,
+            metadata.rope_positions,
+            self.rotary.cos,
+            self.rotary.sin,
+            q_heads=self.q_heads,
+            kv_heads=self.kv_heads,
+            eps=self.module.q_norm.eps,
+            zero_centered=self._qk_norm_zero_centered,
+        )
+        return query, gate, key, value
+
+    def pre_gather_runtime(self, source: torch.Tensor, metadata) -> RowGatherStage:
+        """Run local QKV/index projections, KV/compressed cache updates, and row-split selection."""
+        if self.cache_only or self.sharded is None or self.sharded.mode != "row":
+            raise ValueError("pre_gather_runtime requires non-cache-only row-split QSA")
+        projected_index = self.projections["indexer.index_qk_proj"](source)
+        projected_qkv = self.projections["qkv_proj"](source)
+        query, gate, key, value = self._prepare_qkv_runtime(projected_qkv, metadata)
+        paged_kv_write.run(self.writer, key=key, value=value, k_cache=self.state.main_k_cache,
+            v_cache=self.state.main_v_cache, slot_mapping=metadata.slot_mapping,
+            k_scale=self.constants["k_descale"], v_scale=self.constants["v_descale"])
+        attended = torch.empty((self.tokens, self.q_heads, 256), dtype=source.dtype, device=source.device)
+        selected = torch.empty((self.tokens, 2051), dtype=torch.int32, device=source.device)
+        bindings = {**self.constants, "main_block_table": metadata.main_block_table,
+            "compressed_block_table": metadata.compressed_block_table,
+            "raw_state_slot_ids": metadata.raw_state_slot_ids, "output": attended,
+            "selected_positions": selected}
+        dynamic = {"query": query, "index_query": projected_index[:, :512].view(self.tokens, 4, 128),
+            "raw_index_key": projected_index[:, 512:], **{name: getattr(metadata, name) for name in
+                ("request_ids", "query_positions", "rope_positions", "sequence_lengths", "query_start_loc",
+                 "num_accepted_tokens", "is_prefilling")}}
+        common_constants, send = self.sharded.select_row_runtime(source, bindings, dynamic, self.workspace_bytes)
+        return RowGatherStage(gate, query, metadata, bindings, dynamic, common_constants, send)
+
+    def post_gather_runtime(self, stage: RowGatherStage, *, gather_dependencies=()) -> torch.Tensor:
+        """Complete row-split group gather, sparse attention, gating, and output projection."""
+        self.sharded.finish_row_runtime(
+            stage.bindings, stage.dynamic, stage.common_constants, stage.send,
+            self.workspace_bytes, gather_dependencies=gather_dependencies,
+        )
+        attended = stage.bindings["output"]
+        if self.sparse is not None:
+            attended = self.sparse(self.state.main_k_cache, self.state.main_v_cache, query=stage.query,
+                selected=stage.bindings["selected_positions"], block_table=stage.metadata.main_block_table,
+                requests=stage.metadata.request_ids, positions=stage.metadata.query_positions)
+        gated = attended.flatten(1) * torch.sigmoid(stage.gate.reshape(self.tokens, self.q_heads * 256))
+        output = self.projections["o_proj"](gated)
+        output.masked_fill_((stage.metadata.request_ids < 0)[:, None], 0)
+        return output
+
     def __call__(self, source: torch.Tensor, metadata) -> torch.Tensor | None:
+        if not self.cache_only and self.sharded is not None and self.sharded.mode == "row":
+            return self.post_gather_runtime(self.pre_gather_runtime(source, metadata))
         pending_sharded = None
         if self.sharded is not None and self.sharded.overlap:
             if self.parallel_projections is not None:
@@ -420,16 +508,7 @@ class PreparedAttention:
             projection_workspaces = None
         else:
             (projected_qkv, projected_index), projection_workspaces = self.concurrent.project_runtime(source)
-        q_width = self.q_heads * 512
-        kv_width = self.kv_heads * 256
-        projected_q = projected_qkv[:, :q_width].view(self.tokens, self.q_heads, 512)
-        query, gate = projected_q[..., :256], projected_q[..., 256:]
-        key = projected_qkv[:, q_width:q_width + kv_width].view(self.tokens, self.kv_heads, 256)
-        value = projected_qkv[:, q_width + kv_width:].view(self.tokens, self.kv_heads, 256)
-        cos, sin = self.rotary.gather(metadata.rope_positions)
-        query, key = apply_rotary_pos_emb(self.module.q_norm(query), self.module.k_norm(key), cos, sin,
-                                         unsqueeze_dim=1)
-        query, key = query.contiguous(), key.contiguous()
+        query, gate, key, value = self._prepare_qkv_runtime(projected_qkv, metadata)
         paged_kv_write.run(self.writer, key=key, value=value, k_cache=self.state.main_k_cache,
             v_cache=self.state.main_v_cache, slot_mapping=metadata.slot_mapping,
             k_scale=self.constants["k_descale"], v_scale=self.constants["v_descale"])

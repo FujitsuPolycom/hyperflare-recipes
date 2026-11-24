@@ -93,3 +93,20 @@ def test_ranks_on_separate_hosts_may_share_a_local_device_ordinal():
                            ((0, 0), ["boot-a", "boot-b"]), (None, ("boot-a",))):
         with pytest.raises(ValueError):
             PreparationConfig(devices=devices, hosts=hosts)
+
+
+@pytest.mark.parametrize("chunk, expected_terminal", [
+    (64, ()),
+    (256, ()),
+    (512, (512,)),
+    (2048, (2048,)),
+    (3072, (3072,)),
+    (4096, (4096,)),
+    (8192, (8192,)),
+])
+def test_terminal_prefill_catalog_split(chunk, expected_terminal):
+    from hyperflare_recipes.recipes.qwen38.bootstrap import _terminal_prefill_capacities
+
+    caps = PreparationConfig(prefill_chunk_size=chunk).prefill_capacities
+    assert _terminal_prefill_capacities(caps, has_terminal_op=False) == ()
+    assert _terminal_prefill_capacities(caps, has_terminal_op=True) == expected_terminal
