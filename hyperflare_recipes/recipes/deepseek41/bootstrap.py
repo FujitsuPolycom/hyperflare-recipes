@@ -68,9 +68,11 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
 
 
 def _forward_factories(mla_compute_mode, *, vision,
-                       draft_vocabulary_runtime=None, examples=None):
+                       draft_vocabulary_runtime=None, examples=None,
+                       row_shard_prefill=False):
     """Bind attention arithmetic and the proposal head's BF16 gather channel."""
-    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples),
+    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode,
+                    examples=examples, row_shard_prefill=row_shard_prefill),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
                     mla_compute_mode=mla_compute_mode, examples=examples))
 
@@ -115,6 +117,7 @@ class PreparationConfig(BasePreparationConfig):
     stream_overlap: bool = True
     expert_scale_compression: str | None = None
     mla_compute_mode: str = "auto"
+    row_shard_prefill: bool = False
     packed_verification: bool | None = None
     draft_prefix_selection: str | None = None
     speculation_reference_graphs: bool = False
@@ -158,6 +161,8 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         if type(self.stream_overlap) is not bool:
             raise TypeError("stream_overlap must be a boolean")
+        if type(self.row_shard_prefill) is not bool:
+            raise TypeError("row_shard_prefill must be a boolean")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
         if (not isinstance(self.devices, tuple) or len(self.devices) not in (3, 4, 6)
                 or len(set(placements)) != len(self.devices)
@@ -425,7 +430,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             vision_storage = {}
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
             vision=vision_state,
-            draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples)
+            draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples,
+            row_shard_prefill=config.row_shard_prefill)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
