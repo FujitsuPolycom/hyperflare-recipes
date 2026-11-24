@@ -35,6 +35,7 @@ from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
+from ignition.preparation import runtime_core_pb2 as contract_proto
 from hyperflare_recipes.fixtures.recurrent import register_benchmark_state
 from ignition.preparation.host_memory import release_unused
 from ignition.preparation.model import PreparedModel
@@ -57,6 +58,13 @@ from .vision_state import (
 from .weights import ModelWeights
 from .dflash import SpeculativePreparation
 from ignition.preparation.bootstrap import BasePreparationConfig
+
+
+def _terminal_prefill_capacities(prefill_capacities: tuple[int, ...], *, has_terminal_op: bool) -> tuple[int, ...]:
+    """Select chunk capacities that split into non-terminal prefill and terminal_prefill graphs."""
+    if not has_terminal_op or not prefill_capacities or prefill_capacities[-1] < 512:
+        return ()
+    return (prefill_capacities[-1],)
 
 
 @dataclass(frozen=True)
@@ -312,6 +320,9 @@ def prepare(snapshot, config, *, progress=None, core_storage):
     if config.benchmark_selection is not None:
         prefill_sizes = config.benchmark_selection.prefill_capacities(config.prefill_chunk_size)
         batch_sizes = config.benchmark_selection.batches
+    terminal_capacities = _terminal_prefill_capacities(
+        prefill_sizes, has_terminal_op=hasattr(contract_proto, "TERMINAL_PREFILL"),
+    )
     modes = (config.mtp,) if config.benchmark_selection is not None else serving_modes(config.mtp, config.mtp_only)
     prefill_only = config.benchmark_selection is not None and config.benchmark_selection.prefill_chunk
     with phase(progress, "Construct graph catalog"):
@@ -329,25 +340,33 @@ def prepare(snapshot, config, *, progress=None, core_storage):
             mode_weights = weights if enabled else replace(weights, draft=None)
             for kind, mode, sizes in prefill_modes(prefill_sizes, () if enabled or prefill_only else reversed(batch_sizes), scoring):
                 for capacity in sizes:
-                    rows = 1 if mode == "prefill" else capacity
-                    name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
-                    m = Metadata.allocate(capacity, rows, blocks, device)
-                    scratch = (prefill_storage if mode == "prefill" else decode_storage).rows(capacity, rows)
-                    prefill_vision = vision_state if mode == "prefill" else None
-                    decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
-                        scoring=scoring if kind == "scored_prefill" else None,
-                        vocabulary_runtime=None, coordinator=coordinator, session=session, name=name, workspace=arena,
-                        vision_state=prefill_vision)
-                    batch = prepare_batch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
-                        validate_prefill=None if prefill_vision is None else prefill_vision.validate_prefill)
-                    context = (partial(PreparedContext, runtime=None, coordinator=None,
-                        compact_prefill=mode == "prefill") if enabled else None)
-                    forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=None,
-                        coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
-                        context_factory=context)
-                    fields = forward_inputs if mode == "prefill" else decode_inputs
-                    add(name, forward, kind, rows, capacity if mode == "prefill" else 1,
-                        (*fields, *(vision_prefill.buffers() if prefill_vision is not None else ())), enabled)
+                    variants = (
+                        (("prefill", False), ("terminal_prefill", True))
+                        if kind == "prefill" and capacity in terminal_capacities
+                        else ((kind, True),)
+                    )
+                    for graph_kind, sample in variants:
+                        rows = 1 if mode == "prefill" else capacity
+                        name = f"{graph_kind}{capacity}" + (suffix if mode == "prefill" else "")
+                        m = Metadata.allocate(capacity, rows, blocks, device)
+                        scratch = (prefill_storage if mode == "prefill" else decode_storage).rows(capacity, rows)
+                        prefill_vision = vision_state if mode == "prefill" else None
+                        decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
+                            scoring=scoring if graph_kind == "scored_prefill" else None,
+                            vocabulary_runtime=None, coordinator=coordinator, session=session, name=name, workspace=arena,
+                            vision_state=prefill_vision, sample=sample)
+                        batch = prepare_batch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
+                            validate_prefill=None if prefill_vision is None else prefill_vision.validate_prefill)
+                        context = (partial(PreparedContext, runtime=None, coordinator=None,
+                            compact_prefill=mode == "prefill") if enabled else None)
+                        # Retain DFlash2 prefill absorption on non-terminal chunks so draft KV rings
+                        # remain complete at any dynamically selected prefix checkpoint cut.
+                        forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=None,
+                            coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
+                            context_factory=context, sample=sample, absorb_context=enabled)
+                        fields = forward_inputs if mode == "prefill" else decode_inputs
+                        add(name, forward, graph_kind, rows, capacity if mode == "prefill" else 1,
+                            (*fields, *(vision_prefill.buffers() if prefill_vision is not None else ())), enabled)
         vision_owners = ()
         if patches:
             vision_fields = (*vision_inputs.buffers(), "vision_feature_slot")
@@ -410,7 +429,7 @@ def prepare(snapshot, config, *, progress=None, core_storage):
         stream=stream, pool=graph_pool, collective=None, coordinator=coordinator,
         compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
         retain_graphs=config.retain_graphs, materialize=pool.clear_for_preparation, warmup_storage=core_storage,
-        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "init", "restore", "snapshot", "vision"))
+        compile_kinds=("prefill", "terminal_prefill", "scored_prefill", "decode", "resume", "speculative", "init", "restore", "snapshot", "vision"))
     for study in studies.values():
         study.capture(session=session, device=device, stream=stream, pool=graph_pool,
             compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
@@ -420,7 +439,7 @@ def prepare(snapshot, config, *, progress=None, core_storage):
         from ignition.bench.observations import capture_observers
 
         selected = {name: forward for name, forward in forwards.items()
-                    if signatures[name].kind in ("prefill", "speculative")}
+                    if signatures[name].kind in ("prefill", "terminal_prefill", "speculative")}
         observers = capture_observers(selected, signatures, session=session, device=device,
             stream=stream, pool=graph_pool, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
