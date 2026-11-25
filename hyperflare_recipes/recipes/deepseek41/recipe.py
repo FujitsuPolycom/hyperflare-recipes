@@ -7,6 +7,7 @@
 from types import MappingProxyType
 
 from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
+from .config import replicated_attention_bytes
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -39,7 +40,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         dspark=speculation is not None,
         stream_overlap=plan.stream_overlap, expert_scale_compression=plan.expert_scale_compression,
         mla_compute_mode=plan.mla_compute_mode,
-        row_shard_prefill=plan.row_shard_prefill, **drafting)
+        row_shard_prefill=plan.row_shard_prefill,
+        row_shard_attention=getattr(plan, "row_shard_attention", False), **drafting)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
@@ -69,6 +71,10 @@ RECIPE = Recipe(
     stream_overlap=True,
     joint_tuning=True, vocabulary_parallel_world_sizes=(4, 6),
     row_shard_prefill_world_sizes=(4,),
+    **({"replicated_attention_bytes": replicated_attention_bytes}
+       if "replicated_attention_bytes" in Recipe.__dataclass_fields__ else {}),
     ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, 8 << 30) for world in (3, 4, 6)}),
     plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, 8 << 30) for world in (3, 4, 6)}),
 )
+if not hasattr(RECIPE, "replicated_attention_bytes"):
+    object.__setattr__(RECIPE, "replicated_attention_bytes", replicated_attention_bytes)

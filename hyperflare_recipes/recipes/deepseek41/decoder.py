@@ -279,7 +279,7 @@ class PreparedLayer:
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto",
                  window_metadata=None, examples=None, pipelined_ffn=False, pipelined_attn_hc=False,
                  defer_mlp_b=False, defer_engram_reduce=False, pipelined_attn=None,
-                 row_shard_dma=False, shard_rows=None):
+                 row_shard_dma=False, shard_rows=None, replicated_attention=None):
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
         self.metadata = metadata
@@ -315,6 +315,12 @@ class PreparedLayer:
         self.ffn_meta_scale_cols = 0
         self.attn_gather_0 = self.attn_gather_1 = None
         self.cr_attn_gather_0 = self.cr_attn_gather_1 = None
+        self.kv_gather_0 = self.kv_gather_1 = None
+        self.cr_kv_gather_0 = self.cr_kv_gather_1 = None
+        if replicated_attention is not None and (not self.row_shard_dma or self.pipelined_attn != "full"):
+            raise ValueError("replicated attention weights require a row-sharded full-attention encoder layer")
+        self.row_shard_attention = bool(
+            self.row_shard_dma and self.pipelined_attn == "full" and replicated_attention is not None)
         self.ffn_vals_0 = self.ffn_vals_1 = self.ffn_meta_0 = self.ffn_meta_1 = None
         self.cr_ffn_vals_0 = self.cr_ffn_vals_1 = self.cr_ffn_meta_0 = self.cr_ffn_meta_1 = None
         if self.pipelined_attn_hc and (not self.pipelined_ffn or not carry or boundary is not None):
@@ -384,7 +390,7 @@ class PreparedLayer:
         attn_qkv_encoded = None
         attn_gather_in = None
         attn_gather_out = None
-        if self.row_shard_dma and self.pipelined_attn == "full":
+        if self.row_shard_dma and self.pipelined_attn == "full" and not self.row_shard_attention:
             st = self.shard_tokens
             dev = s.attention_hc.normalized.device
             hidden = s.attention_hc.normalized.shape[1]
@@ -434,24 +440,36 @@ class PreparedLayer:
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode,
             window_metadata=window_metadata, examples=examples, pipelined_mode=self.pipelined_attn,
-            qkv_encoded=attn_qkv_encoded)
+            qkv_encoded=attn_qkv_encoded,
+            shard_tokens=self.shard_tokens if self.row_shard_attention else None,
+            replicated_weights=replicated_attention if self.row_shard_attention else None)
         if self.row_shard_dma:
             st = self.shard_tokens
             self.attention_reduce = None
-            self.attn_gather_0 = PreparedGatherShards(
-                s.attention_hc.normalized[:st] if attn_gather_in is None else attn_gather_in,
-                s.attention_hc.normalized[:h] if attn_gather_out is None else attn_gather_out,
-                runtime=runtime, coordinator=coordinator, session=session, name=name + ".attn_gather.0")
-            self.attn_gather_1 = PreparedGatherShards(
-                s.attention_hc.normalized[:st] if attn_gather_in is None else attn_gather_in,
-                s.attention_hc.normalized[h:] if attn_gather_out is None else attn_gather_out,
-                runtime=runtime, coordinator=coordinator, session=session, name=name + ".attn_gather.1")
-            self.att_reduce_0 = PreparedReduceScatter(
-                s.attention.output[:h], s.attention_output[:st],
-                runtime=runtime, coordinator=coordinator, session=session, name=name + ".attention_rs.0")
-            self.att_reduce_1 = PreparedReduceScatter(
-                s.attention.output[h:], s.attention_output[:st],
-                runtime=runtime, coordinator=coordinator, session=session, name=name + ".attention_rs.1")
+            if self.row_shard_attention:
+                self.att_reduce_0 = self.att_reduce_1 = None
+                self.cr_att_0 = self.cr_att_1 = None
+                self.kv_gather_0 = PreparedGatherShards(
+                    s.attention.window_values[:st], s.attention.window_values[:h],
+                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".kv_gather.0")
+                self.kv_gather_1 = PreparedGatherShards(
+                    s.attention.window_values[:st], s.attention.window_values[h:],
+                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".kv_gather.1")
+            else:
+                self.attn_gather_0 = PreparedGatherShards(
+                    s.attention_hc.normalized[:st] if attn_gather_in is None else attn_gather_in,
+                    s.attention_hc.normalized[:h] if attn_gather_out is None else attn_gather_out,
+                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".attn_gather.0")
+                self.attn_gather_1 = PreparedGatherShards(
+                    s.attention_hc.normalized[:st] if attn_gather_in is None else attn_gather_in,
+                    s.attention_hc.normalized[h:] if attn_gather_out is None else attn_gather_out,
+                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".attn_gather.1")
+                self.att_reduce_0 = PreparedReduceScatter(
+                    s.attention.output[:h], s.attention_output[:st],
+                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".attention_rs.0")
+                self.att_reduce_1 = PreparedReduceScatter(
+                    s.attention.output[h:], s.attention_output[:st],
+                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".attention_rs.1")
             ffn_hc_scratch = s.ffn_hc.rows(st)
             self.ffn_hc = PreparedMHC((s.attention_output[:st], s.attention_hc.residual[:st],
                 s.attention_hc.post[:st], s.attention_hc.comb[:st]),
@@ -583,19 +601,27 @@ class PreparedLayer:
                 attn_parallel.append(self.attention_hc.plan)
             if self.attn_quantizer_plan is not None:
                 attn_parallel.append(self.attn_quantizer_plan)
-            self.cr_attn_gather_0 = ConcurrentGatherShards(self.attn_gather_0, workspace=workspace, session=session,
-                parallel_plans=tuple(p for p in (self.attention_hc.plan, self.attn_quantizer_plan) if p is not None))
-            if self.pipelined_attn == "full":
-                self.cr_attn_gather_1 = ConcurrentGatherShards(self.attn_gather_1, workspace=workspace, session=session,
+            if self.row_shard_attention:
+                self.cr_kv_gather_0 = ConcurrentGatherShards(self.kv_gather_0, workspace=workspace, session=session,
                     parallel_plans=attn_parallel)
-            self.cr_att_0 = ConcurrentReduceScatter(self.att_reduce_0, workspace=workspace, session=session,
-                parallel_plans=attn_parallel)
-            self.cr_att_1 = ConcurrentReduceScatter(self.att_reduce_1, workspace=workspace, session=session,
-                parallel_plans=shard_prep_plans)
+                self.cr_kv_gather_1 = ConcurrentGatherShards(self.kv_gather_1, workspace=workspace, session=session,
+                    parallel_plans=(*attn_parallel, *shard_prep_plans))
+                ffn0_parallel = (*attn_parallel, *shard_prep_plans)
+            else:
+                self.cr_attn_gather_0 = ConcurrentGatherShards(self.attn_gather_0, workspace=workspace, session=session,
+                    parallel_plans=tuple(p for p in (self.attention_hc.plan, self.attn_quantizer_plan) if p is not None))
+                if self.pipelined_attn == "full":
+                    self.cr_attn_gather_1 = ConcurrentGatherShards(self.attn_gather_1, workspace=workspace, session=session,
+                        parallel_plans=attn_parallel)
+                self.cr_att_0 = ConcurrentReduceScatter(self.att_reduce_0, workspace=workspace, session=session,
+                    parallel_plans=attn_parallel)
+                self.cr_att_1 = ConcurrentReduceScatter(self.att_reduce_1, workspace=workspace, session=session,
+                    parallel_plans=shard_prep_plans)
+                ffn0_parallel = shard_prep_plans
             self.cr_ffn_vals_0 = ConcurrentGatherShards(self.ffn_vals_0, workspace=workspace, session=session,
-                parallel_plans=shard_prep_plans)
+                parallel_plans=ffn0_parallel)
             self.cr_ffn_meta_0 = ConcurrentGatherShards(self.ffn_meta_0, workspace=workspace, session=session,
-                parallel_plans=shard_prep_plans)
+                parallel_plans=ffn0_parallel)
             self.cr_ffn_vals_1 = ConcurrentGatherShards(self.ffn_vals_1, workspace=workspace, session=session,
                 parallel_plans=ffn_compute_plans)
             self.cr_ffn_meta_1 = ConcurrentGatherShards(self.ffn_meta_1, workspace=workspace, session=session,
@@ -706,13 +732,17 @@ class PreparedLayer:
         if self.attention_hc is not None:
             self.attention_hc.functional()
         if self.row_shard_dma:
-            self.cr_attn_gather_0.functional(session=session)
-            if self.cr_attn_gather_1 is not None:
-                self.cr_attn_gather_1.functional(session=session)
+            if self.row_shard_attention:
+                self.cr_kv_gather_0.functional(session=session)
+                self.cr_kv_gather_1.functional(session=session)
             else:
-                self.attn_gather_1.functional(session=session)
-            self.cr_att_0.functional(session=session)
-            self.cr_att_1.functional(session=session)
+                self.cr_attn_gather_0.functional(session=session)
+                if self.cr_attn_gather_1 is not None:
+                    self.cr_attn_gather_1.functional(session=session)
+                else:
+                    self.attn_gather_1.functional(session=session)
+                self.cr_att_0.functional(session=session)
+                self.cr_att_1.functional(session=session)
             self.cr_ffn_vals_0.functional(session=session)
             self.cr_ffn_meta_0.functional(session=session)
             self.cr_ffn_vals_1.functional(session=session)
@@ -844,77 +874,6 @@ class PreparedLayer:
                 mixed = self.engram(res_cat, metadata)
             incoming = (mixed[:s_tok], mixed[s_tok:])
         pre_mix_a, pre_mix_b = pre_mix
-        if self.pipelined_attn_hc:
-            mlp_a, prev_res_a, prev_post_a, prev_comb_a, p_mlp_b, prev_res_b, prev_post_b, prev_comb_b = incoming
-            attn_mix_a = torch.empty_like(pre_mix_a)
-            res_a, post_a, comb_a, norm_a_sh = self.attention_hc(
-                mlp_a, prev_res_a, prev_post_a, prev_comb_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
-            attn_a_sh = self._prepare_attn_shard(norm_a_sh)
-            mlp_b = self.cr_att_0.finish(p_mlp_b, attn_a_sh)
-            p_ag_a = self.cr_attn_gather_0.start(attn_a_sh, dependencies=(mlp_b,))
-            attn_mix_b = torch.empty_like(pre_mix_b)
-            res_b, post_b, comb_b, norm_b_sh = self.attention_hc(
-                mlp_b, prev_res_b, prev_post_b, prev_comb_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
-            attn_b_sh = self._prepare_attn_shard(norm_b_sh)
-        else:
-            src_a, src_b = incoming
-            attn_mix_a = torch.empty_like(pre_mix_a)
-            res_a, post_a, comb_a, norm_a_sh = self.attention_hc(src_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
-            attn_a_sh = self._prepare_attn_shard(norm_a_sh)
-            p_ag_a = self.cr_attn_gather_0.start(attn_a_sh, dependencies=(attn_a_sh,))
-            attn_mix_b = torch.empty_like(pre_mix_b)
-            res_b, post_b, comb_b, norm_b_sh = self.attention_hc(src_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
-            attn_b_sh = self._prepare_attn_shard(norm_b_sh)
-        norm_a = self.cr_attn_gather_0.finish(p_ag_a, attn_b_sh)
-        if self.pipelined_attn == "full":
-            p_ag_b = self.cr_attn_gather_1.start(attn_b_sh, dependencies=(norm_a,))
-            wc = self.attention.init_window_cache(metadata, norm_a.device) if window_cache is None else window_cache
-            src_a_att, enc_a_att = self._unpack_attn_gathered(norm_a)
-            out_a = self.attention.run_half(
-                src_a_att, metadata, selection, indices=indices, window_cache=wc, half_idx=0,
-                qkv_encoded_bases=enc_a_att)
-            norm_b = self.cr_attn_gather_1.finish(p_ag_b, out_a)
-            p_att_a = self.cr_att_0.start(out_a, dependencies=(norm_b,))
-            src_b_att, enc_b_att = self._unpack_attn_gathered(norm_b)
-            out_b = self.attention.run_half(
-                src_b_att, metadata, selection, indices=indices, window_cache=wc, half_idx=1,
-                qkv_encoded_bases=enc_b_att)
-            records = (wc, None)
-            if self.attention.mode == "prefill":
-                self.attention.commit(metadata.lengths, records, metadata)
-            att_a = self.cr_att_0.finish(p_att_a, out_b)
-            attention_normalized = src_a_att
-        else:
-            norm_b = self.attn_gather_1(attn_b_sh, dependencies=(norm_a,))
-            normalized = torch.cat((norm_a, norm_b), dim=0)
-            attention_normalized = normalized
-            pending_engram = None
-            if engram_overlap is not None:
-                prepare_engram, cr_engram, bounds, engram_state, use_gather = engram_overlap
-                if prepare_engram is not None:
-                    if use_gather:
-                        engram_state["partial"] = prepare_engram.lookup_local(normalized, metadata)
-                    else:
-                        engram_state["partial"] = prepare_engram.project(normalized, metadata).view(-1, 5120)
-                begin, end = bounds
-                pending_engram = cr_engram.start(
-                    engram_state["partial"][begin:end].clone(), dependencies=(normalized,))
-            prefix_state = self.attention.run_prefix(normalized, metadata, selection,
-                indices=indices, window_cache=window_cache)
-            _, wc, selection, _, _, kv_records = prefix_state
-            out_a = self.attention.run_mla_wo_half(prefix_state, metadata, indices=indices, half_idx=0)
-            att0_deps = ()
-            if pending_engram is not None:
-                engram_chunk = cr_engram.finish(pending_engram, out_a)
-                engram_state["chunks"].append(engram_chunk)
-                att0_deps = (engram_chunk,)
-            p_att_a = self.cr_att_0.start(out_a, dependencies=att0_deps)
-            out_b = self.attention.run_mla_wo_half(prefix_state, metadata, indices=indices, half_idx=1)
-            records = (wc, kv_records)
-            if self.attention.mode == "prefill":
-                self.attention.commit(metadata.lengths, records, metadata)
-            att_a = self.cr_att_0.finish(p_att_a, out_b)
-
         if self.has_image_mask:
             if image_mask is None:
                 image_mask = metadata.token_ids >= 129280
@@ -925,21 +884,147 @@ class PreparedLayer:
         valid_a = (metadata.live_counts[:1] - self.shard_offset_a).clamp(0, s_tok).to(torch.int32)
         valid_b = (metadata.live_counts[:1] - self.shard_offset_b).clamp(0, s_tok).to(torch.int32)
 
-        p_att_b = self.cr_att_1.start(out_b, dependencies=(att_a,))
-        next_mix_a = torch.empty_like(attn_mix_a)
-        res_a, post_a, comb_a, ffn_norm_a_sh = self.ffn_hc(
-            att_a, res_a, post_a, comb_a, pre_mix=attn_mix_a, pre_out=next_mix_a)
-        vals_a_sh, meta_a_sh = self._prepare_ffn_shard(ffn_norm_a_sh, mask_a, valid_a)
-        att_b = self.cr_att_1.finish(p_att_b, meta_a_sh)
+        if getattr(self, "row_shard_attention", False):
+            if self.pipelined_attn_hc:
+                mlp_a, prev_res_a, prev_post_a, prev_comb_a, p_mlp_b, prev_res_b, prev_post_b, prev_comb_b = incoming
+                attn_mix_a = torch.empty_like(pre_mix_a)
+                res_a, post_a, comb_a, norm_a_sh = self.attention_hc(
+                    mlp_a, prev_res_a, prev_post_a, prev_comb_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
+                q_a, wv_a_sh, angles_a = self.attention.run_shard_qkv_q(
+                    norm_a_sh, indices=indices, shard_rows=self.shard_rows_a)
+                mlp_b = self.cr_mlp_1.finish(p_mlp_b, wv_a_sh)
+                p_kv_a = self.cr_kv_gather_0.start(wv_a_sh, dependencies=(mlp_b,))
+                attn_mix_b = torch.empty_like(pre_mix_b)
+                res_b, post_b, comb_b, norm_b_sh = self.attention_hc(
+                    mlp_b, prev_res_b, prev_post_b, prev_comb_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
+                q_b, wv_b_sh, angles_b = self.attention.run_shard_qkv_q(
+                    norm_b_sh, indices=indices, shard_rows=self.shard_rows_b)
+            else:
+                src_a, src_b = incoming
+                attn_mix_a = torch.empty_like(pre_mix_a)
+                res_a, post_a, comb_a, norm_a_sh = self.attention_hc(
+                    src_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
+                q_a, wv_a_sh, angles_a = self.attention.run_shard_qkv_q(
+                    norm_a_sh, indices=indices, shard_rows=self.shard_rows_a)
+                p_kv_a = self.cr_kv_gather_0.start(wv_a_sh, dependencies=(wv_a_sh,))
+                attn_mix_b = torch.empty_like(pre_mix_b)
+                res_b, post_b, comb_b, norm_b_sh = self.attention_hc(
+                    src_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
+                q_b, wv_b_sh, angles_b = self.attention.run_shard_qkv_q(
+                    norm_b_sh, indices=indices, shard_rows=self.shard_rows_b)
+            wv_a_full = self.cr_kv_gather_0.finish(p_kv_a, wv_b_sh)
+            p_kv_b = self.cr_kv_gather_1.start(wv_b_sh, dependencies=(wv_a_full,))
+            wc = self.attention.init_window_cache(metadata, wv_a_full.device) if window_cache is None else window_cache
+            att_a = self.attention.run_shard_mla_wo(
+                q_a, wv_a_full, metadata, selection, indices=indices, window_cache=wc,
+                half_idx=0, shard_rows=self.shard_rows_a, layer_angles=angles_a)
+            next_mix_a = torch.empty_like(attn_mix_a)
+            res_a, post_a, comb_a, ffn_norm_a_sh = self.ffn_hc(
+                att_a, res_a, post_a, comb_a, pre_mix=attn_mix_a, pre_out=next_mix_a)
+            vals_a_sh, meta_a_sh = self._prepare_ffn_shard(ffn_norm_a_sh, mask_a, valid_a)
+            wv_b_full = self.cr_kv_gather_1.finish(p_kv_b, meta_a_sh)
+            p_vals_a = self.cr_ffn_vals_0.start(vals_a_sh, dependencies=(wv_b_full,))
+            p_meta_a = self.cr_ffn_meta_0.start(meta_a_sh, dependencies=(p_vals_a.output,))
+            att_b = self.attention.run_shard_mla_wo(
+                q_b, wv_b_full, metadata, selection, indices=indices, window_cache=wc,
+                half_idx=1, shard_rows=self.shard_rows_b, layer_angles=angles_b)
+            records = (wc, None)
+            if self.attention.mode == "prefill":
+                self.attention.commit(metadata.lengths, records, metadata)
+            next_mix_b = torch.empty_like(attn_mix_b)
+            res_b, post_b, comb_b, ffn_norm_b_sh = self.ffn_hc(
+                att_b, res_b, post_b, comb_b, pre_mix=attn_mix_b, pre_out=next_mix_b)
+            vals_b_sh, meta_b_sh = self._prepare_ffn_shard(ffn_norm_b_sh, mask_b, valid_b)
+            vals_a_full = self.cr_ffn_vals_0.finish(p_vals_a, meta_b_sh)
+            meta_a_full = self.cr_ffn_meta_0.finish(p_meta_a, vals_a_full)
+            attention_normalized = norm_a_sh
+        else:
+            if self.pipelined_attn_hc:
+                mlp_a, prev_res_a, prev_post_a, prev_comb_a, p_mlp_b, prev_res_b, prev_post_b, prev_comb_b = incoming
+                attn_mix_a = torch.empty_like(pre_mix_a)
+                res_a, post_a, comb_a, norm_a_sh = self.attention_hc(
+                    mlp_a, prev_res_a, prev_post_a, prev_comb_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
+                attn_a_sh = self._prepare_attn_shard(norm_a_sh)
+                mlp_b = self.cr_att_0.finish(p_mlp_b, attn_a_sh)
+                p_ag_a = self.cr_attn_gather_0.start(attn_a_sh, dependencies=(mlp_b,))
+                attn_mix_b = torch.empty_like(pre_mix_b)
+                res_b, post_b, comb_b, norm_b_sh = self.attention_hc(
+                    mlp_b, prev_res_b, prev_post_b, prev_comb_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
+                attn_b_sh = self._prepare_attn_shard(norm_b_sh)
+            else:
+                src_a, src_b = incoming
+                attn_mix_a = torch.empty_like(pre_mix_a)
+                res_a, post_a, comb_a, norm_a_sh = self.attention_hc(src_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
+                attn_a_sh = self._prepare_attn_shard(norm_a_sh)
+                p_ag_a = self.cr_attn_gather_0.start(attn_a_sh, dependencies=(attn_a_sh,))
+                attn_mix_b = torch.empty_like(pre_mix_b)
+                res_b, post_b, comb_b, norm_b_sh = self.attention_hc(src_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
+                attn_b_sh = self._prepare_attn_shard(norm_b_sh)
+            norm_a = self.cr_attn_gather_0.finish(p_ag_a, attn_b_sh)
+            if self.pipelined_attn == "full":
+                p_ag_b = self.cr_attn_gather_1.start(attn_b_sh, dependencies=(norm_a,))
+                wc = self.attention.init_window_cache(metadata, norm_a.device) if window_cache is None else window_cache
+                src_a_att, enc_a_att = self._unpack_attn_gathered(norm_a)
+                out_a = self.attention.run_half(
+                    src_a_att, metadata, selection, indices=indices, window_cache=wc, half_idx=0,
+                    qkv_encoded_bases=enc_a_att)
+                norm_b = self.cr_attn_gather_1.finish(p_ag_b, out_a)
+                p_att_a = self.cr_att_0.start(out_a, dependencies=(norm_b,))
+                src_b_att, enc_b_att = self._unpack_attn_gathered(norm_b)
+                out_b = self.attention.run_half(
+                    src_b_att, metadata, selection, indices=indices, window_cache=wc, half_idx=1,
+                    qkv_encoded_bases=enc_b_att)
+                records = (wc, None)
+                if self.attention.mode == "prefill":
+                    self.attention.commit(metadata.lengths, records, metadata)
+                att_a = self.cr_att_0.finish(p_att_a, out_b)
+                attention_normalized = src_a_att
+            else:
+                norm_b = self.attn_gather_1(attn_b_sh, dependencies=(norm_a,))
+                normalized = torch.cat((norm_a, norm_b), dim=0)
+                attention_normalized = normalized
+                pending_engram = None
+                if engram_overlap is not None:
+                    prepare_engram, cr_engram, bounds, engram_state, use_gather = engram_overlap
+                    if prepare_engram is not None:
+                        if use_gather:
+                            engram_state["partial"] = prepare_engram.lookup_local(normalized, metadata)
+                        else:
+                            engram_state["partial"] = prepare_engram.project(normalized, metadata).view(-1, 5120)
+                    begin, end = bounds
+                    pending_engram = cr_engram.start(
+                        engram_state["partial"][begin:end].clone(), dependencies=(normalized,))
+                prefix_state = self.attention.run_prefix(normalized, metadata, selection,
+                    indices=indices, window_cache=window_cache)
+                _, wc, selection, _, _, kv_records = prefix_state
+                out_a = self.attention.run_mla_wo_half(prefix_state, metadata, indices=indices, half_idx=0)
+                att0_deps = ()
+                if pending_engram is not None:
+                    engram_chunk = cr_engram.finish(pending_engram, out_a)
+                    engram_state["chunks"].append(engram_chunk)
+                    att0_deps = (engram_chunk,)
+                p_att_a = self.cr_att_0.start(out_a, dependencies=att0_deps)
+                out_b = self.attention.run_mla_wo_half(prefix_state, metadata, indices=indices, half_idx=1)
+                records = (wc, kv_records)
+                if self.attention.mode == "prefill":
+                    self.attention.commit(metadata.lengths, records, metadata)
+                att_a = self.cr_att_0.finish(p_att_a, out_b)
 
-        p_vals_a = self.cr_ffn_vals_0.start(vals_a_sh, dependencies=(att_b,))
-        p_meta_a = self.cr_ffn_meta_0.start(meta_a_sh, dependencies=(p_vals_a.output,))
-        next_mix_b = torch.empty_like(attn_mix_b)
-        res_b, post_b, comb_b, ffn_norm_b_sh = self.ffn_hc(
-            att_b, res_b, post_b, comb_b, pre_mix=attn_mix_b, pre_out=next_mix_b)
-        vals_b_sh, meta_b_sh = self._prepare_ffn_shard(ffn_norm_b_sh, mask_b, valid_b)
-        vals_a_full = self.cr_ffn_vals_0.finish(p_vals_a, meta_b_sh)
-        meta_a_full = self.cr_ffn_meta_0.finish(p_meta_a, vals_a_full)
+            p_att_b = self.cr_att_1.start(out_b, dependencies=(att_a,))
+            next_mix_a = torch.empty_like(attn_mix_a)
+            res_a, post_a, comb_a, ffn_norm_a_sh = self.ffn_hc(
+                att_a, res_a, post_a, comb_a, pre_mix=attn_mix_a, pre_out=next_mix_a)
+            vals_a_sh, meta_a_sh = self._prepare_ffn_shard(ffn_norm_a_sh, mask_a, valid_a)
+            att_b = self.cr_att_1.finish(p_att_b, meta_a_sh)
+
+            p_vals_a = self.cr_ffn_vals_0.start(vals_a_sh, dependencies=(att_b,))
+            p_meta_a = self.cr_ffn_meta_0.start(meta_a_sh, dependencies=(p_vals_a.output,))
+            next_mix_b = torch.empty_like(attn_mix_b)
+            res_b, post_b, comb_b, ffn_norm_b_sh = self.ffn_hc(
+                att_b, res_b, post_b, comb_b, pre_mix=attn_mix_b, pre_out=next_mix_b)
+            vals_b_sh, meta_b_sh = self._prepare_ffn_shard(ffn_norm_b_sh, mask_b, valid_b)
+            vals_a_full = self.cr_ffn_vals_0.finish(p_vals_a, meta_b_sh)
+            meta_a_full = self.cr_ffn_meta_0.finish(p_meta_a, vals_a_full)
 
         p_vals_b = self.cr_ffn_vals_1.start(vals_b_sh, dependencies=(meta_a_full,))
         p_meta_b = self.cr_ffn_meta_1.start(meta_b_sh, dependencies=(p_vals_b.output,))
@@ -1239,7 +1324,8 @@ class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
                  vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None,
-                 suffix_runtime=None, encoder_only=False, row_shard_prefill=False):
+                 suffix_runtime=None, encoder_only=False, row_shard_prefill=False,
+                 row_shard_attention=False):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
@@ -1350,6 +1436,16 @@ class PreparedDecoder:
         )
         self.half_tokens = encoder_tokens // 2
         self.shard_tokens = self.half_tokens // world if self.row_shard_dma else 0
+        self.row_shard_attention = (
+            bool(row_shard_attention)
+            and self.row_shard_dma
+            and getattr(weights, "replicated_attention", None) is not None
+            and PreparedGatherShards.fits(
+                runtime,
+                scratch.attention.window_values[:self.shard_tokens],
+                scratch.attention.window_values[:self.half_tokens],
+            )
+        )
         if self.row_shard_dma:
             r = getattr(weights.shard, "rank", 0)
             dev = scratch.residual.device
@@ -1409,7 +1505,12 @@ class PreparedDecoder:
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
                 examples=examples, pipelined_ffn=pipelined_ffn, pipelined_attn_hc=pipelined_attn_hc,
                 defer_mlp_b=defer_mlp_b, defer_engram_reduce=overlap_engram, pipelined_attn=pipelined_attn,
-                row_shard_dma=layer_row_shard_dma, shard_rows=shared_shard_rows)
+                row_shard_dma=layer_row_shard_dma, shard_rows=shared_shard_rows,
+                replicated_attention=(
+                    weights.replicated_attention.get(index)
+                    if self.row_shard_attention and layer_row_shard_dma and pipelined_attn == "full"
+                    else None
+                ))
             if pipelined_attn_hc:
                 prev_plan = self.layers[index - 1].cr_mlp_1.reduce.plan
                 if getattr(prepared_layer.attention_hc, "plan", None) is not None:

@@ -4,6 +4,7 @@
 
 """Windowed MLA, source-shared compression, and two-level sparse selection."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -411,7 +412,7 @@ class PreparedAttention:
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
                  mla_compute_mode="auto", window_metadata=None, examples=None, pipelined_mode=None,
-                 qkv_encoded=None):
+                 qkv_encoded=None, shard_tokens=None, replicated_weights=None):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
         self.replay_start = replay_start
@@ -421,6 +422,14 @@ class PreparedAttention:
             raise ValueError("full pipelined attention requires a non-source, non-indexer layer")
         if qkv_encoded is not None and pipelined_mode != "full":
             raise ValueError("preencoded qkv_a requires full pipelined attention")
+        if (shard_tokens is None) != (replicated_weights is None):
+            raise ValueError("row-sharded attention requires both shard_tokens and replicated_weights")
+        self.row_shard_attention = shard_tokens is not None
+        if self.row_shard_attention:
+            if mode != "prefill" or pipelined_mode != "full":
+                raise ValueError("row-sharded attention requires prefill mode with full pipelined attention")
+            if qkv_encoded is not None:
+                raise ValueError("row-sharded attention owns shard-local qkv_a quantization and rejects preencoded qkv_a")
         self.pipelined_mode = pipelined_mode
         config = pool.config
         draft = mode == "draft"
@@ -431,8 +440,36 @@ class PreparedAttention:
         if pipelined_mode is not None and (tokens < 2 or tokens % 2 != 0):
             raise ValueError("pipelined attention requires an even token capacity >= 2")
         self.half_tokens = tokens // 2
-        prefix_tokens = self.half_tokens if pipelined_mode == "full" else tokens
-        mla_tokens = self.half_tokens if pipelined_mode in ("full", "mla_wo") else tokens
+        if self.row_shard_attention:
+            if type(shard_tokens) is not int or shard_tokens <= 0 or self.half_tokens % shard_tokens != 0:
+                raise ValueError("row-sharded attention shard_tokens must be a positive divisor of half_tokens")
+            if (not isinstance(replicated_weights, Mapping)
+                    or any(replicated_weights.get(k) is None for k in ("q_b_full", "output_full", "sink_full"))):
+                raise ValueError("row-sharded attention requires q_b_full, output_full, and sink_full weights")
+            num_heads = config.text.get("num_attention_heads", 64)
+            head_dim = config.text.get("head_dim", 512)
+            o_groups = config.text.get("o_groups", 8)
+            q_b_weight = replicated_weights["q_b_full"]
+            output_weight = replicated_weights["output_full"]
+            sink_weight = replicated_weights["sink_full"]
+            q_b_out = getattr(q_b_weight, "out_features", None)
+            out_groups = getattr(output_weight, "groups", None)
+            if ((q_b_out is not None and q_b_out != num_heads * head_dim)
+                    or (out_groups is not None and out_groups != o_groups)
+                    or not isinstance(sink_weight, torch.Tensor)
+                    or sink_weight.shape != (num_heads,)
+                    or sink_weight.dtype != torch.float32
+                    or sink_weight.device != device):
+                raise ValueError("row-sharded attention replicated weights must span all heads and output groups")
+            self.shard_tokens = shard_tokens
+            prefix_tokens = shard_tokens
+            mla_tokens = shard_tokens
+            window_tokens = self.half_tokens
+        else:
+            self.shard_tokens = 0
+            prefix_tokens = self.half_tokens if pipelined_mode == "full" else tokens
+            mla_tokens = self.half_tokens if pipelined_mode in ("full", "mla_wo") else tokens
+            window_tokens = prefix_tokens
         rows = metadata.starts.numel()
         def zeros(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=device)
@@ -473,9 +510,21 @@ class PreparedAttention:
         self.index_lengths = zeros(tokens, torch.int32) if geometry is None else geometry.index_lengths
         self.page_table = metadata.token_page_table
         self.projections = {}
+        if self.row_shard_attention:
+            query_buf = declaration_tensor(
+                examples, "row_shard.attn_query", (prefix_tokens, num_heads, head_dim), torch.bfloat16, device)
+            attended_buf = declaration_tensor(
+                examples, "row_shard.attn_attended", (mla_tokens, num_heads, head_dim), torch.bfloat16, device)
+        else:
+            q_b_weight = weights["q_b"]
+            output_weight = weights["output"]
+            sink_weight = weights["sink"]
+            query_buf = scratch.query[:prefix_tokens]
+            attended_buf = scratch.attended[:mla_tokens]
         use_b12x_mxfp8 = not sm103_projection.is_sm103(device)
-        paired_mxfp8 = use_b12x_mxfp8 and all(isinstance(getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
-                           for key in ("qkv_a", "q_b"))
+        paired_mxfp8 = use_b12x_mxfp8 and all(
+            isinstance(getattr(w, "weight", None), mxfp8.MXFP8Rows)
+            for w in (weights["qkv_a"], q_b_weight))
         use_a16_qkv = (paired_mxfp8 and prefix_tokens <= 28
                        and not getattr(session, "native_dense_activations", False))
         self.norm_quant = (PreparedMLANormQuant(scratch.projected[:prefix_tokens],
@@ -484,17 +533,17 @@ class PreparedAttention:
             eps=self.eps, session=session, name=name + ".qkv_norm",
             release_dependents=prefix_tokens <= 8, examples=examples)
             if paired_mxfp8 and not use_a16_qkv and self.eps == 1e-20 and mla_norm_mxfp8.is_supported(device) else None)
-        for key, values, out in (
-            ("qkv_a", source[:prefix_tokens], scratch.projected[:prefix_tokens]),
-            ("q_b", scratch.query_low[:prefix_tokens], scratch.query[:prefix_tokens].view(prefix_tokens, -1)),
+        for key, w, values, out in (
+            ("qkv_a", weights["qkv_a"], source[:prefix_tokens], scratch.projected[:prefix_tokens]),
+            ("q_b", q_b_weight, scratch.query_low[:prefix_tokens], query_buf.view(prefix_tokens, -1)),
         ):
             packed_mxfp8 = use_b12x_mxfp8 and isinstance(
-                getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
+                getattr(w, "weight", None), mxfp8.MXFP8Rows)
             use_quantized_seam = packed_mxfp8 and not use_a16_qkv
             qkv_preencoded = key == "qkv_a" and qkv_encoded is not None
             if qkv_preencoded and not use_quantized_seam:
                 raise ValueError("preencoded qkv_a requires an MXFP8 quantized attention seam")
-            self.projections[key] = QuantizedProjection(values, weights[key], out,
+            self.projections[key] = QuantizedProjection(values, w, out,
                 session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto",
                 mxfp8_min_amax=(1e-4 if use_quantized_seam and not qkv_preencoded
                                 and (key != "q_b" or self.norm_quant is None) else None),
@@ -519,14 +568,14 @@ class PreparedAttention:
                 scratch.window_values[:prefix_tokens], eps=self.eps, session=session, name=name + ".kv_norm")
                 if self.norm_quant is None else None)
         self.output_projection = PreparedGroupedOutputProjection(
-            scratch.attended[:mla_tokens], weights["output"], scratch.output[:mla_tokens],
+            attended_buf, output_weight, scratch.output[:mla_tokens],
             session=session, name=name + ".output", workspace=workspace,
             inv_rope=self.angles is not None,
-            heads_per_group=scratch.attended.shape[1] // getattr(weights["output"], "groups", 1),
+            heads_per_group=attended_buf.shape[1] // getattr(output_weight, "groups", 1),
             nope_dim=448, rope_dim=64, positions=self.token_offsets[:mla_tokens],
             cos_sin_cache=None if self.angles is None else self.angles.values[:mla_tokens])
-        self.window_writer = PreparedCompressedCacheWriter(scratch.window_values[:prefix_tokens], self.window_cache,
-            self.window_slots[:prefix_tokens], page_size=self.window_page_size, kind="swa", session=session,
+        self.window_writer = PreparedCompressedCacheWriter(scratch.window_values[:window_tokens], self.window_cache,
+            self.window_slots[:window_tokens], page_size=self.window_page_size, kind="swa", session=session,
             name=f"{name}.window_write",
             history=self.window if mode in ("verify", "draft") else None,
             history_rows=metadata.state_rows if mode in ("verify", "draft") else None,
@@ -565,9 +614,9 @@ class PreparedAttention:
             indexed_indices=scratch.selected[:mla_tokens], indexed_lengths=self.index_lengths[:mla_tokens],
             page_table=self.page_table[:mla_tokens],
             indexed_page_size=128 // self.ratio)
-        self.attention = PreparedCompressedMLA(scratch.query[:mla_tokens], self.window_cache,
-            self.window_indices[:mla_tokens], self.window_lengths[:mla_tokens], weights["sink"],
-            scratch.attended[:mla_tokens],
+        self.attention = PreparedCompressedMLA(query_buf[:mla_tokens], self.window_cache,
+            self.window_indices[:mla_tokens], self.window_lengths[:mla_tokens], sink_weight,
+            attended_buf,
             window_page_size=self.window_page_size,
             # Speculative rows use explicit indices into staged caches. Their
             # prepared row bound belongs to the decode contract, including
@@ -609,7 +658,7 @@ class PreparedAttention:
                 selectors=self.selectors if overlap_indexer else (),
                 selector_rows=INDEXER_QUERY_ROWS)
 
-        self.query_shape = (prefix_tokens, scratch.query.shape[1], scratch.query.shape[2])
+        self.query_shape = (prefix_tokens, query_buf.shape[1], query_buf.shape[2])
         self.candidate_source = config.text["candidate_source_layer_id"]
         self.q_b_fused_rope = False
         self.index_query_fused_rope = False
@@ -637,7 +686,8 @@ class PreparedAttention:
         register_finalizer(session, self.release_examples)
 
     def _finalize_standalone_rope(self):
-        if (self.concurrent_query is None and self.angles is not None and self.angles.split
+        if (not self.row_shard_attention and self.concurrent_query is None
+                and self.angles is not None and self.angles.split
                 and self.projections["q_b"].encoded is None
                 and self.projections["q_b"].encoded_layout is None):
             self.q_b_fused_rope = register_tc_gemv_rope(
@@ -690,6 +740,53 @@ class PreparedAttention:
         if self.mode == "prefill":
             gather_rows(self.window, metadata.state_rows, window_cache[:, :128 * 528])
         return window_cache
+
+    def run_shard_qkv_q(self, source_shard, *, indices, shard_rows):
+        """Run rank-local [st, 5120] through qkv_a, norm_quant, KV RoPE, q_b_full, and Q RoPE."""
+        if not getattr(self, "row_shard_attention", False):
+            raise ValueError("run_shard_qkv_q requires row-sharded attention")
+        qkv = self.projections["qkv_a"]
+        qkv_encoded_bases = (None if qkv.encoded_layout is None else tuple(
+            torch.empty(shape, dtype=dtype, device=source_shard.device) for shape, dtype in qkv.encoded_layout))
+        projected = qkv(source_shard, encoded_bases=qkv_encoded_bases)
+        encoded_bases = None
+        layer_angles = torch.index_select(indices.angles[(bool(self.ratio), 0)], 0, shard_rows)
+        if self.fused_qkv_norm_rope:
+            query_low, window_values = _q_kv_norm_rope(
+                projected, self.q_norm_weight, self.kv_norm_weight, layer_angles, self.eps)
+        elif self.norm_quant is None:
+            query_low = self.query_norm(projected[:, :1280])
+            window_values = self.window_norm(projected[:, 1280:])
+            self.angles.apply(window_values, layer_angles)
+        else:
+            query_low, window_values, encoded_bases = self.norm_quant(projected)
+            self.angles.apply(window_values, layer_angles)
+        query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
+        self.angles.apply(query, layer_angles)
+        return query, window_values, layer_angles
+
+    def run_shard_mla_wo(self, query_shard, window_values_full, metadata, selection, *,
+                         indices, window_cache, half_idx, shard_rows, layer_angles):
+        """Write full half-chunk SWA KV cache [h, 512], then run rank-local [st, 64, 512] MLA + Wo."""
+        if not getattr(self, "row_shard_attention", False):
+            raise ValueError("run_shard_mla_wo requires row-sharded attention")
+        m = metadata
+        h = self.half_tokens
+        sl = slice(0, h) if half_idx == 0 else slice(h, 2 * h)
+        self.window_writer(window_values_full, indices.window_slots[sl], cache=window_cache)
+        selected, _, _ = selection
+        geometry = indices.compressed(self.ratio) if self.ratio else None
+        win_idx = torch.index_select(indices.window_indices, 0, shard_rows)
+        win_len = torch.index_select(indices.window_lengths, 0, shard_rows)
+        attended = self.attention(
+            query_shard, win_idx, win_len,
+            indexed_indices=torch.index_select(selected, 0, shard_rows) if self.ratio else None,
+            indexed_lengths=torch.index_select(geometry.index_lengths, 0, shard_rows) if self.ratio else None,
+            page_table=torch.index_select(m.token_page_table, 0, shard_rows) if self.ratio else None,
+            window=window_cache,
+        )
+        return self.output_projection(
+            attended, positions=self.token_offsets[:self.shard_tokens], cos_sin_cache=layer_angles)
 
     def run_half(self, source_half, metadata, selection, *, indices, window_cache, half_idx,
                  qkv_encoded_bases=None):
