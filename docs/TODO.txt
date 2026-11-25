@@ -358,3 +358,16 @@
     on single-host SM120 PCIe has been exported and served. Close when each
     supported configuration exports and passes native serving validation or
     remains explicitly rejected by planning.
+
+[ ] Wire `num_valid_tokens` (`metadata.live_counts[:1]`) into the remaining
+    `PreparedRouter` recipes (`deepseek4` on non-prefill modes, where prefill
+    masks `ids` via `metadata.positions >= 0`; `glm53`, `kimi3`, `mimo_v2`,
+    and `step5`, which pass `correction_bias` without `num_valid_tokens`; and
+    `qwen38`, which calls unbiased `PreparedRouter` without
+    `num_valid_tokens`), and qualify `deepseek-v4.1-flash` valid-token MoE
+    routing at TP3 and TP6 and on SM103; `deepseek-v4.1-flash` compiled-layer
+    replay on SM120 and SM121 and TP4 `--roce-ring` `ignition export` and
+    `flare run` serving on GB10 (SM121) are verified. Close when each remaining
+    recipe forwards `metadata.live_counts[:1]` and the remaining
+    `deepseek-v4.1-flash` target widths and architectures pass serving
+    validation.
