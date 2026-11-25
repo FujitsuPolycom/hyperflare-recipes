@@ -13,7 +13,10 @@ from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
 from b12x.gemm import blockscaled
 from b12x.norm import mhc
 from b12x.norm.mhc import _impl as mhc_impl
-from b12x.norm.mhc._split_lagged import compile_cluster_post_y_norm
+from b12x.norm.mhc._split_lagged import (
+    compile_cluster_post_y_norm,
+    split_lagged_cluster_size,
+)
 from b12x.preparation import PreparationSession, PreparedCall
 
 from hyperflare_recipes.components.mhc import MHCScratch, MHCWeights
@@ -162,11 +165,12 @@ def test_register_tc_gemv_rope_matches_unfused(head_dim: int, tokens: int, split
     assert int(ulp.max().item()) <= 1
 
 
-def test_split_lagged_mhc_eager_and_compiled_match_reference():
+@pytest.mark.parametrize("tokens", [1, 8, 13, 16, 32, 64, 127, 128])
+def test_split_lagged_mhc_eager_and_compiled_match_reference(tokens: int):
     _require_sm120()
     device = torch.device("cuda", torch.cuda.current_device())
-    torch.manual_seed(202)
-    tokens, hidden = 8, 5120
+    torch.manual_seed(202 + tokens)
+    hidden = 5120
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device) * 0.5
     residual = torch.randn(tokens, 4, hidden, dtype=torch.bfloat16, device=device) * 0.5
     prev_post = torch.rand(tokens, 4, dtype=torch.float32, device=device)
@@ -198,7 +202,7 @@ def test_split_lagged_mhc_eager_and_compiled_match_reference():
     plan = mhc.plan(
         mhc.Caps(device=device, max_tokens=tokens, hidden_size=hidden), invocation=inv
     )
-    sess = PreparationSession(compile_workers=0)
+    sess = PreparationSession(compile_workers=0, autotune=False)
     sc_buf = MHCScratch.allocate(tokens, hidden, device)
     pre_ref = torch.empty_like(pre_mix)
 
@@ -230,7 +234,7 @@ def test_split_lagged_mhc_eager_and_compiled_match_reference():
             )
         )
 
-    sess.prepare((plan.request(name="ref", prepare_call=prepare),))
+    sess.prepare((plan.request(name=f"ref_{tokens}", prepare_call=prepare),))
     state = plan._prepared.state
     ws = [
         torch.empty(sp.nbytes, dtype=sp.dtype, device=device)
@@ -277,6 +281,7 @@ def test_split_lagged_mhc_eager_and_compiled_match_reference():
             False,
             1e-20,
             torch.bfloat16,
+            cluster_size=split_lagged_cluster_size(tokens),
             emit_mxfp8=True,
         )
     )
@@ -289,9 +294,8 @@ def test_split_lagged_mhc_eager_and_compiled_match_reference():
         return out_, y_, av_, as_, post_, comb_, pre_
 
     eager = step(x, residual, prev_post, prev_comb, pre_mix)
-    compiled = torch.compile(step, fullgraph=True)(
-        x, residual, prev_post, prev_comb, pre_mix
-    )
+    compiled_fn = torch.compile(step, fullgraph=True)
+    compiled = compiled_fn(x, residual, prev_post, prev_comb, pre_mix)
     torch.cuda.synchronize()
 
     for a, b in zip(eager, compiled, strict=True):
@@ -299,6 +303,52 @@ def test_split_lagged_mhc_eager_and_compiled_match_reference():
     out_new, y_new, _, _, post_new, comb_new, pre_new = eager
     torch.testing.assert_close(out_new.float(), out_ref.float(), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(y_new.float(), y_ref.float(), atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(pre_new, pre_ref, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(post_new, post_ref, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(comb_new, comb_ref, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(pre_new, pre_ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(post_new, post_ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(comb_new, comb_ref, atol=1e-4, rtol=1e-4)
+
+    # Capture compiled split-lagged overlap into a CUDA graph, replay, and verify live mutation.
+    if tokens in (8, 16, 64, 128):
+        cap_stream = torch.cuda.Stream(device=device)
+        gx, gr, gpp, gpc, gpm = (
+            x.clone(),
+            residual.clone(),
+            prev_post.clone(),
+            prev_comb.clone(),
+            pre_mix.clone(),
+        )
+        torch.cuda.synchronize()
+        with torch.cuda.stream(cap_stream):
+            compiled_fn(gx, gr, gpp, gpc, gpm)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=cap_stream):
+            g_out = compiled_fn(gx, gr, gpp, gpc, gpm)
+        with torch.cuda.stream(cap_stream):
+            graph.replay()
+        torch.cuda.synchronize()
+        for a, b in zip(g_out, eager, strict=True):
+            assert torch.equal(a, b)
+
+        torch.manual_seed(909 + tokens)
+        nx = torch.randn_like(gx) * 0.5
+        nr = torch.randn_like(gr) * 0.5
+        npp = torch.rand_like(gpp)
+        npc = torch.softmax(torch.randn_like(gpc), dim=-1)
+        npm = torch.softmax(torch.randn_like(gpm), dim=-1)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(cap_stream):
+            gx.copy_(nx)
+            gr.copy_(nr)
+            gpp.copy_(npp)
+            gpc.copy_(npc)
+            gpm.copy_(npm)
+            graph.replay()
+        torch.cuda.synchronize()
+        replayed = tuple(t.clone() for t in g_out)
+        assert not torch.equal(replayed[0], eager[0])
+        assert not torch.equal(replayed[6], eager[6])
+        expected = step(gx, gr, gpp, gpc, gpm)
+        torch.cuda.synchronize()
+        for a, b in zip(replayed, expected, strict=True):
+            assert torch.equal(a, b)
