@@ -128,6 +128,17 @@ def _mhc_weights(weights, kind, norm):
                       residual[f"hc_{kind}_base"], residual[norm + ".weight"])
 
 
+def _mxfp8_scale_mma(scale_rows_2d: torch.Tensor, hidden: int) -> torch.Tensor:
+    """Swizzle contiguous [rows, hidden // 32] UE8M0 scale rows into b12x MMA tile layout."""
+    m_tiles, k_tiles = scale_rows_2d.shape[0] // 128, hidden // 128
+    return (
+        scale_rows_2d.view(m_tiles, 4, 32, k_tiles, 4)
+        .permute(0, 3, 2, 1, 4)
+        .contiguous()
+        .view(1, m_tiles, k_tiles, 32, 4, 4)
+    )
+
+
 class PreparedDecoderBoundary:
     """Produce complete global KV, then optionally gather the decoder's bounded replay rows."""
 
@@ -296,6 +307,9 @@ class PreparedLayer:
                 self.shard_rows_a, self.shard_rows_b, self.shard_offset_a, self.shard_offset_b = shard_rows
         else:
             self.shard_rows_a = self.shard_rows_b = self.shard_offset_a = self.shard_offset_b = None
+        self.attn_quantizer_plan = None
+        self.attn_local_shapes = None
+        self.attn_vals_bf16_cols = 0
         self.ffn_quantizer_plan = None
         self.ffn_local_shapes = None
         self.ffn_meta_scale_cols = 0
@@ -367,19 +381,70 @@ class PreparedLayer:
             self.attention_hc = None if boundary is not None else PreparedMHC(
                 incoming, _mhc_weights(weights, "attn", "attn_norm"), s.attention_hc,
                 session=session, name=name + ".attn_hc", workspace=workspace, pre_mix=s.pre_mix, pre_out=s.attn_mix, **options)
+        attn_qkv_encoded = None
+        attn_gather_in = None
+        attn_gather_out = None
+        if self.row_shard_dma and self.pipelined_attn == "full":
+            st = self.shard_tokens
+            dev = s.attention_hc.normalized.device
+            hidden = s.attention_hc.normalized.shape[1]
+            if dev.type == "cuda" and st % 128 == 0 and h % 128 == 0 and h > 28 and hidden % 128 == 0:
+                from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+                from b12x.quantization import mxfp8
+                from hyperflare_recipes.components import sm103_projection
+
+                qkv_weight = weights.attention["qkv_a"]
+                if (not sm103_projection.is_sm103(dev)
+                        and isinstance(qkv_weight, MXFP8LinearWeight)
+                        and qkv_weight.padded_in_features == hidden):
+                    local_shapes = mxfp8.dense_rows_storage_shapes(st, hidden)
+                    full_shapes = mxfp8.dense_rows_storage_shapes(h, hidden)
+                    local_vals = declaration_tensor(examples, "row_shard.attn_local_vals", local_shapes[0], torch.float8_e4m3fn, dev)
+                    local_srows = declaration_tensor(examples, "row_shard.attn_local_srows", local_shapes[1], torch.uint8, dev)
+                    local_smma = declaration_tensor(examples, "row_shard.attn_local_smma", local_shapes[2], torch.uint8, dev)
+                    full_vals = declaration_tensor(examples, "row_shard.attn_full_vals", full_shapes[0], torch.float8_e4m3fn, dev)
+                    full_srows = declaration_tensor(examples, "row_shard.attn_full_srows", full_shapes[1], torch.uint8, dev)
+                    full_smma = declaration_tensor(examples, "row_shard.attn_full_smma", full_shapes[2], torch.uint8, dev)
+                    vals_bf16_cols = hidden // 2
+                    scale_bf16_cols = local_srows.view(st, -1).view(torch.bfloat16).shape[1]
+                    local_packed = declaration_tensor(examples, "row_shard.attn_local_packed",
+                                                      (st, vals_bf16_cols + scale_bf16_cols), torch.bfloat16, dev)
+                    full_packed = declaration_tensor(examples, "row_shard.attn_full_packed",
+                                                     (h, vals_bf16_cols + scale_bf16_cols), torch.bfloat16, dev)
+                    if PreparedGatherShards.fits(runtime, local_packed, full_packed):
+                        local_encoded = mxfp8.dense_rows_from_bases(local_vals, local_srows, local_smma)
+                        full_encoded = mxfp8.dense_rows_from_bases(full_vals, full_srows, full_smma)
+                        self.attn_local_shapes = local_shapes
+                        self.attn_vals_bf16_cols = vals_bf16_cols
+                        # Match PreparedAttention's qkv_a min_amax=1e-4 so shard quantization is bit-exact.
+                        src_attn_norm = s.attention_hc.normalized[:st]
+                        self.attn_quantizer_plan = mxfp8.plan(mxfp8.query_from_call(
+                            src_attn_norm, local_encoded.values, local_encoded.scale_rows,
+                            local_encoded.scale_mma, min_amax=1e-4))
+                        declare(session, (self.attn_quantizer_plan.request(
+                            name=name + ".attn_quant",
+                            prepare_call=lambda state, src=src_attn_norm, enc=local_encoded: PreparedCall(
+                                run=lambda: state.run(src, enc.values, enc.scale_rows, enc.scale_mma),
+                                owners=(src, enc))),))
+                        attn_qkv_encoded = full_encoded
+                        attn_gather_in = local_packed
+                        attn_gather_out = full_packed
         self.attention = PreparedAttention(index, weights.attention, s.attention_hc.normalized, s.attention,
             metadata, pool, rotary, mode=mode, world=shard.world_size,
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode,
-            window_metadata=window_metadata, examples=examples, pipelined_mode=self.pipelined_attn)
+            window_metadata=window_metadata, examples=examples, pipelined_mode=self.pipelined_attn,
+            qkv_encoded=attn_qkv_encoded)
         if self.row_shard_dma:
             st = self.shard_tokens
             self.attention_reduce = None
             self.attn_gather_0 = PreparedGatherShards(
-                s.attention_hc.normalized[:st], s.attention_hc.normalized[:h],
+                s.attention_hc.normalized[:st] if attn_gather_in is None else attn_gather_in,
+                s.attention_hc.normalized[:h] if attn_gather_out is None else attn_gather_out,
                 runtime=runtime, coordinator=coordinator, session=session, name=name + ".attn_gather.0")
             self.attn_gather_1 = PreparedGatherShards(
-                s.attention_hc.normalized[:st], s.attention_hc.normalized[h:],
+                s.attention_hc.normalized[:st] if attn_gather_in is None else attn_gather_in,
+                s.attention_hc.normalized[h:] if attn_gather_out is None else attn_gather_out,
                 runtime=runtime, coordinator=coordinator, session=session, name=name + ".attn_gather.1")
             self.att_reduce_0 = PreparedReduceScatter(
                 s.attention.output[:h], s.attention_output[:st],
@@ -516,8 +581,10 @@ class PreparedLayer:
             attn_parallel = list(self.attention.plans())
             if getattr(self.attention_hc, "plan", None) is not None:
                 attn_parallel.append(self.attention_hc.plan)
+            if self.attn_quantizer_plan is not None:
+                attn_parallel.append(self.attn_quantizer_plan)
             self.cr_attn_gather_0 = ConcurrentGatherShards(self.attn_gather_0, workspace=workspace, session=session,
-                parallel_plans=(self.attention_hc.plan,))
+                parallel_plans=tuple(p for p in (self.attention_hc.plan, self.attn_quantizer_plan) if p is not None))
             if self.pipelined_attn == "full":
                 self.cr_attn_gather_1 = ConcurrentGatherShards(self.attn_gather_1, workspace=workspace, session=session,
                     parallel_plans=attn_parallel)
@@ -690,6 +757,31 @@ class PreparedLayer:
             engram_project=engram_project)
         return incoming, next_mix, records, selection
 
+    def _prepare_attn_shard(self, normalized):
+        if self.attn_quantizer_plan is None:
+            return normalized
+        from b12x.quantization import mxfp8
+
+        local_vals = torch.empty(self.attn_local_shapes[0], dtype=torch.float8_e4m3fn, device=normalized.device)
+        local_srows = torch.empty(self.attn_local_shapes[1], dtype=torch.uint8, device=normalized.device)
+        local_smma = torch.empty(self.attn_local_shapes[2], dtype=torch.uint8, device=normalized.device)
+        mxfp8.quantize_dense_rows(normalized, local_vals, local_srows, local_smma, plan=self.attn_quantizer_plan)
+        return torch.cat(
+            (local_vals.view(torch.bfloat16), local_srows.view(normalized.shape[0], -1).view(torch.bfloat16)),
+            dim=1,
+        )
+
+    def _unpack_attn_gathered(self, packed_full):
+        if self.attn_quantizer_plan is None:
+            return packed_full, None
+        full_rows = packed_full.shape[0]
+        full_vals = packed_full[:, :self.attn_vals_bf16_cols].contiguous().view(torch.float8_e4m3fn)
+        hidden = full_vals.shape[1]
+        full_srows_2d = packed_full[:, self.attn_vals_bf16_cols:].contiguous().view(torch.uint8)
+        full_srows = full_srows_2d.view(1, full_rows, hidden // 32)
+        full_smma = _mxfp8_scale_mma(full_srows_2d, hidden)
+        return full_vals, (full_vals, full_srows, full_smma)
+
     def _prepare_ffn_shard(self, normalized, mask, num_valid_tokens):
         logits = self.router_projection(normalized)
         route = self.router(logits, image_mask=mask, num_valid_tokens=num_valid_tokens)
@@ -716,13 +808,7 @@ class PreparedLayer:
             hidden = full_vals.shape[1]
             full_srows_2d = meta_full[:, :self.ffn_meta_scale_cols].contiguous().view(torch.uint8)
             full_srows = full_srows_2d.view(1, full_rows, hidden // 32)
-            m_tiles, k_tiles = full_rows // 128, hidden // 128
-            full_smma = (
-                full_srows_2d.view(m_tiles, 4, 32, k_tiles, 4)
-                .permute(0, 3, 2, 1, 4)
-                .contiguous()
-                .view(1, m_tiles, k_tiles, 32, 4, 4)
-            )
+            full_smma = _mxfp8_scale_mma(full_srows_2d, hidden)
             ffn_encoded_bases = (full_vals, full_srows, full_smma)
             route_words = meta_full[:, self.ffn_meta_scale_cols:].contiguous().view(torch.int32)
             top_k = route_words.shape[1] // 2
@@ -763,33 +849,43 @@ class PreparedLayer:
             attn_mix_a = torch.empty_like(pre_mix_a)
             res_a, post_a, comb_a, norm_a_sh = self.attention_hc(
                 mlp_a, prev_res_a, prev_post_a, prev_comb_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
-            mlp_b = self.cr_att_0.finish(p_mlp_b, norm_a_sh)
-            p_ag_a = self.cr_attn_gather_0.start(norm_a_sh, dependencies=(mlp_b,))
+            attn_a_sh = self._prepare_attn_shard(norm_a_sh)
+            mlp_b = self.cr_att_0.finish(p_mlp_b, attn_a_sh)
+            p_ag_a = self.cr_attn_gather_0.start(attn_a_sh, dependencies=(mlp_b,))
             attn_mix_b = torch.empty_like(pre_mix_b)
             res_b, post_b, comb_b, norm_b_sh = self.attention_hc(
                 mlp_b, prev_res_b, prev_post_b, prev_comb_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
+            attn_b_sh = self._prepare_attn_shard(norm_b_sh)
         else:
             src_a, src_b = incoming
             attn_mix_a = torch.empty_like(pre_mix_a)
             res_a, post_a, comb_a, norm_a_sh = self.attention_hc(src_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
-            p_ag_a = self.cr_attn_gather_0.start(norm_a_sh, dependencies=(norm_a_sh,))
+            attn_a_sh = self._prepare_attn_shard(norm_a_sh)
+            p_ag_a = self.cr_attn_gather_0.start(attn_a_sh, dependencies=(attn_a_sh,))
             attn_mix_b = torch.empty_like(pre_mix_b)
             res_b, post_b, comb_b, norm_b_sh = self.attention_hc(src_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
-        norm_a = self.cr_attn_gather_0.finish(p_ag_a, norm_b_sh)
+            attn_b_sh = self._prepare_attn_shard(norm_b_sh)
+        norm_a = self.cr_attn_gather_0.finish(p_ag_a, attn_b_sh)
         if self.pipelined_attn == "full":
-            p_ag_b = self.cr_attn_gather_1.start(norm_b_sh, dependencies=(norm_a,))
+            p_ag_b = self.cr_attn_gather_1.start(attn_b_sh, dependencies=(norm_a,))
             wc = self.attention.init_window_cache(metadata, norm_a.device) if window_cache is None else window_cache
-            out_a = self.attention.run_half(norm_a, metadata, selection, indices=indices, window_cache=wc, half_idx=0)
+            src_a_att, enc_a_att = self._unpack_attn_gathered(norm_a)
+            out_a = self.attention.run_half(
+                src_a_att, metadata, selection, indices=indices, window_cache=wc, half_idx=0,
+                qkv_encoded_bases=enc_a_att)
             norm_b = self.cr_attn_gather_1.finish(p_ag_b, out_a)
             p_att_a = self.cr_att_0.start(out_a, dependencies=(norm_b,))
-            out_b = self.attention.run_half(norm_b, metadata, selection, indices=indices, window_cache=wc, half_idx=1)
+            src_b_att, enc_b_att = self._unpack_attn_gathered(norm_b)
+            out_b = self.attention.run_half(
+                src_b_att, metadata, selection, indices=indices, window_cache=wc, half_idx=1,
+                qkv_encoded_bases=enc_b_att)
             records = (wc, None)
             if self.attention.mode == "prefill":
                 self.attention.commit(metadata.lengths, records, metadata)
             att_a = self.cr_att_0.finish(p_att_a, out_b)
-            attention_normalized = norm_a
+            attention_normalized = src_a_att
         else:
-            norm_b = self.attn_gather_1(norm_b_sh, dependencies=(norm_a,))
+            norm_b = self.attn_gather_1(attn_b_sh, dependencies=(norm_a,))
             normalized = torch.cat((norm_a, norm_b), dim=0)
             attention_normalized = normalized
             pending_engram = None

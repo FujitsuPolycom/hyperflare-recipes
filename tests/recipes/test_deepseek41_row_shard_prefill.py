@@ -4,6 +4,7 @@
 """DeepSeek V4.1 PCIe row-sharded encoder prefill eligibility, shard clamping, and Engram selection."""
 
 from dataclasses import dataclass
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -15,10 +16,12 @@ from hyperflare_recipes.components.mlp import MLPScratch
 from hyperflare_recipes.components.moe import RouteRecord, RouterScratch
 from hyperflare_recipes.components.paged_batch import Metadata
 from hyperflare_recipes.components.parallel import TensorParallelShard
-from hyperflare_recipes.recipes.deepseek41 import decoder, engram as ds_engram, recipe as ds_recipe
+from hyperflare_recipes.recipes.deepseek41 import attention as ds_attention, decoder, engram as ds_engram, recipe as ds_recipe
 from hyperflare_recipes.recipes.deepseek41.bootstrap import PreparationConfig
 from ignition.planning import Gpu, Plan, UsageError
 from ignition.preparation.scratch import ScratchArena
+
+_RUN_CUDA_TESTS = os.environ.get("FLARE_RUN_CUDA_TESTS") == "1"
 
 
 def _sm120_gpus(count: int, capability: tuple[int, int] = (12, 0)) -> tuple[Gpu, ...]:
@@ -376,6 +379,9 @@ def test_prepared_layer_row_shard_clamps_partial_tails_and_reconstructs_mxfp8_sc
         layer.shard_offset_b = torch.tensor([half + s0], dtype=torch.int32)
         layer.engram = None
         layer.has_image_mask = True
+        layer.attn_quantizer_plan = None
+        layer.attn_local_shapes = None
+        layer.attn_vals_bf16_cols = 0
         layer.ffn_quantizer_plan = None
         layer.ffn_local_shapes = None
         layer.ffn_meta_scale_cols = 0
@@ -681,3 +687,273 @@ def test_prepared_engram_row_shard_eligibility_and_owner_row_selection(monkeypat
             build_engram(
                 tok=tokens, rank=0, w_size=world, runtime=dma_rt, weights=weights_full, row_shard=bad_row_shard
             )
+
+
+@pytest.mark.parametrize("pipelined_attn_hc", [False, True])
+def test_prepared_layer_attn_mxfp8_gather_unpack_and_wiring(pipelined_attn_hc):
+    tokens, world, hidden, top_k = 1024, 4, 256, 6
+    half = tokens // 2
+    shard_tokens = half // world
+    scale_cols_u8 = hidden // 32
+    vals_bf16_cols = hidden // 2
+    scale_bf16_cols = scale_cols_u8 // 2
+
+    class PassCollective:
+        def __init__(self, fn):
+            self.fn = fn
+            self.seen_shapes = []
+
+        def start(self, source, *, dependencies=()):
+            self.seen_shapes.append(tuple(source.shape))
+            out = self.fn(source)
+            return SimpleNamespace(source=source, output=out, dependencies=dependencies)
+
+        def finish(self, pending, dependency):
+            return pending.output
+
+    layer = decoder.PreparedLayer.__new__(decoder.PreparedLayer)
+    layer.row_shard_dma = True
+    layer.pipelined_attn_hc = pipelined_attn_hc
+    layer.pipelined_attn = "full"
+    layer.defer_mlp_b = False
+    layer.half_tokens = half
+    layer.shard_tokens = shard_tokens
+    layer.shard_rows_a = torch.arange(0, shard_tokens, dtype=torch.int64)
+    layer.shard_rows_b = torch.arange(half, half + shard_tokens, dtype=torch.int64)
+    layer.shard_offset_a = torch.tensor([0], dtype=torch.int32)
+    layer.shard_offset_b = torch.tensor([half], dtype=torch.int32)
+    layer.engram = None
+    layer.has_image_mask = False
+    layer.attn_quantizer_plan = object()
+    layer.attn_local_shapes = None
+    layer.attn_vals_bf16_cols = vals_bf16_cols
+    layer.ffn_quantizer_plan = None
+    layer.ffn_local_shapes = None
+    layer.ffn_meta_scale_cols = 0
+
+    # Construct distinct per-(row, col) FP8 payloads and UE8M0 scales for both microbatch halves.
+    vals_a = ((torch.arange(half * hidden, dtype=torch.int64) % 113) + 1).to(torch.uint8).view(torch.float8_e4m3fn).reshape(half, hidden)
+    srows_a = ((torch.arange(half * scale_cols_u8, dtype=torch.int64) % 241) + 5).to(torch.uint8).reshape(half, scale_cols_u8)
+    packed_a = torch.cat((vals_a.view(torch.bfloat16), srows_a.view(torch.bfloat16)), dim=1)
+
+    vals_b = ((torch.arange(half * hidden, dtype=torch.int64) % 97) + 3).to(torch.uint8).view(torch.float8_e4m3fn).reshape(half, hidden)
+    srows_b = ((torch.arange(half * scale_cols_u8, dtype=torch.int64) % 229) + 11).to(torch.uint8).reshape(half, scale_cols_u8)
+    packed_b = torch.cat((vals_b.view(torch.bfloat16), srows_b.view(torch.bfloat16)), dim=1)
+
+    # Verify _unpack_attn_gathered reproduces exact FP8 values, scale_rows, and MMA tile layout.
+    unpacked_vals, bases = layer._unpack_attn_gathered(packed_a)
+    assert bases is not None
+    b_vals, b_srows, b_smma = bases
+    assert torch.equal(unpacked_vals.view(torch.uint8), vals_a.view(torch.uint8))
+    assert torch.equal(b_vals.view(torch.uint8), vals_a.view(torch.uint8))
+    assert torch.equal(b_srows, srows_a.view(1, half, scale_cols_u8))
+    assert b_smma.shape == (1, half // 128, hidden // 128, 32, 4, 4)
+    for m_tile in range(half // 128):
+        for k_tile in range(hidden // 128):
+            for r_outer in range(4):
+                for c_inner in range(4):
+                    rows_idx = m_tile * 128 + r_outer * 32 + torch.arange(32)
+                    col_idx = k_tile * 4 + c_inner
+                    assert torch.equal(b_smma[0, m_tile, k_tile, :, r_outer, c_inner], srows_a[rows_idx, col_idx])
+
+    # Sensitivity check: mutating one packed scale byte changes the exact mapped scale_mma slot.
+    mutated = packed_a.clone()
+    mutated_srows = mutated[:, vals_bf16_cols:].contiguous().view(torch.uint8)
+    mutated_srows[165, 5] ^= 0x01
+    mutated[:, vals_bf16_cols:] = mutated_srows.view(torch.bfloat16)
+    _, (_, _, mutated_smma) = layer._unpack_attn_gathered(mutated)
+    assert not torch.equal(mutated_smma, b_smma)
+    diff_mask = mutated_smma != b_smma
+    assert int(diff_mask.sum().item()) == 1
+    assert bool(diff_mask[0, 1, 1, 5, 1, 1].item())
+
+    # Wire _run_row_shard_dma and verify both half gathers carry packed width and forward qkv_encoded_bases.
+    packed_shards = [packed_a[:shard_tokens], packed_b[:shard_tokens]]
+    shard_idx = [0]
+
+    def fake_prepare_attn_shard(normalized):
+        out = packed_shards[shard_idx[0]]
+        shard_idx[0] += 1
+        return out
+
+    layer._prepare_attn_shard = fake_prepare_attn_shard
+    layer.attention_hc = lambda *args, **kwargs: (
+        torch.zeros((shard_tokens, 4, hidden), dtype=torch.bfloat16),
+        torch.zeros((shard_tokens, 4), dtype=torch.float32),
+        torch.zeros((shard_tokens, 4, 4), dtype=torch.float32),
+        torch.zeros((shard_tokens, hidden), dtype=torch.bfloat16),
+    )
+    layer.cr_attn_gather_0 = PassCollective(lambda sh: packed_a)
+    layer.cr_attn_gather_1 = PassCollective(lambda sh: packed_b)
+    seen_run_half = []
+
+    def fake_run_half(source_half, metadata, selection, *, indices, window_cache, half_idx, qkv_encoded_bases=None):
+        seen_run_half.append((half_idx, source_half, qkv_encoded_bases))
+        return torch.zeros((half, hidden), dtype=torch.bfloat16)
+
+    layer.attention = SimpleNamespace(
+        mode="prefill",
+        init_window_cache=lambda metadata, dev: "wc",
+        run_half=fake_run_half,
+        commit=lambda lengths, records, metadata: None,
+    )
+    layer.cr_att_0 = PassCollective(lambda full: torch.zeros((shard_tokens, hidden), dtype=torch.bfloat16))
+    layer.cr_att_1 = PassCollective(lambda full: torch.zeros((shard_tokens, hidden), dtype=torch.bfloat16))
+    layer.ffn_hc = lambda att, res, post, comb, *, pre_mix, pre_out: (res, post, comb, att)
+    layer.router_projection = lambda norm: torch.zeros((norm.shape[0], 384), dtype=torch.float32)
+    layer.router = lambda logits, **kw: RouterScratch(
+        torch.zeros((logits.shape[0], top_k), dtype=torch.float32),
+        torch.zeros((logits.shape[0], top_k), dtype=torch.int32),
+        torch.ones((logits.shape[0], top_k), dtype=torch.float32),
+    )
+    layer.cr_ffn_vals_0 = PassCollective(lambda sh: sh.repeat(world, 1))
+    layer.cr_ffn_meta_0 = PassCollective(lambda sh: sh.repeat(world, 1))
+    layer.cr_ffn_vals_1 = PassCollective(lambda sh: sh.repeat(world, 1))
+    layer.cr_ffn_meta_1 = PassCollective(lambda sh: sh.repeat(world, 1))
+    layer.experts = lambda vals, ids, weights, **kw: vals
+    layer.shared = lambda vals, **kw: vals
+    layer.cr_mlp_0 = PassCollective(lambda full: full[:shard_tokens].clone())
+    layer.cr_mlp_1 = PassCollective(lambda full: full[:shard_tokens].clone())
+    layer.post = lambda mlp_sh, res, post, comb: res
+
+    metadata = Metadata.allocate(tokens, 1, 10, "cpu")
+    metadata.live_counts[0] = tokens
+    metadata.lengths[0] = tokens
+    pm_a = torch.zeros((shard_tokens, 4), dtype=torch.float32)
+    pm_b = torch.zeros((shard_tokens, 4), dtype=torch.float32)
+    if pipelined_attn_hc:
+        zeros_res = torch.zeros((shard_tokens, 4, hidden), dtype=torch.bfloat16)
+        zeros_post = torch.zeros((shard_tokens, 4), dtype=torch.float32)
+        zeros_comb = torch.zeros((shard_tokens, 4, 4), dtype=torch.float32)
+        mlp_a = torch.zeros((shard_tokens, hidden), dtype=torch.bfloat16)
+        p_mlp_b = SimpleNamespace(output=torch.zeros((shard_tokens, hidden), dtype=torch.bfloat16))
+        incoming = (mlp_a, zeros_res, zeros_post, zeros_comb, p_mlp_b, zeros_res, zeros_post, zeros_comb)
+    else:
+        incoming = (
+            torch.zeros((shard_tokens, 4, hidden), dtype=torch.bfloat16),
+            torch.zeros((shard_tokens, 4, hidden), dtype=torch.bfloat16),
+        )
+
+    layer._run_row_shard_dma(incoming, (pm_a, pm_b), metadata, "indices", ("sel", None, None))
+    assert layer.cr_attn_gather_0.seen_shapes == [(shard_tokens, vals_bf16_cols + scale_bf16_cols)]
+    assert layer.cr_attn_gather_1.seen_shapes == [(shard_tokens, vals_bf16_cols + scale_bf16_cols)]
+    assert len(seen_run_half) == 2
+    assert seen_run_half[0][0] == 0 and seen_run_half[1][0] == 1
+    assert torch.equal(seen_run_half[0][1].view(torch.uint8), vals_a.view(torch.uint8))
+    assert torch.equal(seen_run_half[1][1].view(torch.uint8), vals_b.view(torch.uint8))
+    assert torch.equal(seen_run_half[0][2][1], srows_a.view(1, half, scale_cols_u8))
+    assert torch.equal(seen_run_half[1][2][1], srows_b.view(1, half, scale_cols_u8))
+
+
+def test_prepared_attention_preencoded_qkv_contract():
+    # Reject preencoded qkv_a outside full pipelined attention.
+    for bad_mode in (None, "mla_wo"):
+        with pytest.raises(ValueError, match="preencoded qkv_a requires full pipelined attention"):
+            ds_attention.PreparedAttention(
+                0, {}, None, None, None, None, None, mode="prefill", world=4,
+                session=None, name="attn", workspace=None, pipelined_mode=bad_mode,
+                qkv_encoded=object(),
+            )
+
+    # Preencoded qkv_a (quantizer_plan is None) must not allocate uninitialized encoded_bases in run_half.
+    seen_bases = []
+
+    class FakeQkvProjection:
+        def __init__(self, *, quantizer_plan):
+            self.quantizer_plan = quantizer_plan
+            self.encoded_layout = (((8, 16), torch.float8_e4m3fn),)
+
+        def __call__(self, source, *, encoded_bases=None):
+            seen_bases.append(encoded_bases)
+            if self.quantizer_plan is None and encoded_bases is None:
+                raise ValueError("functional preencoded projection requires encoded_bases")
+            raise StopIteration("reached qkv call")
+
+    attn = ds_attention.PreparedAttention.__new__(ds_attention.PreparedAttention)
+    attn.half_tokens = 8
+
+    attn.projections = {"qkv_a": FakeQkvProjection(quantizer_plan=None)}
+    with pytest.raises(ValueError, match="functional preencoded projection requires encoded_bases"):
+        attn.run_half(torch.zeros((8, 16), dtype=torch.bfloat16), None, None,
+                      indices=None, window_cache=None, half_idx=0, qkv_encoded_bases=None)
+    assert seen_bases == [None]
+
+    supplied = (torch.zeros((8, 16), dtype=torch.float8_e4m3fn),)
+    seen_bases.clear()
+    with pytest.raises(StopIteration, match="reached qkv call"):
+        attn.run_half(torch.zeros((8, 16), dtype=torch.bfloat16), None, None,
+                      indices=None, window_cache=None, half_idx=0, qkv_encoded_bases=supplied)
+    assert seen_bases == [supplied]
+
+    # Projection-owned quantizer still allocates fresh encoded_bases when caller passes None.
+    seen_bases.clear()
+    attn.projections = {"qkv_a": FakeQkvProjection(quantizer_plan=object())}
+    with pytest.raises(StopIteration, match="reached qkv call"):
+        attn.run_half(torch.zeros((8, 16), dtype=torch.bfloat16), None, None,
+                      indices=None, window_cache=None, half_idx=0)
+    assert len(seen_bases) == 1 and seen_bases[0] is not None and seen_bases[0][0].shape == (8, 16)
+
+
+@pytest.mark.skipif(
+    not _RUN_CUDA_TESTS or not torch.cuda.is_available(),
+    reason="requires CUDA GPU and FLARE_RUN_CUDA_TESTS=1",
+)
+def test_mxfp8_attn_shard_quantize_gather_matches_full_quantize_bit_exact_cuda():
+    from b12x.quantization import mxfp8
+
+    device = torch.device("cuda")
+    half, world, hidden = 4096, 4, 5120
+    st = half // world
+
+    gen = torch.Generator(device=device).manual_seed(42)
+    full_x = torch.randn((half, hidden), dtype=torch.bfloat16, device=device, generator=gen)
+    # Exercise zero rows and sub-min_amax rows (below 1e-4) alongside normal activations.
+    full_x[0].zero_()
+    full_x[128:256].mul_(1e-5)
+    full_x[1024:1152].mul_(50.0)
+
+    # Reference: post-gather MXFP8 quantization with min_amax=1e-4 (matching PreparedAttention qkv_a).
+    full_shapes = mxfp8.dense_rows_storage_shapes(half, hidden)
+    ref_vals = torch.empty(full_shapes[0], dtype=torch.float8_e4m3fn, device=device)
+    ref_srows = torch.empty(full_shapes[1], dtype=torch.uint8, device=device)
+    ref_smma = torch.empty(full_shapes[2], dtype=torch.uint8, device=device)
+    ref_encoded = mxfp8.dense_rows_from_bases(ref_vals, ref_srows, ref_smma)
+    full_plan = mxfp8.plan(mxfp8.query_from_call(
+        full_x, ref_encoded.values, ref_encoded.scale_rows, ref_encoded.scale_mma, min_amax=1e-4))
+    mxfp8.quantize_dense_rows(full_x, ref_vals, ref_srows, ref_smma, plan=full_plan)
+
+    # Treatment: per-shard quantization + pack -> gather -> unpack via PreparedLayer helpers.
+    local_shapes = mxfp8.dense_rows_storage_shapes(st, hidden)
+    local_vals_ex = torch.empty(local_shapes[0], dtype=torch.float8_e4m3fn, device=device)
+    local_srows_ex = torch.empty(local_shapes[1], dtype=torch.uint8, device=device)
+    local_smma_ex = torch.empty(local_shapes[2], dtype=torch.uint8, device=device)
+    local_encoded = mxfp8.dense_rows_from_bases(local_vals_ex, local_srows_ex, local_smma_ex)
+    shard_plan = mxfp8.plan(mxfp8.query_from_call(
+        full_x[:st], local_encoded.values, local_encoded.scale_rows, local_encoded.scale_mma, min_amax=1e-4))
+
+    layer = decoder.PreparedLayer.__new__(decoder.PreparedLayer)
+    layer.attn_quantizer_plan = shard_plan
+    layer.attn_local_shapes = local_shapes
+    layer.attn_vals_bf16_cols = hidden // 2
+
+    packed_shards = [layer._prepare_attn_shard(full_x[r * st : (r + 1) * st]) for r in range(world)]
+    assert all(p.shape == (st, hidden // 2 + hidden // 64) and p.dtype == torch.bfloat16 for p in packed_shards)
+    packed_full = torch.cat(packed_shards, dim=0)
+    got_vals, bases = layer._unpack_attn_gathered(packed_full)
+    assert bases is not None
+    b_vals, got_srows, got_smma = bases
+
+    assert torch.equal(got_vals.view(torch.uint8), ref_vals.view(torch.uint8))
+    assert torch.equal(b_vals.view(torch.uint8), ref_vals.view(torch.uint8))
+    assert torch.equal(got_srows, ref_srows)
+    assert torch.equal(got_smma, ref_smma)
+    got_encoded = mxfp8.dense_rows_from_bases(*bases)
+    assert torch.equal(got_encoded.scale_mma.view(torch.uint8), ref_encoded.scale_mma.view(torch.uint8))
+
+    # Sensitivity check: mismatched min_amax=0.0 must differ on the sub-1e-4 rows.
+    wrong_plan = mxfp8.plan(mxfp8.query_from_call(
+        full_x[:st], local_encoded.values, local_encoded.scale_rows, local_encoded.scale_mma, min_amax=0.0))
+    layer.attn_quantizer_plan = wrong_plan
+    wrong_full = torch.cat([layer._prepare_attn_shard(full_x[r * st : (r + 1) * st]) for r in range(world)], dim=0)
+    _, (_, wrong_srows, _) = layer._unpack_attn_gathered(wrong_full)
+    assert not torch.equal(wrong_srows, ref_srows)

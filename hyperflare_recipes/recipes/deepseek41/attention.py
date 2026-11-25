@@ -402,7 +402,8 @@ def _commit_window(Staged, Window, State, Starts, Lengths, STRIDE: tl.constexpr,
 class PreparedAttention:
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
-                 mla_compute_mode="auto", window_metadata=None, examples=None, pipelined_mode=None):
+                 mla_compute_mode="auto", window_metadata=None, examples=None, pipelined_mode=None,
+                 qkv_encoded=None):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
         self.replay_start = replay_start
@@ -410,6 +411,8 @@ class PreparedAttention:
             raise ValueError(f"unsupported pipelined attention mode: {pipelined_mode!r}")
         if pipelined_mode == "full" and ("compressor" in weights or "index_q" in weights):
             raise ValueError("full pipelined attention requires a non-source, non-indexer layer")
+        if qkv_encoded is not None and pipelined_mode != "full":
+            raise ValueError("preencoded qkv_a requires full pipelined attention")
         self.pipelined_mode = pipelined_mode
         config = pool.config
         draft = mode == "draft"
@@ -480,11 +483,15 @@ class PreparedAttention:
             packed_mxfp8 = use_b12x_mxfp8 and isinstance(
                 getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
             use_quantized_seam = packed_mxfp8 and not use_a16_qkv
+            qkv_preencoded = key == "qkv_a" and qkv_encoded is not None
+            if qkv_preencoded and not use_quantized_seam:
+                raise ValueError("preencoded qkv_a requires an MXFP8 quantized attention seam")
             self.projections[key] = QuantizedProjection(values, weights[key], out,
                 session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto",
-                mxfp8_min_amax=(1e-4 if use_quantized_seam and (key != "q_b" or self.norm_quant is None)
-                                else None),
-                encoded=self.norm_quant.encoded if key == "q_b" and self.norm_quant is not None else None,
+                mxfp8_min_amax=(1e-4 if use_quantized_seam and not qkv_preencoded
+                                and (key != "q_b" or self.norm_quant is None) else None),
+                encoded=(qkv_encoded if qkv_preencoded else
+                         (self.norm_quant.encoded if key == "q_b" and self.norm_quant is not None else None)),
                 rhs_prefetch_ready=use_quantized_seam,
                 allow_bf16_atomic_reduction=not packed_mxfp8,
                 examples=examples, example_role="attention." + key)
@@ -675,14 +682,16 @@ class PreparedAttention:
             gather_rows(self.window, metadata.state_rows, window_cache[:, :128 * 528])
         return window_cache
 
-    def run_half(self, source_half, metadata, selection, *, indices, window_cache, half_idx):
+    def run_half(self, source_half, metadata, selection, *, indices, window_cache, half_idx,
+                 qkv_encoded_bases=None):
         """Run one half-chunk [h, 5120] through QKV, SWA cache write, MLA, and Wo."""
         m = metadata
         h = self.half_tokens
         sl = slice(0, h) if half_idx == 0 else slice(h, 2 * h)
         qkv = self.projections["qkv_a"]
-        qkv_encoded_bases = (None if qkv.encoded_layout is None else tuple(
-            torch.empty(shape, dtype=dtype, device=source_half.device) for shape, dtype in qkv.encoded_layout))
+        if qkv_encoded_bases is None and qkv.quantizer_plan is not None and qkv.encoded_layout is not None:
+            qkv_encoded_bases = tuple(
+                torch.empty(shape, dtype=dtype, device=source_half.device) for shape, dtype in qkv.encoded_layout)
         projected = qkv(source_half, encoded_bases=qkv_encoded_bases)
         encoded_bases = None
         layer_angles = indices.angles[(bool(self.ratio), 0)][sl]
