@@ -204,6 +204,7 @@ def test_export_server_options_match_core_contract(tmp_path, budget):
     ("kimi-k3-dspark", "Kimi-K3"),
     ("step5-preview-nvfp4", "Step-5-Preview"),
     ("nemotron-bolt-24gb", "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB"),
+    ("nemotron-3.5-super-vl-nvfp4", "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"),
 ])
 @pytest.mark.parametrize("local", [False, True], ids=["checkpoint", "local-directory"])
 def test_server_options_advertise_canonical_names_independently_of_checkpoint_source(

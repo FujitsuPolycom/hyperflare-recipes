@@ -134,6 +134,12 @@ class PreparedUngatedMLP:
         self.activation, self.intermediate = activation, intermediate
 
         def projection(x, weight, y, suffix, bias):
+            from hyperflare_recipes.components.tensor_fp8 import TensorFP8Projection, TensorFP8Weight
+
+            if isinstance(weight, TensorFP8Weight):
+                if bias is not None:
+                    raise ValueError("tensor-FP8 MLP projections do not support bias")
+                return TensorFP8Projection(x, weight, y, session=session, name=name + suffix)
             kwargs = dict(session=session, name=name + suffix, bias=bias)
             if isinstance(weight, torch.Tensor):
                 return UnquantizedProjection(x, weight, y, **kwargs)

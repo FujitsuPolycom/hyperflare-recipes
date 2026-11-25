@@ -27,10 +27,11 @@ def prepare_projection(source, weight, output, *, session, name, workspace, acti
                        bias=None):
     """Bind a projection without changing its checkpoint weight representation."""
     from .block_fp8 import BlockFP8Projection, BlockFP8Weight
+    from .tensor_fp8 import TensorFP8Projection, TensorFP8Weight
     from .weights import GroupedLinearWeights
 
-    if bias is not None and isinstance(weight, (GroupedLinearWeights, BlockFP8Weight)):
-        raise ValueError(f"{name}: bias is not supported for grouped or block-FP8 projections")
+    if bias is not None and isinstance(weight, (GroupedLinearWeights, BlockFP8Weight, TensorFP8Weight)):
+        raise ValueError(f"{name}: bias is not supported for grouped, block-FP8, or tensor-FP8 projections")
     if isinstance(weight, GroupedLinearWeights):
         return PreparedProjectionGroup(source, weight, output, session=session, name=name, workspace=workspace,
                                        activation_mode=activation_mode, staging=staging)
@@ -38,6 +39,8 @@ def prepare_projection(source, weight, output, *, session, name, workspace, acti
         return UnquantizedProjection(source, weight, output, session=session, name=name, bias=bias)
     if isinstance(weight, BlockFP8Weight):
         return BlockFP8Projection(source, weight, output, session=session, name=name)
+    if isinstance(weight, TensorFP8Weight):
+        return TensorFP8Projection(source, weight, output, session=session, name=name)
     return QuantizedProjection(source, weight, output, session=session, name=name,
                                workspace=workspace, activation_mode=activation_mode, bias=bias)
 
@@ -47,13 +50,14 @@ class PreparedProjectionGroup:
 
     def __init__(self, source, weight, output, *, session, name, workspace, activation_mode, staging):
         from .block_fp8 import BlockFP8Weight
+        from .tensor_fp8 import TensorFP8Weight
 
         self.output = output
         self.widths = weight.widths
         self.projections, self.copies = [], []
         for index, (part, target) in enumerate(zip(weight.parts, output.split(weight.widths, dim=-1), strict=True)):
             destination = target
-            if not isinstance(part, (torch.Tensor, BlockFP8Weight)) and not target.is_contiguous():
+            if not isinstance(part, (torch.Tensor, BlockFP8Weight, TensorFP8Weight)) and not target.is_contiguous():
                 if (staging is None or not staging.is_contiguous() or staging.numel() < target.numel()
                         or staging.dtype != target.dtype or staging.device != target.device):
                     raise ValueError("mixed packed projections require caller-owned contiguous staging")
