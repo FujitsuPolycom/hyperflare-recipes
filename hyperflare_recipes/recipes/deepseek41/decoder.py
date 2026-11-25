@@ -187,7 +187,7 @@ class PreparedDecoderBoundary:
             self.res_gather_0 = self.res_gather_1 = self.state_gather_0 = self.state_gather_1 = None
         self.global_kv = PreparedGlobalKV(index, weights.attention, source.attention_hc.normalized, source.attention,
             source_indices.metadata, pool, rotary, session=session, name=name + ".global_kv",
-            indices=source_indices)
+            indices=source_indices, examples=examples)
         self.indexer = None
         if packing is None:
             from hyperflare_recipes.components.mxfp4_indexer import PreparedMXFP4Indexer
@@ -1166,8 +1166,18 @@ class PreparedDecoder:
                 raise ValueError("decoder suffix replay requires Engram and compressed KV sources before its boundary")
             self.packing = PreparedDecoderSuffix(metadata)
         self.output_metadata = metadata if self.packing is None else self.packing.metadata
-        self.output_scratch = scratch if self.packing is None else Scratch.allocate(
-            128, scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device)
+        if self.packing is None:
+            self.output_scratch = scratch
+        elif examples is None:
+            self.output_scratch = Scratch.allocate(
+                128, scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device)
+        else:
+            output_key = ("decoder.output_scratch", scratch.hidden.shape[0],
+                          weights.shard.world_size, scratch.embedding.device)
+            if output_key not in examples:
+                examples[output_key] = Scratch.allocate(
+                    128, scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device)
+            self.output_scratch = examples[output_key]
         if suffix_runtime is not None and not _runtime_accepts(suffix_runtime, self.output_scratch.attention.output):
             suffix_runtime = None
         self.aux_layers = () if (self.encoder_only or weights.draft is None) else weights.config.draft.target_layers
@@ -1181,11 +1191,18 @@ class PreparedDecoder:
         self.rotary = Rotary(weights.config, scratch.embedding.device)
         self.window_commit = None
         if mode == "verify":
+            verify_staging = declaration_tensor(
+                examples,
+                "verify.window_staging",
+                (len(weights.layers), metadata.state_rows.numel(), (128 + metadata.max_query_tokens) * 528),
+                torch.uint8,
+                metadata.state_rows.device,
+            )
             self.window_commit = PreparedRingCommit(pool.reserved_backing,
                 [pool.layout.region(f"layer{index}.window").offset for index in range(len(weights.layers))],
                 metadata.state_rows, metadata.starts,
                 token_capacity=metadata.max_query_tokens,
-                window_tokens=128, record_bytes=528)
+                window_tokens=128, record_bytes=528, staging=verify_staging)
         ratios = weights.config.text["compress_ratios"][:len(weights.layers)]
         prefix_ratios = ratios if (self.packing is None and not self.encoder_only) else ratios[:decoder_start + 1]
         self.window_metadata = AttentionIndices(metadata, mode=mode,
