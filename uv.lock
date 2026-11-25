@@ -400,7 +400,7 @@ source = { git = "https://github.com/NVIDIA/hyperflare-inference.git?subdirector
 [[package]]
 name = "flashinfer-python"
 version = "0.7.3"
-source = { git = "https://github.com/local-inference-lab/flashinfer.git?branch=main#c3ab1d046a45431338e8ca9f11f549878e82d514" }
+source = { git = "https://github.com/local-inference-lab/flashinfer.git?branch=main#0d48af5394eca497d5a712e18ac1cd47deb33836" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "click" },
