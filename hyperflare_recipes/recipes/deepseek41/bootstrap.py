@@ -68,11 +68,11 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
 
 
 def _forward_factories(mla_compute_mode, *, vision,
-                       draft_vocabulary_runtime=None, examples=None,
+                       draft_vocabulary_runtime=None, kv_runtime=None, examples=None,
                        row_shard_prefill=False, row_shard_attention=False):
     """Bind attention arithmetic and the proposal head's BF16 gather channel."""
     return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode,
-                    examples=examples, row_shard_prefill=row_shard_prefill,
+                    kv_runtime=kv_runtime, examples=examples, row_shard_prefill=row_shard_prefill,
                     row_shard_attention=row_shard_attention),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
                     mla_compute_mode=mla_compute_mode, examples=examples))
@@ -325,6 +325,28 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
     return collective, prefill, vocabulary, result, draft_vocabulary
 
 
+def _kv_gather_runtime(config, group, device, *, coordinator, core_storage):
+    """Allocate a peer-to-peer KV gather channel for single-host row-sharded attention."""
+    if (coordinator.spans_hosts
+            or not config.row_shard_attention
+            or len(config.devices) < 2
+            or config.prefill_chunk_size < 1024):
+        return None
+    from b12x.comm.pcie.pcie_dcp_a2a import (
+        DCP_A2A_REQUIRED_SMS, SUPPORTED_WORLD_SIZES as _DCP_WORLD_SIZES,
+    )
+
+    world = len(config.devices)
+    max_kv_shard_rows = config.prefill_chunk_size // (2 * world)
+    if (world not in _DCP_WORLD_SIZES
+            or max_kv_shard_rows <= 0
+            or torch.cuda.get_device_properties(device).multi_processor_count < DCP_A2A_REQUIRED_SMS):
+        return None
+    return create_all_gather_runtime(
+        group, device, max_rows=max_kv_shard_rows,
+        columns=512 * world, ipc=core_storage.peer_storage)
+
+
 @torch.no_grad()
 @with_autotune_effort
 def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=None):
@@ -390,6 +412,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         collective, prefill_collective, vocabulary_collective, result_collective, draft_vocabulary_collective = _collective_runtimes(
             config, group, device, coordinator=coordinator, core_storage=core_storage,
             verification_samples=verification_samples)
+        kv_collective = _kv_gather_runtime(
+            config, group, device, coordinator=coordinator, core_storage=core_storage)
         sampling_collective = logprob_collective = None
         if config.vocabulary_parallel_sampling and shard.world_size > 1:
             sampling_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
@@ -437,7 +461,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             vision_storage = {}
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
             vision=vision_state,
-            draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples,
+            draft_vocabulary_runtime=draft_vocabulary_collective,
+            kv_runtime=kv_collective, examples=examples,
             row_shard_prefill=config.row_shard_prefill,
             row_shard_attention=config.row_shard_attention)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
@@ -691,10 +716,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         core_data=tables if rank == 0 else None,
         resources=(scoring, weights, tables, pool, requests, inputs, admission, commands, forwards,
             compiled, stream, graph_pool, session,
-            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, coordinator, speculation, confidence,
+            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, kv_collective, coordinator, speculation, confidence,
             vision_state, vision_inputs, vision_prefill, feature_pool),
         close_resources=tuple(dict.fromkeys(c for c in
-            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
+            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, kv_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
     return model

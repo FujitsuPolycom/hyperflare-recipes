@@ -201,7 +201,8 @@ class EngramScratch:
 
 class PreparedEngram:
     def __init__(self, layer, weights, tables, source, output, metadata, pool, *, scratch, session, name, workspace,
-                 runtime=None, coordinator=None, examples=None, defer_reduce_functional=False, row_shard=None):
+                 runtime=None, coordinator=None, examples=None, defer_reduce_functional=False, row_shard=None,
+                 min_gather_chunks: int = 1):
         self.pool = pool
         tokens, device = metadata.token_ids.numel(), source.device
         self.mask, self.gathered, self.projected = scratch.mask, scratch.gathered, scratch.projected
@@ -250,13 +251,15 @@ class PreparedEngram:
         self.gather_parts = ()
         self.gather_bounds = ()
         if self.use_all_gather:
+            if type(min_gather_chunks) is not int or min_gather_chunks < 1:
+                raise ValueError("Engram min_gather_chunks must be a positive integer")
             world = tables.shard.world_size
             local_cols = 6144 // world
             max_rows = runtime.shard_capacity // (local_cols * 2)
             if max_rows < 1:
                 raise ValueError("DMA runtime shard capacity is too small for Engram all-gather")
-            chunks = max(1, (tokens + max_rows - 1) // max_rows)
-            step = (tokens + chunks - 1) // chunks
+            chunks = max(min_gather_chunks, (tokens + max_rows - 1) // max_rows)
+            step = min(max_rows, (tokens + chunks - 1) // chunks)
             self.gather_bounds = tuple((start, min(start + step, tokens)) for start in range(0, tokens, step))
             self.gather_parts = tuple(
                 PreparedAllGather(
