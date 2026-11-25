@@ -70,11 +70,10 @@ _KV_ALLOCATION_MARGIN = 64 << 20
 def races_context_transport(config, world_size, device):
     """Whether single-host preparation races peer pull against the ring for prefill context.
 
-    The race captures compiled forwards, needs a tuning effort above off, and needs static
-    collectives because runtime tuning owns the transports' launch parameters. It is qualified
-    on four ranks of SM120 GPUs; every other cell keeps peer pull.
+    The race captures compiled forwards and requires an autotune effort above off.
+    It is qualified on four ranks of SM120 GPUs; every other cell keeps peer pull.
     """
-    return (config.compile_decoder and config.autotune_effort != "off" and config.collective_tuning == "static"
+    return (config.compile_decoder and config.autotune_effort != "off"
             and world_size == 4 and torch.cuda.get_device_capability(device) == (12, 0))
 
 
@@ -361,7 +360,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 group, device, max_tokens=decode_tokens, pipe_tokens=config.token_capacity, hidden_size=4096,
                 gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage, varlen_bytes=varlen_bytes)
         elif group is not None:
-            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.token_capacity,
+            collective = create_all_reduce_runtime(group, device, max_tokens=config.token_capacity,
                                                    hidden_size=4096, ipc=ipc)
             prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
                                                                hidden_size=4096, ipc=ipc)
@@ -371,7 +370,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
             "contract": "glm5next.graph-inputs.v3", "vision": not config.language_model_only}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity, workload_schema="glm-text-stack-tp-v1",
             numerical_policy="default", coordinator=coordinator,

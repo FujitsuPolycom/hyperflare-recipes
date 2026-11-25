@@ -386,7 +386,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         hidden_gather_collective = collective if has_dflash else None
         shortlist_gather_collective = collective if has_dflash else None
     elif group is not None:
-        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=max(config.token_capacity, draft_rows), hidden_size=reduction_width, ipc=ipc)
+        collective = create_all_reduce_runtime(group, device, max_tokens=max(config.token_capacity, draft_rows), hidden_size=reduction_width, ipc=ipc)
         if config.prefill_chunk_size >= _DMA_PREFILL_TOKENS:
             prefill_collective = create_dma_all_reduce_runtime(
                 group, device, max_tokens=config.prefill_chunk_size, hidden_size=reduction_width, ipc=ipc
@@ -414,7 +414,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 )
     collectives = dict(runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator)
     session = preparation_session(
-        compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+        compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
         native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
         device=device, checkpoint=REVISION, coordinator=coordinator,
         namespace={"config": manifest.metadata_sha256["config.json"], "headers": manifest.headers_sha256, "world_size": shard.world_size,

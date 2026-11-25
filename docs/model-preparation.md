@@ -184,30 +184,6 @@ no winners and is meant for occasional sampled runs, not routine tuning. The
 audit search includes every default candidate. Kernel families retain their
 declared tuning axes.
 
-`--collective-tuning static|runtime` selects when collective choices become fixed.
-`static` uses ordinary preparation-time autotuning and emits no collective startup
-tuners. Every recipe defaults to `static`. `[preparation] collective_tuning`
-overrides the recipe default; the command-line option overrides configuration.
-`runtime` requires `--collective-ladder PATH` and uses the file's final joint
-kernel geometry for eligible plain BF16 direct PCIe reductions. Preparation
-compiles that geometry without racing alternatives. A captured tuner selects
-among the supplied submode and active-CTA profiles when the core loads,
-including with autotune effort `off`; geometry stays fixed and no search runs
-during requests. Other collective paths retain their preparation policy. The
-[GB202 PCIe TP4 ladder](https://github.com/NVIDIA/hyperflare-inference/blob/main/ignition/preparation/ladders/README.md) covers four
-SM120 GPUs with out-of-place BF16 reductions from 16 bytes through 8 MiB:
-
-```sh
---collective-tuning runtime \
---collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json
-```
-
-Startup races in one preparation share fixture and timing storage. Cold races
-read an existing checkpoint allocation on the same GPU when it is at least
-twice the L2 cache size or 64 MiB, whichever is larger. If no allocation is large
-enough, the races use one shared eviction buffer. A core's resident startup
-storage is fixed at export.
-
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
 graphics frequency for the b12x tuning batch and actual Inductor autotuning
 trials during compiled-forward preparation. Frozen warmup, capture, and serving
@@ -691,8 +667,8 @@ per rank through b12x's neighbor-only ring byte gather (a kernel run by eight CT
 through the channel's peer-accessible staging banks, not a copy engine), and
 scatters them into the slab. Peer pull is the default.
 
-With one host, four ranks on SM120 GPUs, compiled forwards,
-`--collective-tuning static`, and `--autotune-effort default` or `audit`, the
+With one host, four ranks on SM120 GPUs, compiled forwards, and
+`--autotune-effort default` or `audit`, the
 "Tune prefill context transport" phase races the two transports. It runs after
 child kernel tuning and before model-forward compilation and capture, and binds the
 winner to every prefill gather. Both transports must reproduce exact latent bytes
@@ -703,7 +679,7 @@ choice. Every rank must select the same transport, or preparation fails. The
 selected implementation and the race's record are reported under
 `context_compositions` in preparation measurements.
 
-Control. `--autotune-effort off`, `--collective-tuning runtime`, eager forwards
+Control. `--autotune-effort off`, eager forwards
 (`--no-compile`), and `--no-context-parallel` prepare without the race and keep peer
 pull. Other GPU architectures, other rank counts, and TP1 never run it, and
 cross-host preparation keeps its RoCE gather. If the race fails, preparation stops
@@ -966,8 +942,7 @@ For a TP4, single-request configuration with seven drafts, run:
   --max-concurrency 1 --mtp-draft-tokens 7 --speculative-token-capacity 8 \
   --prefill-chunk-size 4096 --expert-scale-compression native --mla-compute-mode bf16 \
   --draft-head-quantization nvfp4 --markov-head-quantization fp8 \
-  --vocabulary-parallel-sampling --joint-tuning --collective-tuning runtime \
-  --collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json
+  --vocabulary-parallel-sampling --joint-tuning
 ```
 
 Use a fresh weight export when first enabling this option: the Markov head's
@@ -1302,8 +1277,8 @@ of two; key scales use `max(absmax, 1e-4) / 448` in FP32.
 MLA query/KV normalization and indexer LayerNorm use the checkpoint's
 `rms_norm_eps` value of `1e-5`.
 
-With compiled forwards, speculation enabled, `--collective-tuning static`
-(the default), and `--autotune-effort default` or `audit`, preparation measures
+With compiled forwards, speculation enabled, and `--autotune-effort default` or
+`audit`, preparation measures
 two complete sparse-candidate exchanges for single-request decode and
 verification. One gathers every rank's candidates on every rank; the other
 sends each query's candidates to one owner, selects there, and broadcasts only
@@ -1311,7 +1286,7 @@ the selected IDs. Both preserve FP32 score words, cutoff ties and ID order.
 The measurement includes packing, transport, selection and replication, and
 binds one implementation per row capacity before model capture. The choice is
 recorded under `candidate_compositions` in preparation measurements. Prefill
-graphs below 4096 rows, multiple-request graphs, runtime collective tuning and
+graphs below 4096 rows, multiple-request graphs, and
 disabled autotuning retain the replicated exchange. Prefill graphs of 4096 rows
 or more use neither exchange; they distribute index queries as described below.
 No serving flag or runtime graph change is required.

@@ -238,7 +238,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             )
         elif group is not None:
             collective = create_all_reduce_runtime(
-                group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=weights.config.hidden, ipc=ipc
+                group, device, max_tokens=tokens, hidden_size=weights.config.hidden, ipc=ipc
             )
             prefill_collective = create_dma_all_reduce_runtime(
                 group,
@@ -273,7 +273,6 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             ).encode()
         ).hexdigest()
         session = RecordedPreparationSession(
-            collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder,
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             tuning_replica=config.tuning_replica,

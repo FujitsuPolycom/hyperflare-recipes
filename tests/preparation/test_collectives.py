@@ -465,19 +465,17 @@ def test_differing_tuning_races_report_bounded_counts_and_release_job(monkeypatc
     assert closed == [True]
 
 
-@pytest.mark.parametrize("mode", [None, "static", "runtime"])
-def test_joint_workspace_is_provisioned_only_for_runtime_selection(monkeypatch, mode):
+def test_create_all_reduce_runtime_uses_static_pcie_channel(monkeypatch):
     from b12x.comm.pcie import AllReduce
     from ignition.preparation.collectives import create_all_reduce_runtime
 
     calls = []
     result, group, device, ipc = object(), object(), object(), object()
     monkeypatch.setattr(AllReduce, "from_exchange_group", lambda **kwargs: calls.append(kwargs) or result)
-    options = {} if mode is None else {"collective_tuning": mode}
-    assert create_all_reduce_runtime(group, device, max_tokens=32, hidden_size=2560, ipc=ipc, **options) is result
+    assert create_all_reduce_runtime(group, device, max_tokens=32, hidden_size=2560, ipc=ipc) is result
     assert calls == [dict(exchange_group=group, device=device, single_channel=True,
                          max_size=32 * 2560 * 2, eager_buffer_bytes=32 * 2560 * 2,
-                         ipc=ipc, joint=mode == "runtime")]
+                         ipc=ipc)]
 
 
 @pytest.mark.parametrize("configured,widened", [(20_000_000, 600_000_000), (900_000_000, 900_000_000)])

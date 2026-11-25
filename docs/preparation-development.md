@@ -298,14 +298,7 @@ requests run in a follow-up collective or independent remainder batch where
 ranks without local remainders still join completion and failure relays.
 `ReplicaPreparation` keeps these exchanges within each serving TP replica;
 independent kernel candidates retain corresponding-rank sharding across replicas.
-Preparation-time search ends before graph handoff. With `--collective-tuning
-runtime`, the required `--collective-ladder PATH` file supplies final compiled
-geometries for eligible plain BF16 PCIe reductions and column gathers. Gather
-buckets depend on total per-rank input bytes, independently of row width. These pinned plans do not
-race geometries during preparation, including with `--autotune-effort off`.
-Captured tuning graphs select among the supplied submode/active-CTA profiles
-before serving begins; native rank coordination only launches those graphs and
-waits for their completion. See the [ladder format](https://github.com/NVIDIA/hyperflare-inference/blob/main/ignition/preparation/ladders/README.md).
+Preparation-time search ends before graph handoff.
 
 - **Compile tensor-parallel forwards once, sharded across ranks.** Pass the
   preparation coordinator to `capture_forwards`. Each forward variant compiles

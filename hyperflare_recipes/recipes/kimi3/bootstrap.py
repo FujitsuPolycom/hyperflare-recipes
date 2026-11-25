@@ -320,7 +320,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         # Prefill activations reduce in chunks of the rows decode and verification already need a channel for: a
         # channel sized for whole prefill chunks would stage 448 MiB per rank for 4096 rows.
         channel_rows = max(min(max_tokens, REDUCE_ROWS), config.decode_tokens)
-        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=channel_rows,
+        collective = create_all_reduce_runtime(group, device, max_tokens=channel_rows,
             hidden_size=weights.config.hidden, ipc=core_storage.peer_storage)
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
@@ -367,7 +367,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             dcp_ipc = core_storage.peer_storage.for_group(dcp_group)
             # Full hidden activations use the TP16 runtime above. Hybrid DCP reductions carry only
             # staged 1x8 signals and selected-ID bytes expanded to BF16, so avoid another hidden-sized channel.
-            dcp_reduction = create_all_reduce_runtime(dcp_group, device, collective_tuning=config.collective_tuning,
+            dcp_reduction = create_all_reduce_runtime(dcp_group, device,
                 max_tokens=1, hidden_size=config.dcp_reduction_elements, ipc=dcp_ipc)
         context = None
         if config.context_parallel and shard.world_size > 1:
@@ -381,8 +381,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                 extra["candidates"] = create_head_exchange(dcp_group, device,
                     max_rows=max(min(config.prefill_chunk_size, PREFILL_ROWS), config.decode_tokens),
                     heads=config.context_parallel_size, head_dim=8192, ipc=dcp_ipc)
-                if (drafting and config.compile_decoder and config.autotune_effort != "off"
-                        and config.collective_tuning == "static"):
+                if drafting and config.compile_decoder and config.autotune_effort != "off":
                     from b12x.comm.pcie.pcie_dcp_topk import PCIeDCPTopKOwnerExchange
 
                     from hyperflare_recipes.components.published_candidates import PublishedCandidateStorage
@@ -429,7 +428,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         identity = target_tuning_identity(weights.config, headers, shard.world_size,
             online_mxfp8_scope=config.online_mxfp8_scope, context_parallel_size=config.context_parallel_size)
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity,
             workload_schema="kimi3", numerical_policy="default", coordinator=coordinator,

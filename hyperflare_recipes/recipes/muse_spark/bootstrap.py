@@ -143,7 +143,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         # Reduce each routed expert output before the replicated mixture finalizer.
         expert_width = weights.config.text["moe_hidden_size"]
         routed_width = weights.config.text["num_experts_per_tok"] * expert_width
-        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+        collective = create_all_reduce_runtime(group, device,
             max_tokens=max(config.decode_tokens, draft_rows), hidden_size=routed_width,
             ipc=core_storage.peer_storage)
         prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
@@ -161,7 +161,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             draft_headers=draft_headers, kv_dtype="float8_e4m3fn",
             world_size=shard.world_size, contract="muse-spark.text.v1"), sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(compile_workers=config.compile_workers,
-            collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort,
+            autotune_effort=config.autotune_effort,
             tuning_replica=config.tuning_replica, native_dense_activations=config.native_dense_activations,
             lock_gpu_clocks=config.lock_gpu_clocks, device=device, checkpoint=identity,
             workload_schema="muse_spark", numerical_policy="default", coordinator=coordinator,

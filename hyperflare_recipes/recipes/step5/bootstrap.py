@@ -163,7 +163,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
-        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=max(decode_tokens, draft_tokens),
+        collective = create_all_reduce_runtime(group, device, max_tokens=max(decode_tokens, draft_tokens),
             hidden_size=weights.config.hidden, element_bytes=4, ipc=core_storage.peer_storage)
         prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
             hidden_size=weights.config.hidden, element_bytes=4, ipc=core_storage.peer_storage)
@@ -177,7 +177,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             "quantization": weights.config.quantization, "headers": headers, "world_size": shard.world_size,
             "contract": "step5.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity, workload_schema="step5",
             numerical_policy="default", coordinator=coordinator, headroom_bytes=config.headroom_bytes,

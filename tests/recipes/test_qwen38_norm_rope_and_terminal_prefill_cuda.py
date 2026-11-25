@@ -258,7 +258,7 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
             ),
         )
         collective = create_all_reduce_runtime(
-            group, device, collective_tuning="static", max_tokens=tokens, hidden_size=2560
+            group, device, max_tokens=tokens, hidden_size=2560
         )
         dma_rt = (
             create_dma_all_reduce_runtime(group, device, max_tokens=tokens, hidden_size=2560)

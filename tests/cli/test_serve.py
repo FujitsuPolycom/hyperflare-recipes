@@ -748,13 +748,6 @@ def test_lock_gpu_clocks_reaches_preparation_plan(host):
 
 
 @pytest.mark.parametrize("command", ["export", "debug-serve"])
-def test_runtime_collective_policy_requires_ladder_before_preparation(host, capsys, command):
-    assert main([command, "qwen3.8-flash", "--collective-tuning", "runtime"]) == 2
-    assert "requires --collective-ladder PATH" in capsys.readouterr().err
-    assert "prepared" not in host and host["exports"] == 0
-
-
-@pytest.mark.parametrize("command", ["export", "debug-serve"])
 @pytest.mark.parametrize("configured,flag,expected", [
     (False, [], False), (False, ["--force-moe-decode-a16"], True),
     (True, [], True), (True, ["--no-force-moe-decode-a16"], False),

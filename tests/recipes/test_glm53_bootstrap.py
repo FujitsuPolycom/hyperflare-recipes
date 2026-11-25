@@ -50,7 +50,6 @@ def test_mtp_catalog_defaults_to_five_drafts_and_reserves_draft_pages():
     ({"autotune_effort": "audit"}, 4, (12, 0), True),
     ({"autotune_effort": "off"}, 4, (12, 0), False),
     ({"compile_decoder": False}, 4, (12, 0), False),
-    ({"collective_tuning": "runtime"}, 4, (12, 0), False),
     ({}, 2, (12, 0), False),
     ({}, 4, (12, 1), False),
     ({}, 4, (10, 3), False)])

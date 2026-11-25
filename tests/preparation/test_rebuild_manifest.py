@@ -98,21 +98,6 @@ def test_absent_catalog_is_not_inferred_from_allocation_names():
     assert bundle.allocations[0].nbytes == 64
 
 
-@pytest.mark.parametrize("mode", ["static", "runtime"])
-def test_rebuild_manifest_records_collective_selection(mode):
-    from dataclasses import replace
-    from google.protobuf.json_format import ParseDict
-    from ignition.preparation.rebuild_manifest import from_plan
-    from hyperflare_recipes.recipes import ResolvedModel
-    from tests.cli.test_planning import derive
-
-    plan = replace(derive(), collective_tuning=mode)
-    model = ResolvedModel(plan.recipe, plan.checkpoint)
-    manifest = ParseDict(from_plan(model, plan, compiled_forwards=True), proto.RebuildManifest())
-    restored = proto.RebuildManifest.FromString(manifest.SerializeToString())
-    assert restored.collective_tuning == mode
-
-
 def test_rebuild_manifest_embeds_parseable_reproduction_arguments(tmp_path):
     from dataclasses import replace
     from google.protobuf.json_format import ParseDict
@@ -128,7 +113,6 @@ def test_rebuild_manifest_embeds_parseable_reproduction_arguments(tmp_path):
         autotune_effort="audit",
         native_dense_activations=True,
         lock_gpu_clocks=True,
-        collective_tuning="static",
     )
     model = ResolvedModel(plan.recipe, plan.checkpoint)
     encoded = from_plan(model, plan, compiled_forwards=False)

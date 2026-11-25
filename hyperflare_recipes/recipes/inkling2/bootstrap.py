@@ -157,7 +157,7 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, hi
         return runtime, runtime, drafting, drafting
     ipc = core_storage.peer_storage
     runtime = create_all_reduce_runtime(group, device, max_tokens=min(tokens, 1024),
-        hidden_size=hidden, element_bytes=4, ipc=ipc, collective_tuning=config.collective_tuning)
+        hidden_size=hidden, element_bytes=4, ipc=ipc)
     vocabulary = create_all_gather_runtime(group, device, max_rows=vocabulary_rows,
         columns=2 * local_vocabulary * world, ipc=ipc)
     sampling = (create_all_gather_runtime(group, device, max_rows=config.decode_samples,
@@ -272,7 +272,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             tuning_replica=config.tuning_replica,
             device=device, checkpoint=identity, workload_schema="inkling2", numerical_policy="default",
             coordinator=coordinator, headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage,
-            collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder,
             autotune_effort=config.autotune_effort)
         session.__enter__()
         register_benchmark_state(session, pool.reserved_backing, storage=pool.reserved_backing,

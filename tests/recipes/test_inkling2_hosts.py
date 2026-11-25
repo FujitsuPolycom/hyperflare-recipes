@@ -156,7 +156,7 @@ def test_remote_channels_share_one_roce_runtime_without_pcie(monkeypatch, drafti
 
 @pytest.mark.parametrize("drafting", [False, True])
 def test_local_channels_are_unchanged(monkeypatch, drafting):
-    config = bootstrap.PreparationConfig(max_active=8, drafting=drafting, collective_tuning="runtime")
+    config = bootstrap.PreparationConfig(max_active=8, drafting=drafting)
     gathers, reductions = [], []
     monkeypatch.setattr(bootstrap, "create_all_gather_runtime",
                         lambda group, device, **kwargs: gathers.append(kwargs) or object())
@@ -169,8 +169,7 @@ def test_local_channels_are_unchanged(monkeypatch, drafting):
         coordinator=SimpleNamespace(spans_hosts=False), core_storage=SimpleNamespace(peer_storage=ipc), **GEOMETRY)
     present = [channel for channel in channels if channel is not None]
     assert len(present) == (4 if drafting else 2) and len({id(channel) for channel in present}) == len(present)
-    assert reductions == [dict(max_tokens=1024, hidden_size=HIDDEN, element_bytes=4, ipc=ipc,
-                               collective_tuning="runtime")]
+    assert reductions == [dict(max_tokens=1024, hidden_size=HIDDEN, element_bytes=4, ipc=ipc)]
     samples = config.decode_samples
     assert gathers[0] == dict(max_rows=max(samples, 8), columns=2 * 201024, ipc=ipc)
     assert gathers[1:] == ([dict(max_rows=samples, columns=64 * 4, ipc=ipc),

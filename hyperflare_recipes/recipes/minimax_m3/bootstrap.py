@@ -212,7 +212,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                 ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage)
             vision_collective = collective if config.vision else None
         else:
-            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=max(decode_tokens, draft_tokens), hidden_size=weights.config.hidden,
+            collective = create_all_reduce_runtime(group, device, max_tokens=max(decode_tokens, draft_tokens), hidden_size=weights.config.hidden,
                 element_bytes=4, ipc=core_storage.peer_storage)
             prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
                 hidden_size=weights.config.hidden, ipc=core_storage.peer_storage)
@@ -233,7 +233,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             tuning_replica=config.tuning_replica, device=device, checkpoint=identity,
             workload_schema="minimax-m3", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage,
-            collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort)
+            autotune_effort=config.autotune_effort)
         session.__enter__()
         register_benchmark_state(session, pool.reserved_backing, storage=pool.reserved_backing,
                                  restore=pool.clear_for_preparation)

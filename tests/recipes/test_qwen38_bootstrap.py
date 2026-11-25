@@ -858,7 +858,7 @@ def _tp2_dma_and_barrier_worker(rank, world, port, error_queue):
     try:
         coordinator = CollectivePreparation(group)
         pcie_rt = create_all_reduce_runtime(
-            group, device, max_tokens=1024, hidden_size=2560, collective_tuning="static"
+            group, device, max_tokens=1024, hidden_size=2560
         )
         dma_rt = create_dma_all_reduce_runtime(group, device, max_tokens=1024, hidden_size=2560)
         session = RecordedPreparationSession(

@@ -230,7 +230,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             prefill_collective = vocabulary_collective = vision_collective = collective
             context_collective = collective if config.dflash else None
         else:
-            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=hidden, ipc=ipc)
+            collective = create_all_reduce_runtime(group, device, max_tokens=tokens, hidden_size=hidden, ipc=ipc)
             prefill_collective = create_dma_all_reduce_runtime(
                 group, device, max_tokens=config.prefill_chunk_size, hidden_size=hidden, ipc=ipc
             )
@@ -254,7 +254,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             ).encode()
         ).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device,
             checkpoint=identity,

@@ -94,7 +94,7 @@ def test_remote_channels_cover_gathers_and_broadcasts_without_pcie(monkeypatch, 
 
 
 def test_local_channels_are_unchanged(monkeypatch):
-    config = bootstrap.PreparationConfig(devices=(0, 1), max_active=16, collective_tuning="runtime")
+    config = bootstrap.PreparationConfig(devices=(0, 1), max_active=16)
     gathers, reductions = [], []
     monkeypatch.setattr(bootstrap, "create_all_gather_runtime",
                         lambda group, device, **kwargs: gathers.append(kwargs) or object())
@@ -107,7 +107,7 @@ def test_local_channels_are_unchanged(monkeypatch):
     collective, prefill, vocabulary, markov = bootstrap._collective_runtimes(config, None, None,
         coordinator=SimpleNamespace(spans_hosts=False), core_storage=SimpleNamespace(peer_storage=ipc))
     assert len({id(collective), id(prefill), id(vocabulary), id(markov)}) == 4
-    assert reductions[0]["collective_tuning"] == "runtime" and reductions[0]["ipc"] is ipc
+    assert reductions[0]["ipc"] is ipc
     assert gathers[0]["columns"] == 129280
     assert gathers[0]["max_rows"] == max(config.decode_samples, config.request_capacity * config.draft_tokens)
     assert gathers[1] == {"max_rows": config.request_capacity, "columns": 2 * 129280, "ipc": ipc}
