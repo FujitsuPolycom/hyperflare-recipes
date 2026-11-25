@@ -416,7 +416,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             candidate_tokens=config.prefill_chunk_size)
             if config.prompt_logprobs else None)
         decoder_storage = Scratch.allocate(config.decode_tokens, verification_samples, shard.world_size, device)
-        vision_state = vision_inputs = vision_prefill = vision_storage = feature_pool = None
+        vision_state = vision_inputs = vision_prefill = vision_max = vision_storage = feature_pool = None
         if weights.vision is not None:
             vision_inputs = VisionInputs.allocate(device, patches=max(PATCH_CAPACITIES))
             vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
@@ -528,9 +528,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             forward_inputs=forward_inputs,
             host_allocate=core_storage.host_allocate, device=device)
         if vision_state is not None:
+            vision_max = VisionScratch.allocate(max(PATCH_CAPACITIES), device, hidden=5120)
             for capacity in reversed(PATCH_CAPACITIES):
                 name = f"vision{capacity}"
-                vision_storage[capacity] = VisionScratch.allocate(capacity, device, hidden=5120)
+                vision_storage[capacity] = vision_max.rows(capacity)
                 encoder = PreparedVision(weights.vision, vision_storage[capacity], vision_inputs,
                     session=session, workspace=arena, name=name)
                 add(name, PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence),
@@ -555,6 +556,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()), enabled=enabled)
     transient.close()
     release_unused()
+    torch.cuda.empty_cache()
     if progress is not None:
         progress(f"before tuning: {torch.cuda.memory_allocated(device) >> 20} MiB allocated, "
                  f"{torch.cuda.memory_reserved(device) >> 20} MiB reserved, "
@@ -594,7 +596,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         metadata.clear()
         scratch.clear()
         examples.clear()
-        vision_storage = None
+        vision_max = vision_storage = None
         prefill_storage = decoder_storage = scored_storage = storage = decoder = batch = None
         arena.release_preparation()
         release_unused()
