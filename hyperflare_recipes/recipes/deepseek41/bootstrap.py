@@ -254,8 +254,16 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
         buffers["proposal_confidence"] = confidence.device_view
         prefix_limits = torch.zeros(slots, dtype=torch.int32, device=device)
         buffers["speculative_prefix_limits"] = prefix_limits
+        if hasattr(speculation, "buffers"):
+            buffers.update(speculation.buffers())
         packed_inputs = tuple(field for field in forward_inputs if field != "query_lengths")
-        packed_inputs += ("speculative_prefix_limits",)
+        packed_inputs += (
+            "speculative_prefix_limits",
+            "copy_token_ids",
+            "copy_token_count",
+            "copy_expected_consumed",
+            "copy_generation",
+        )
         packed_batches = {batch for batch, _ in config.packed_speculative_shapes}
         proposals = {}
         for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):
