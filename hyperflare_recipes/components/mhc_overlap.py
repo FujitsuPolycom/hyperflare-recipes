@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import itertools
+import weakref
 
 import torch
 
@@ -13,6 +15,161 @@ from hyperflare_recipes.components.mhc import MHCWeights
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import register_finalizer
+
+
+_FUSED_MHC_AR_OWNERS: weakref.WeakValueDictionary[int, "PreparedFusedMhcAllReducePostYNorm"] = (
+    weakref.WeakValueDictionary()
+)
+_FUSED_MHC_AR_HANDLES = itertools.count()
+
+
+def _is_roce_or_dma_runtime(runtime) -> bool:
+    if runtime is None:
+        return True
+    try:
+        from b12x.comm import roce
+
+        if isinstance(runtime, roce.AllReduce):
+            return True
+    except ImportError:
+        pass
+    try:
+        from b12x.comm import pcie
+
+        if isinstance(runtime, pcie.DmaAllReduce):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
+def _resolve_oneshot_channel(runtime):
+    """Return the single-channel PCIe oneshot channel backing ``runtime``, or ``None``."""
+    if _is_roce_or_dma_runtime(runtime):
+        return None
+    algorithm = getattr(runtime, "algorithm", None)
+    if algorithm is not None:
+        if algorithm != "oneshot" or not getattr(runtime, "single_channel", False):
+            return None
+        for_stream = getattr(runtime, "for_stream", None)
+        if for_stream is None:
+            return None
+        try:
+            return for_stream()
+        except Exception:
+            return None
+    if hasattr(runtime, "_ext") and hasattr(runtime, "_ptr"):
+        return runtime
+    return None
+
+
+def _channel_sentinel_capacity_bytes(channel) -> int | None:
+    """Return the Lamport-sentinel payload capacity in bytes, or ``None`` if unavailable."""
+    ext = getattr(channel, "_ext", None)
+    ptr = getattr(channel, "_ptr", None)
+    if ext is None or ptr is None:
+        return None
+    get_state = getattr(ext, "_state", None)
+    if get_state is None:
+        return None
+    try:
+        state = get_state(ptr)
+    except Exception:
+        return None
+    if (
+        getattr(state, "eager_tables", None) is None
+        or getattr(state, "eager_buffer_bytes", None) is None
+        or int(getattr(state, "plain_payload_ready_region_packs", 0)) <= 0
+    ):
+        return None
+    cap = int(state.eager_buffer_bytes)
+    channel_max = getattr(channel, "max_size", None)
+    if channel_max is not None:
+        cap = min(cap, int(channel_max))
+    return cap if cap > 0 else None
+
+
+def supports_fused_mhc_allreduce(
+    runtime,
+    tokens: int,
+    hidden: int,
+    norm_dtype: torch.dtype,
+    *,
+    device: torch.device | None = None,
+) -> bool:
+    """Return True when b12x fused Lamport-sentinel AllReduce + ClusterMhcPostYNorm fits."""
+    try:
+        from b12x.norm.mhc import _split_lagged
+    except ImportError:
+        return False
+
+    supports_fn = getattr(_split_lagged, "supports_cluster_allreduce_post_y_norm", None)
+    compile_fn = getattr(_split_lagged, "compile_cluster_allreduce_post_y_norm", None)
+    params_fn = getattr(_split_lagged, "oneshot_channel_sentinel_params", None)
+    if supports_fn is None or compile_fn is None or params_fn is None:
+        return False
+
+    channel = _resolve_oneshot_channel(runtime)
+    if channel is None:
+        return False
+
+    tokens = int(tokens)
+    hidden = int(hidden)
+    max_tokens = int(getattr(_split_lagged, "CLUSTER_AR_MHC_MAX_TOKENS", 32))
+    if not (1 <= tokens <= max_tokens) or hidden <= 0 or hidden % 8 != 0:
+        return False
+
+    world_size = getattr(runtime, "world_size", getattr(channel, "world_size", 0))
+    if not isinstance(world_size, int) or world_size < 2:
+        return False
+
+    payload_bytes = tokens * hidden * 2
+    runtime_max = getattr(runtime, "max_size", None)
+    if runtime_max is not None and payload_bytes > int(runtime_max):
+        return False
+
+    sentinel_cap = _channel_sentinel_capacity_bytes(channel)
+    if sentinel_cap is None or payload_bytes > sentinel_cap:
+        return False
+
+    target_device = (
+        device
+        if device is not None
+        else getattr(channel, "device", getattr(runtime, "device", None))
+    )
+    if target_device is None:
+        return False
+
+    return bool(supports_fn(target_device, tokens, hidden, norm_dtype, world_size))
+
+
+def pack_mxfp8_scale_mma(scale_rows: torch.Tensor, hidden: int) -> torch.Tensor:
+    """Swizzle row-major ``[tokens, hidden // 32]`` UE8M0 scales into b12x MMA tile layout.
+
+    When ``tokens`` is not a multiple of 128, pads trailing rows with neutral UE8M0
+    unit scales (127) before swizzling into ``[1, m_tiles, hidden // 128, 32, 4, 4]``.
+    """
+    hidden = int(hidden)
+    if scale_rows.ndim != 2 or scale_rows.shape[1] != hidden // 32 or hidden % 128 != 0:
+        raise ValueError("pack_mxfp8_scale_mma requires [tokens, hidden // 32] with hidden % 128 == 0")
+    rows = scale_rows.shape[0]
+    padded_rows = ((rows + 127) // 128) * 128
+    if padded_rows != rows:
+        padded = torch.full(
+            (padded_rows, scale_rows.shape[1]),
+            127,
+            dtype=scale_rows.dtype,
+            device=scale_rows.device,
+        )
+        padded[:rows].copy_(scale_rows)
+        scale_rows = padded
+    m_tiles, k_tiles = padded_rows // 128, hidden // 128
+    return (
+        scale_rows.view(m_tiles, 4, 32, k_tiles, 4)
+        .permute(0, 3, 2, 1, 4)
+        .contiguous()
+        .view(1, m_tiles, k_tiles, 32, 4, 4)
+    )
 
 
 def _cluster_size_for_tokens(tokens: int) -> int:
@@ -250,6 +407,60 @@ def _fake_join_mhc_fn_sinkhorn(
     pass
 
 
+@torch.library.custom_op(
+    "flare::cluster_mhc_allreduce_post_y_norm",
+    mutates_args=("out", "y", "a_values", "a_scales"),
+)
+def _cluster_mhc_allreduce_post_y_norm(
+    x: torch.Tensor,
+    input_addend: torch.Tensor | None,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    pre_mix: torch.Tensor,
+    norm_weight: torch.Tensor,
+    out: torch.Tensor,
+    y: torch.Tensor,
+    a_values: torch.Tensor | None,
+    a_scales: torch.Tensor | None,
+    dependencies: list[torch.Tensor],
+    handle: int,
+) -> None:
+    owner = _FUSED_MHC_AR_OWNERS[handle]
+    owner._launch(
+        x,
+        input_addend,
+        residual,
+        prev_post,
+        prev_comb,
+        pre_mix,
+        norm_weight,
+        out,
+        y,
+        a_values,
+        a_scales,
+    )
+
+
+@_cluster_mhc_allreduce_post_y_norm.register_fake
+def _fake_cluster_mhc_allreduce_post_y_norm(
+    x,
+    input_addend,
+    residual,
+    prev_post,
+    prev_comb,
+    pre_mix,
+    norm_weight,
+    out,
+    y,
+    a_values,
+    a_scales,
+    dependencies,
+    handle,
+):
+    pass
+
+
 _SPLIT_MHC_RUNNERS: dict[tuple, object] = {}
 
 
@@ -287,6 +498,7 @@ class SplitLaggedMHC:
         sinkhorn_iters: int,
         norm_eps: float,
         experts=None,
+        compile_post_y: bool = True,
     ):
         from b12x.norm.mhc._split_lagged import (
             split_lagged_partials_shape,
@@ -339,6 +551,7 @@ class SplitLaggedMHC:
         self.stream_handle = self.stream.cuda_stream
         self.experts = experts
         self.emit_mxfp8 = False
+        self.compile_post_y = bool(compile_post_y)
         register_finalizer(session, self._finalize)
 
     def functional(self):
@@ -355,29 +568,30 @@ class SplitLaggedMHC:
             self.emit_mxfp8 = supports_prequant_mxfp8(self.experts.plan, self.tokens)
         self.experts = None
         ordinal = int(self.device.index or 0)
-        cluster_size = _cluster_size_for_tokens(self.tokens)
-        post_y = compile_cluster_post_y_norm(
-            ordinal,
-            self.hidden,
-            self.pre_only,
-            self.norm_eps,
-            self.weights.norm.dtype,
-            cluster_size=cluster_size,
-            emit_mxfp8=self.emit_mxfp8,
-        )
-        load_programs(post_y)
-        _SPLIT_MHC_RUNNERS[
-            (
-                "post_y",
+        if self.compile_post_y:
+            cluster_size = _cluster_size_for_tokens(self.tokens)
+            post_y = compile_cluster_post_y_norm(
                 ordinal,
                 self.hidden,
                 self.pre_only,
                 self.norm_eps,
                 self.weights.norm.dtype,
-                cluster_size,
-                self.emit_mxfp8,
+                cluster_size=cluster_size,
+                emit_mxfp8=self.emit_mxfp8,
             )
-        ] = post_y
+            load_programs(post_y)
+            _SPLIT_MHC_RUNNERS[
+                (
+                    "post_y",
+                    ordinal,
+                    self.hidden,
+                    self.pre_only,
+                    self.norm_eps,
+                    self.weights.norm.dtype,
+                    cluster_size,
+                    self.emit_mxfp8,
+                )
+            ] = post_y
         fn_sink, bucket = _compile_fn_sinkhorn(
             ordinal,
             self.hidden,
@@ -486,3 +700,291 @@ class SplitLaggedMHC:
             self.stream_handle,
         )
         return pending.post_out, pending.comb_out, pending.pre_out
+
+
+class PreparedFusedMhcAllReducePostYNorm:
+    """Fused Lamport-sentinel PCIe AllReduce + ``ClusterMhcPostYNorm`` for lagged mHC.
+
+    Replaces a standalone single-channel PCIe ``OneshotAllReduce`` (with optional
+    BF16 input addend) followed by ``ClusterMhcPostYNorm`` (with optional bit-exact
+    MXFP8 quantization and SM120 PDL dependent launch release) in a single kernel
+    launch without writing or reading the intermediate ``[tokens, hidden]`` BF16
+    reduced activation in HBM.
+
+    Pre-compiles and loads all Lamport double-buffer phase variants
+    ``(device_slot_selection=False, slot_bias=0)`` (pre-capture warmup) and
+    ``(device_slot_selection=True, slot_bias in {0, 1})`` (CUDA graph capture)
+    during preparation finalization so graph capture performs zero compilation
+    and tracks the live channel epoch identically to ``PCIeOneshotAllReduce``.
+    """
+
+    @staticmethod
+    def fits(
+        runtime,
+        tokens: int,
+        hidden: int,
+        norm_dtype: torch.dtype,
+        *,
+        device: torch.device | None = None,
+    ) -> bool:
+        return supports_fused_mhc_allreduce(
+            runtime, tokens, hidden, norm_dtype, device=device
+        )
+
+    def __init__(
+        self,
+        inputs,
+        weights: MHCWeights,
+        *,
+        runtime,
+        session,
+        norm_eps: float,
+        has_addend: bool = False,
+        emit_mxfp8: bool = False,
+        release_dependents: bool = True,
+        experts=None,
+    ):
+        if len(inputs) != 4:
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm requires 4 post_pre inputs "
+                "(x, residual, prev_post, prev_comb)"
+            )
+        x, residual, prev_post, prev_comb = inputs
+        if (
+            residual.ndim != 3
+            or residual.shape[1] != 4
+            or residual.dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm residual requires BF16 [tokens, 4, hidden]"
+            )
+        tokens, _, hidden = residual.shape
+        if x.shape != (tokens, hidden) or x.dtype != torch.bfloat16:
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm branch input requires BF16 [tokens, hidden]"
+            )
+        if prev_post.shape != (tokens, 4) or prev_post.dtype != torch.float32:
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm prev_post requires FP32 [tokens, 4]"
+            )
+        if prev_comb.shape != (tokens, 4, 4) or prev_comb.dtype != torch.float32:
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm prev_comb requires FP32 [tokens, 4, 4]"
+            )
+        if weights.norm.shape != (hidden,) or weights.norm.dtype not in (
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm norm weight requires BF16 or FP32 [hidden]"
+            )
+        if not self.fits(
+            runtime, tokens, hidden, weights.norm.dtype, device=residual.device
+        ):
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm runtime, geometry, or b12x build is not supported"
+            )
+        record_numeric_tensor(weights.norm)
+
+        self.runtime = runtime
+        self.weights = weights
+        self.device = residual.device
+        self.tokens = int(tokens)
+        self.hidden = int(hidden)
+        self.world_size = int(runtime.world_size)
+        self.rank = int(runtime.rank)
+        self.norm_eps = float(norm_eps)
+        self.has_addend = bool(has_addend)
+        self.emit_mxfp8 = bool(emit_mxfp8)
+        self.release_dependents = bool(release_dependents)
+        self.experts = experts
+        self._runners: dict[tuple[bool, int], object] = {}
+        self.handle = next(_FUSED_MHC_AR_HANDLES)
+        _FUSED_MHC_AR_OWNERS[self.handle] = self
+        register_finalizer(session, self._finalize)
+
+    def _channel(self):
+        channel = _resolve_oneshot_channel(self.runtime)
+        if channel is None:
+            raise RuntimeError(
+                "PreparedFusedMhcAllReducePostYNorm requires a live single-channel PCIe oneshot channel"
+            )
+        return channel
+
+    def functional(self, *, session=None):
+        return self
+
+    def _compile_variant(self, device_slot_selection: bool, slot_bias: int):
+        from b12x.norm.mhc._split_lagged import compile_cluster_allreduce_post_y_norm
+
+        ordinal = int(self.device.index or 0)
+        cluster_size = _cluster_size_for_tokens(self.tokens)
+        bias = int(slot_bias) & 1 if device_slot_selection else 0
+        return compile_cluster_allreduce_post_y_norm(
+            ordinal,
+            self.hidden,
+            self.world_size,
+            self.rank,
+            self.norm_eps,
+            self.weights.norm.dtype,
+            cluster_size=cluster_size,
+            emit_mxfp8=self.emit_mxfp8,
+            has_addend=self.has_addend,
+            device_slot_selection=device_slot_selection,
+            slot_bias=bias,
+            release_dependents=self.release_dependents,
+        )
+
+    def _finalize(self):
+        from b12x._lib.compile_plan import load_programs
+        from b12x.moe.fused_moe._binding_ops import supports_prequant_mxfp8
+
+        if self.experts is not None and not getattr(
+            self.experts, "integrated_routing", False
+        ):
+            self.emit_mxfp8 = bool(
+                self.emit_mxfp8
+                or supports_prequant_mxfp8(self.experts.plan, self.tokens)
+            )
+        self.experts = None
+        ordinal = int(self.device.index or 0)
+        cluster_size = _cluster_size_for_tokens(self.tokens)
+        for dev_sel, bias in ((False, 0), (True, 0), (True, 1)):
+            runner = self._compile_variant(dev_sel, bias)
+            load_programs(runner)
+            self._runners[(dev_sel, bias)] = runner
+            _SPLIT_MHC_RUNNERS[
+                (
+                    "fused_ar_post_y",
+                    ordinal,
+                    self.hidden,
+                    self.world_size,
+                    self.rank,
+                    self.norm_eps,
+                    self.weights.norm.dtype,
+                    cluster_size,
+                    self.emit_mxfp8,
+                    self.has_addend,
+                    dev_sel,
+                    bias,
+                    self.release_dependents,
+                )
+            ] = runner
+
+    def _launch(
+        self,
+        x: torch.Tensor,
+        input_addend: torch.Tensor | None,
+        residual: torch.Tensor,
+        prev_post: torch.Tensor,
+        prev_comb: torch.Tensor,
+        pre_mix: torch.Tensor,
+        norm_weight: torch.Tensor,
+        out: torch.Tensor,
+        y: torch.Tensor,
+        a_values: torch.Tensor | None,
+        a_scales: torch.Tensor | None,
+    ) -> None:
+        from b12x.norm.mhc._split_lagged import oneshot_channel_sentinel_params
+
+        channel = self._channel()
+        (
+            peer_table_address,
+            signal_table_address,
+            shard_packs,
+            payload_ready_region_packs,
+            device_slot_selection,
+            slot_bias,
+        ) = oneshot_channel_sentinel_params(channel)
+        key = (bool(device_slot_selection), int(slot_bias) & 1 if device_slot_selection else 0)
+        runner = self._runners.get(key)
+        if runner is None:
+            runner = self._compile_variant(key[0], key[1])
+            self._runners[key] = runner
+        stream = (
+            torch.cuda.current_stream(residual.device)
+            if residual.device.type == "cuda"
+            else None
+        )
+        runner(
+            peer_table_address,
+            signal_table_address,
+            x,
+            residual,
+            prev_post,
+            prev_comb,
+            pre_mix,
+            norm_weight,
+            out,
+            y,
+            shard_packs=shard_packs,
+            payload_ready_region_packs=payload_ready_region_packs,
+            input_addend=input_addend,
+            a_values=a_values,
+            a_scales=a_scales,
+            stream=stream,
+        )
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        prev_post: torch.Tensor,
+        prev_comb: torch.Tensor,
+        *,
+        pre_mix: torch.Tensor,
+        input_addend: torch.Tensor | None = None,
+        dependencies=(),
+    ):
+        if self.has_addend and input_addend is None:
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm with has_addend=True requires input_addend"
+            )
+        if not self.has_addend and input_addend is not None:
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm with has_addend=False does not accept input_addend"
+            )
+        tokens, _, hidden = residual.shape
+        device = residual.device
+        out = torch.empty((tokens, 4, hidden), dtype=residual.dtype, device=device)
+        y = torch.empty((tokens, hidden), dtype=residual.dtype, device=device)
+        if self.emit_mxfp8:
+            a_values = torch.empty((tokens, hidden), dtype=torch.uint8, device=device)
+            a_scales = torch.empty(
+                (tokens, hidden // 32), dtype=torch.uint8, device=device
+            )
+        else:
+            a_values = None
+            a_scales = None
+        _cluster_mhc_allreduce_post_y_norm(
+            x,
+            input_addend,
+            residual,
+            prev_post,
+            prev_comb,
+            pre_mix,
+            self.weights.norm,
+            out,
+            y,
+            a_values,
+            a_scales,
+            list(dependencies),
+            self.handle,
+        )
+        return out, y, a_values, a_scales
+
+
+def link_fused_mhc_layers(layers) -> None:
+    """Defer FFN AllReduce into the following layer's fused AllReduce+mHC when both fit."""
+    for prev_layer, next_layer in zip(layers, layers[1:]):
+        if (
+            getattr(prev_layer, "split_mhc", False)
+            and prev_layer.post is None
+            and getattr(next_layer, "split_mhc", False)
+            and next_layer.carry
+            and next_layer.engram is None
+            and getattr(next_layer, "attn_fused_mhc", None) is not None
+            and getattr(prev_layer, "fused_mhc_runtime", None)
+            is next_layer.attn_fused_mhc.runtime
+        ):
+            prev_layer.defer_mlp_reduce = True
