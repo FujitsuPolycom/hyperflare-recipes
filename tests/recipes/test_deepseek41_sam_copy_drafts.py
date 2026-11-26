@@ -22,7 +22,6 @@ from hyperflare_recipes.components.parallel_draft import (
     _resolve_copy_proposals,
 )
 from hyperflare_recipes.components.speculation import (
-    DRAFT_RNG_DOMAIN,
     PreparedSpeculativeCommit,
     SpeculativeAcceptance,
     SpeculativeRngState,
@@ -865,3 +864,295 @@ def test_fx_traceable_copy_overlay_has_no_data_dependent_control_flow():
     assert out_probs[1, 5].sum().item() == pytest.approx(1.0)
     assert out_valid.all()
     assert out_mask.tolist() == [0, 0b11111]
+
+
+def test_local_vocab_start_tensor_overlay_and_fx_traceable():
+    """Tensor vocab_start avoids Dynamo rank guards and matches scalar int across all 4 TP shards."""
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    world, local_vocab, tile_block = 4, 512, 256
+    blocks = local_vocab // tile_block
+    copy_tokens = torch.tensor([[10, 520, 1100, 1900, -1, -1, -1]], dtype=torch.int64)
+    copy_active = torch.tensor([[True, True, True, True, False, False, False]])
+    base_probs = torch.full((1, 7, local_vocab), 1.0 / (world * local_vocab), dtype=torch.float32)
+    base_masses = torch.full((1, 7, blocks), tile_block / (world * local_vocab), dtype=torch.float32)
+
+    for rank in range(world):
+        scalar_start = rank * local_vocab
+        tensor_start = torch.tensor([scalar_start], dtype=torch.int64)
+
+        d_s, p_s, v_s, m_s = (
+            torch.zeros((1, 7), dtype=torch.int64),
+            base_probs.clone(),
+            torch.zeros((1, 7), dtype=torch.bool),
+            base_masses.clone(),
+        )
+        mask_s = _apply_copy_proposals(
+            d_s, p_s, v_s, copy_active, copy_tokens, vocab_start=scalar_start, tile_masses=m_s,
+        )
+
+        d_t, p_t, v_t, m_t = (
+            torch.zeros((1, 7), dtype=torch.int64),
+            base_probs.clone(),
+            torch.zeros((1, 7), dtype=torch.bool),
+            base_masses.clone(),
+        )
+        mask_t = _apply_copy_proposals(
+            d_t, p_t, v_t, copy_active, copy_tokens, vocab_start=tensor_start, tile_masses=m_t,
+        )
+
+        assert torch.equal(d_s, d_t)
+        assert torch.equal(v_s, v_t)
+        assert torch.equal(p_s.view(torch.int32), p_t.view(torch.int32))
+        assert torch.equal(m_s.view(torch.int32), m_t.view(torch.int32))
+        assert torch.equal(mask_s, mask_t)
+
+    # Trace once with rank 0 tensor vocab_start, then replay with rank 2 tensor vocab_start.
+    def fn(drafts, probs, valid, masses, active, tokens, vocab_start):
+        mask = _apply_copy_proposals(
+            drafts, probs, valid, active, tokens, vocab_start=vocab_start, tile_masses=masses,
+        )
+        return drafts, probs, valid, masses, mask
+
+    traced = make_fx(fn)(
+        torch.zeros((1, 7), dtype=torch.int64),
+        base_probs.clone(),
+        torch.zeros((1, 7), dtype=torch.bool),
+        base_masses.clone(),
+        copy_active,
+        copy_tokens,
+        torch.tensor([0], dtype=torch.int64),
+    )
+    _out_d, out_p, _out_v, out_m, out_mask = traced(
+        torch.zeros((1, 7), dtype=torch.int64),
+        base_probs.clone(),
+        torch.zeros((1, 7), dtype=torch.bool),
+        base_masses.clone(),
+        copy_active,
+        copy_tokens,
+        torch.tensor([2 * local_vocab], dtype=torch.int64),
+    )
+    # Token 1100 is at local index 1100 - 1024 = 76 on rank 2 (tile 0).
+    assert out_p[0, 2, 76].item() == 1.0 and out_p[0, 2].sum().item() == 1.0
+    assert out_m[0, 2].tolist() == [1.0, 0.0]
+    assert out_p[0, 0].sum().item() == 0.0 and out_m[0, 0].tolist() == [0.0, 0.0]
+    assert out_mask.tolist() == [0b1111]
+
+
+@pytest.mark.parametrize("k", [0, 1, 3, 7])
+def test_vocabulary_parallel_fused_copy_uses_single_run_without_post_overlay(k, monkeypatch):
+    """When full_proposal supports inline copy (has_copy=True), propose() uses single run() with 0 extra overlay."""
+    import hyperflare_recipes.components.parallel_draft as pd_mod
+
+    world, local_vocab, tile_block = 4, 512, 256
+    vocab = world * local_vocab
+    blocks = local_vocab // tile_block
+    copy_seq = [10, 520, 1100, 1900, 42, 777, 1500]
+
+    op, owner, _ = _make_round_and_owner(batch=2, width=8, capacity=4, vocab=vocab, with_copy=True)
+    owner.weights.shard = SimpleNamespace(rank=1, world_size=world)
+    op.vocabulary_parallel = True
+    op.draft_mass_shape = (2, 7, blocks)
+    op.local_vocab_start = torch.tensor([local_vocab], dtype=torch.int64)
+    op.operations = None, (), None, None
+
+    if k > 0:
+        owner.copy_ids[0, :k] = torch.tensor(copy_seq[:k], dtype=torch.int64)
+        owner.copy_count[0] = k
+        owner.copy_expected[0] = owner.requests.consumed_tokens[0]
+        owner.copy_generation[0] = owner.requests.generation[0]
+
+    overlay_calls = []
+
+    def fail_if_called(*args, **kwargs):
+        overlay_calls.append((args, kwargs))
+        raise AssertionError("_apply_copy_proposals should not run when full_proposal.has_copy is True")
+
+    monkeypatch.setattr(pd_mod, "_apply_copy_proposals", fail_if_called)
+
+    run_calls = []
+    seen_tail_prev = []
+
+    class _FusedCopyVocabSoftmax:
+        has_copy = True
+
+        def run(self, base, drafts, *, pending, seeds, offsets, probabilities, valid, tokens,
+                tile_masses, token_limits, copy_active=None, copy_tokens=None):
+            run_calls.append((copy_active.clone(), copy_tokens.clone()))
+            start = local_vocab
+            local_ids = torch.arange(local_vocab, dtype=torch.int64) + start
+            for step in range(drafts.shape[1]):
+                if step == k and k > 0:
+                    seen_tail_prev.append(drafts[0, step - 1].item())
+                for row in range(drafts.shape[0]):
+                    if copy_active[row, step]:
+                        tok = copy_tokens[row, step].item()
+                        pm = (local_ids == tok).to(torch.float32)
+                        probabilities[row, step].copy_(pm)
+                        tile_masses[row, step].copy_(pm.view(blocks, tile_block).sum(dim=-1))
+                        valid[row, step] = True
+                        tokens[row, step] = tok
+                    else:
+                        probabilities[row, step].fill_(1.0 / vocab)
+                        tile_masses[row, step].fill_(tile_block / vocab)
+                        valid[row, step] = True
+                        tokens[row, step] = 200 + row * 10 + step
+
+        def run_step(self, *args, **kwargs):
+            raise AssertionError("7x run_step must not be invoked when has_copy is True and recurrent is None")
+
+    op.full_proposal = _FusedCopyVocabSoftmax()
+    probs = torch.empty(2, 7, local_vocab, dtype=torch.float32)
+    out = op.propose(probabilities=probs)
+
+    assert len(run_calls) == 1
+    assert overlay_calls == []
+    assert out.copy_offered_mask.tolist() == [(1 << k) - 1, 0]
+    if k > 0:
+        assert out.drafts[0, :k].tolist() == copy_seq[:k]
+        if k < 7:
+            assert seen_tail_prev == [copy_seq[k - 1]]
+        # Token 520 is at local index 520 - 512 = 8 on rank 1.
+        if k >= 2:
+            assert probs[0, 1, 8].item() == 1.0 and probs[0, 1].sum().item() == 1.0
+            assert out.tile_masses[0, 1].tolist() == [1.0, 0.0]
+        # Token 10 belongs to rank 0, so rank 1 holds all zeros for pos 0.
+        assert probs[0, 0].sum().item() == 0.0 and out.tile_masses[0, 0].tolist() == [0.0, 0.0]
+    assert out.drafts[1].tolist() == [210 + s for s in range(7)]
+
+
+def test_prepared_vocabulary_softmax_copy_contract_validation():
+    """PreparedVocabularySoftmax validates optional copy_active/copy_tokens pairing and target rejection."""
+    from hyperflare_recipes.components.vocabulary_sampling import PreparedVocabularySoftmax
+
+    b, w, local = 2, 4, 16
+    device = torch.device("cpu")
+    requests = DeviceRequestState.allocate(device, vocab_size=local, capacity=4)
+    logits = torch.zeros((b, w, local), dtype=torch.float32, device=device)
+    probs = torch.zeros((b, w, local), dtype=torch.float32, device=device)
+    valid = torch.zeros((b, w), dtype=torch.bool, device=device)
+    slots = torch.arange(b, dtype=torch.int32, device=device)
+    gens = torch.zeros(b, dtype=torch.int64, device=device)
+    live = torch.tensor([b], dtype=torch.int32, device=device)
+    drafts = torch.zeros((b, w), dtype=torch.int64, device=device)
+    seeds = torch.zeros(b, dtype=torch.int64, device=device)
+    offsets = torch.zeros(b, dtype=torch.int64, device=device)
+    copy_active = torch.zeros((b, w), dtype=torch.bool, device=device)
+    copy_tokens = torch.zeros((b, w), dtype=torch.int64, device=device)
+
+    common = {"start": 0, "runtime": None, "session": None, "coordinator": None, "name": "test"}
+
+    # Mismatched copy_active / copy_tokens rejected.
+    with pytest.raises(ValueError, match="both copy_active and copy_tokens"):
+        PreparedVocabularySoftmax(
+            logits, probs, valid, requests, slots, gens, live, drafts,
+            **common, seeds=seeds, offsets=offsets, tokens=drafts, copy_active=copy_active,
+        )
+
+    # Target softmax (tokens=None) rejects copy proposals.
+    with pytest.raises(ValueError, match="target softmax cannot attach copy proposals"):
+        PreparedVocabularySoftmax(
+            logits, probs, valid, requests, slots, gens, live, torch.zeros((b, w - 1), dtype=torch.int64),
+            **common, copy_active=copy_active, copy_tokens=copy_tokens,
+        )
+
+    # Default copy_active=None preserves backwards compatibility (has_copy == False).
+    op_default = PreparedVocabularySoftmax(
+        logits, probs, valid, requests, slots, gens, live, drafts,
+        **common, seeds=seeds, offsets=offsets, tokens=drafts,
+    )
+    assert op_default.has_copy is False
+
+    # Valid paired copy tensors set has_copy == True.
+    op_copy = PreparedVocabularySoftmax(
+        logits, probs, valid, requests, slots, gens, live, drafts,
+        **common, seeds=seeds, offsets=offsets, tokens=drafts,
+        copy_active=copy_active, copy_tokens=copy_tokens,
+    )
+    assert op_copy.has_copy is True
+
+
+@pytest.mark.parametrize("batch", [1, 4, 6, 12, 16, 24])
+def test_speculative_commit_clamps_leader_amax_for_non_power_of_two_batches(batch, monkeypatch):
+    """PreparedSpeculativeStateCommit runs and traces cleanly across B in {1, 4, 6, 12, 16, 24}."""
+    from torch.fx.experimental.proxy_tensor import make_fx
+    from hyperflare_recipes.components import speculation as spec_mod
+
+    if batch not in spec_mod.BATCH_CAPACITIES:
+        monkeypatch.setattr(spec_mod, "BATCH_CAPACITIES", (1, 2, 4, 6, 8, 12, 16, 24, 32, 64))
+
+    w, vocab = 4, 16
+    cap = max(32, batch)
+    device = torch.device("cpu")
+    requests = DeviceRequestState.allocate(device, vocab_size=vocab, capacity=cap)
+    live_n = max(1, batch - 1)
+    requests.status[:live_n] = RUNNING
+    requests.generation[:live_n] = torch.arange(1, live_n + 1, dtype=torch.int64)
+    requests.consumed_tokens[:live_n] = 10
+    requests.pending_token[:live_n] = 2
+    requests.max_new_tokens[:live_n] = 64
+
+    slots = torch.arange(batch, dtype=torch.int32, device=device)
+    gens = torch.arange(1, batch + 1, dtype=torch.int64, device=device)
+    live_rows = torch.tensor([live_n], dtype=torch.int32, device=device)
+    candidates = torch.full((batch, w), 3, dtype=torch.int64, device=device)
+    candidates[:, 0] = 2
+
+    acceptance = SpeculativeAcceptance.allocate(batch, w, device)
+    acceptance.token_ids[:, :2] = torch.tensor([3, 4], dtype=torch.int64)
+    acceptance.proposed_count.fill_(2)
+    acceptance.accepted_drafts.fill_(1)
+    acceptance.offered_drafts.fill_(w - 1)
+    acceptance.valid.fill_(True)
+    acceptance.rng_increment.fill_(8)
+
+    completion = CompletionOutputs.allocate((2, cap, VECTOR_TOKENS_FIELD + w), device=device)
+    frame = torch.zeros(1, dtype=torch.int32, device=device)
+    sequence = torch.tensor([1], dtype=torch.int64, device=device)
+    rng = SpeculativeRngState.allocate(device, capacity=cap)
+
+    class _NoopLogprobs:
+        def prepare(self):
+            pass
+
+        def functional(self, **kwargs):
+            return self
+
+        def __call__(self):
+            pass
+
+        def run(self, logits, **kwargs):
+            pass
+
+    commit = PreparedSpeculativeCommit(
+        requests, acceptance, candidates, slots, gens, live_rows,
+        completion, frame, sequence, logprobs=_NoopLogprobs(), rng=rng, draft_context_lag=0,
+    )
+    commit.prepare()
+    commit.functional()
+
+    out = commit(None, acceptance=acceptance, inputs=candidates)
+    assert out.emitted_count[:live_n].tolist() == [2] * live_n
+    if live_n < batch:
+        assert out.emitted_count[live_n:].tolist() == [0] * (batch - live_n)
+
+    # Confirm make_fx graph contains the explicit clamp on amax(1) to [0, batch - 1].
+    traced = make_fx(lambda tok_ids, prop, acc, off, val, inc, surv, inp: commit(
+        None,
+        acceptance=SpeculativeAcceptance(tok_ids, prop, acc, off, val, inc, surv),
+        inputs=inp,
+    ))(
+        acceptance.token_ids,
+        acceptance.proposed_count,
+        acceptance.accepted_drafts,
+        acceptance.offered_drafts,
+        acceptance.valid,
+        acceptance.rng_increment,
+        acceptance.survival,
+        candidates,
+    )
+    clamp_nodes = [
+        n for n in traced.graph.nodes
+        if n.op == "call_function" and "clamp" in str(n.target) and n.args[1:] == (0, batch - 1)
+    ]
+    assert len(clamp_nodes) >= 1, f"expected clamp(0, {batch - 1}) node in FX graph for B={batch}"
