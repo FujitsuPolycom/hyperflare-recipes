@@ -7,8 +7,11 @@
 from dataclasses import dataclass
 
 import torch
+import triton
+import triton.language as tl
 
 from ignition.components.collectives import PreparedAllReduce
+from ignition.preparation.persistent import persistent_copy
 from .draft_sampling import DRAFT_CANDIDATES, PreparedDraftDistribution, PreparedDraftBlockBroadcast
 from .paged_batch import Metadata, prepare_batch, row_rotary_offsets
 from .speculation import (
@@ -44,6 +47,170 @@ class DraftProposalState:
     # Each row's rotary offset from its token index, for a pool that declares the region.
     rotary_offsets: torch.Tensor | None = None
     tile_masses: torch.Tensor | None = None
+    copy_offered_mask: torch.Tensor | None = None
+
+
+def _resolve_copy_proposals(owner, active, safe, before, limits, depth):
+    """Validate per-slot host copy proposals and return contiguous prefix masks and token IDs."""
+    copy_ids = getattr(owner, "copy_ids", None)
+    if copy_ids is None or depth <= 0:
+        return None, None
+    device = safe.device
+    copy_count = owner.copy_count[safe]
+    copy_expected = owner.copy_expected[safe]
+    copy_generation = owner.copy_generation[safe]
+    row_valid = (
+        active
+        & (copy_generation == owner.requests.generation[safe])
+        & (copy_expected == before)
+        & (copy_count > 0)
+    )
+    grammar_enabled = getattr(owner.requests, "grammar_enabled", None)
+    if grammar_enabled is not None:
+        row_valid = row_valid & (grammar_enabled[safe] == 0)
+    copy_width = copy_ids.shape[1]
+    take = min(depth, copy_width)
+    tokens = copy_ids[safe, :take]
+    if take < depth:
+        tokens = torch.nn.functional.pad(tokens, (0, depth - take), value=-1)
+    positions = torch.arange(depth, device=device)
+    raw = (
+        row_valid[:, None]
+        & (positions[None, :] < copy_count[:, None])
+        & (positions[None, :] < (limits[:, None] - 1))
+        & (tokens >= 0)
+        & (tokens < owner.requests.vocab_size)
+    )
+    # Copy proposals form a contiguous prefix starting at draft position zero.
+    copy_active = raw.to(torch.int32).cumprod(dim=1).bool()
+    return copy_active, tokens
+
+
+def _copy_offered_mask(copy_active):
+    """Pack contiguous copy-draft active flags into a per-row bitmask."""
+    positions = torch.arange(copy_active.shape[1], device=copy_active.device, dtype=torch.int64)
+    return (copy_active.to(torch.int64) << positions[None, :]).sum(dim=1)
+
+
+@triton.jit
+def _apply_copy_proposals_kernel(
+    Drafts,
+    Probabilities,
+    Valid,
+    TileMass,
+    CopyActive,
+    CopyTokens,
+    VocabStartPtr,
+    VOCAB_START_CONST: tl.constexpr,
+    USE_VOCAB_START_PTR: tl.constexpr,
+    LOCAL_VOCAB: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    TILE_BLOCK: tl.constexpr,
+    HAS_MASSES: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    row_depth = tl.program_id(1)
+    if tl.load(CopyActive + row_depth) == 0:
+        return
+    copy_tok = tl.load(CopyTokens + row_depth)
+    if tile == 0:
+        tl.store(Drafts + row_depth, copy_tok)
+        tl.store(Valid + row_depth, True)
+    vocab_start = (
+        tl.load(VocabStartPtr).to(tl.int64)
+        if USE_VOCAB_START_PTR
+        else tl.full((), VOCAB_START_CONST, tl.int64)
+    )
+    local_target = copy_tok - vocab_start
+    col = tile * TILE_BLOCK + tl.arange(0, TILE_BLOCK)
+    mask = col < LOCAL_VOCAB
+    point_mass = (col.to(tl.int64) == local_target).to(Probabilities.dtype.element_ty)
+    tl.store(Probabilities + row_depth * LOCAL_VOCAB + col, point_mass, mask=mask)
+    if HAS_MASSES:
+        tile_start = tile * TILE_BLOCK
+        tile_has_target = (
+            (local_target >= tile_start)
+            & (local_target < tile_start + TILE_BLOCK)
+            & (local_target < LOCAL_VOCAB)
+        )
+        tl.store(
+            TileMass + row_depth * BLOCKS + tile,
+            tl.where(tile_has_target, 1.0, 0.0).to(TileMass.dtype.element_ty),
+        )
+
+
+def _apply_copy_proposals(
+    drafts,
+    probabilities,
+    valid,
+    copy_active,
+    copy_tokens,
+    *,
+    vocab_start=0,
+    tile_masses=None,
+    tile_block=256,
+):
+    """Overlay contiguous copy-draft prefixes with point-mass q=1.0 proposal distributions."""
+    batch, depth = drafts.shape
+    local_vocab = probabilities.shape[-1]
+    device = drafts.device
+    blocks = (local_vocab + tile_block - 1) // tile_block if tile_block > 0 else 0
+    if (
+        probabilities.is_cuda
+        and batch > 0
+        and depth > 0
+        and local_vocab > 0
+        and probabilities.is_contiguous()
+        and drafts.is_contiguous()
+        and valid.is_contiguous()
+        and tile_block > 0
+        and (tile_block & (tile_block - 1)) == 0
+        and (tile_masses is None or (tile_masses.is_contiguous() and tile_masses.shape[-1] == blocks))
+    ):
+        from torch.fx.experimental.proxy_tensor import get_proxy_mode
+
+        use_ptr = isinstance(vocab_start, torch.Tensor)
+        vocab_start_ptr = vocab_start.contiguous() if use_ptr else None
+        vocab_start_const = 0 if use_ptr else int(vocab_start)
+        args = (
+            drafts,
+            probabilities,
+            valid,
+            tile_masses,
+            copy_active.contiguous(),
+            copy_tokens.contiguous(),
+            vocab_start_ptr,
+        )
+        kwargs = {
+            "VOCAB_START_CONST": vocab_start_const,
+            "USE_VOCAB_START_PTR": use_ptr,
+            "LOCAL_VOCAB": local_vocab,
+            "BLOCKS": blocks,
+            "TILE_BLOCK": tile_block,
+            "HAS_MASSES": tile_masses is not None,
+            "num_warps": 4,
+        }
+        grid = (blocks, batch * depth)
+        if torch.compiler.is_compiling() or get_proxy_mode() is not None:
+            torch.library.wrap_triton(_apply_copy_proposals_kernel)[grid](*args, **kwargs)
+        else:
+            _apply_copy_proposals_kernel[grid](*args, **kwargs)
+        return _copy_offered_mask(copy_active)
+
+    drafts.copy_(torch.where(copy_active, copy_tokens, drafts))
+    valid.copy_(torch.where(copy_active, True, valid))
+    local_ids = torch.arange(local_vocab, device=device, dtype=torch.int64) + vocab_start
+    point_mass = (local_ids[None, None, :] == copy_tokens[:, :, None]).to(probabilities.dtype)
+    probabilities.copy_(torch.where(copy_active[:, :, None], point_mass, probabilities))
+    if tile_masses is not None:
+        mass_blocks = tile_masses.shape[-1]
+        local_target = copy_tokens - vocab_start
+        in_shard = (local_target >= 0) & (local_target < local_vocab)
+        target_tile = torch.where(in_shard, local_target // tile_block, -1)
+        tile_ids = torch.arange(mass_blocks, device=device, dtype=torch.int64)
+        tile_point_mass = (tile_ids[None, None, :] == target_tile[:, :, None]).to(tile_masses.dtype)
+        tile_masses.copy_(torch.where(copy_active[:, :, None], tile_point_mass, tile_masses))
+    return _copy_offered_mask(copy_active)
 
 
 class PreparedParallelDraftRound:
@@ -559,21 +726,22 @@ class PreparedParallelDraftRound:
         o.offset.copy_(torch.where(matches.any(1), base + 4 * drafts, o.offset))
         o.generation.copy_(torch.where(matches.any(1), o.requests.generation, o.generation))
 
-    def verify(self, proposal_valid=None, *, probabilities, proposal):
+    def verify(self, proposal_valid=None, *, probabilities, proposal, token_limits=None):
         o, b, w = self.owner, self.batch, self.width
         target, _, verify, commit = self.operations
         slots = o.inputs.row_slot_ids[:b].long()
         safe = slots.clamp(0, o.requests.capacity - 1)
         active = proposal.active if proposal_valid is None else proposal.active & proposal_valid
-        limits = torch.where(active, o.inputs.query_lengths[:b], 0)
+        query_limits = o.inputs.query_lengths[:b] if token_limits is None else token_limits
+        limits = torch.where(active, query_limits, 0)
         states = o.inputs.request_state_rows[safe, 0]
         metadata = Metadata.pack(proposal.before, limits, states, o.inputs.page_tables[safe],
             proposal.candidates, o.inputs.live_rows, token_capacity=self.target_token_capacity,
             sample_count=b * w, max_query_tokens=w, rotary_offset=proposal.rotary_offsets)
         hidden, logits, auxiliary, records = self.decoder(metadata)
+        limit_kwargs = {} if token_limits is None else {"token_limits": query_limits}
         if self.vocabulary_parallel:
             target_tile_masses = torch.empty(self.target_mass_shape, dtype=torch.float32, device=logits.device)
-            query_limits = o.inputs.query_lengths[:b]
             target_probabilities, target_valid, _ = target.run(logits.view(b, w, -1), proposal.drafts,
                 tile_masses=target_tile_masses, token_limits=query_limits)
             if proposal.tile_masses is None:
@@ -591,12 +759,22 @@ class PreparedParallelDraftRound:
                               for name, (shape, dtype) in target.layout.items()}
             verify_scratch = {name: torch.empty(shape, dtype=dtype, device=logits.device)
                               for name, (shape, dtype) in verify.layout.items()}
-            target.run(target_scratch, logits.view(b, w, -1), candidates=proposal.drafts)
+            target.run(target_scratch, logits.view(b, w, -1), candidates=proposal.drafts, **limit_kwargs)
             acceptance = verify.run(verify_scratch, probabilities, target_scratch["probabilities"],
-                target_scratch["valid"], disjoint=True, drafts=proposal.drafts, draft_valid=proposal.valid)
+                target_scratch["valid"], disjoint=True, drafts=proposal.drafts, draft_valid=proposal.valid,
+                **limit_kwargs)
         if proposal_valid is not None:
             acceptance.valid.logical_and_(proposal_valid)
-        committed = commit(logits.view(b, w, -1), acceptance=acceptance, inputs=proposal.candidates)
+        commit_kwargs = dict(limit_kwargs)
+        if proposal.copy_offered_mask is not None:
+            offered = (limits - 1).clamp(0, max(0, w - 1)).to(torch.int64)
+            offered_mask = torch.where(
+                offered >= 63,
+                (1 << 63) - 1,
+                (torch.ones_like(offered) << offered.clamp_max(62)) - 1,
+            )
+            commit_kwargs["copy_offered_mask"] = proposal.copy_offered_mask & offered_mask
+        committed = commit(logits.view(b, w, -1), acceptance=acceptance, inputs=proposal.candidates, **commit_kwargs)
         counts = committed.emitted_count
         if w > 1:
             self.decoder.commit(counts, records, metadata)
@@ -606,3 +784,105 @@ class PreparedParallelDraftRound:
         if self.context is not None:
             self.context(auxiliary, counts, metadata)
         return metadata, acceptance, committed
+
+
+class PreparedCopyOnlySpeculativeRound:
+    """Target-only wide copy-verify round that skips DSpark and Markov drafting.
+
+    Host copy proposals are validated for slot liveness, generation, cursor
+    freshness, unconstrained grammar, and contiguous in-vocabulary token IDs,
+    then verified directly through the target decoder with point-mass ``q=1.0``
+    proposals. Accepted target feedback updates ``PreparedContext`` so the next
+    learned draft round retains exact draft context KV state.
+    """
+
+    def __init__(self, target, *, name=None):
+        if (target.generate_proposals or target.proposal_only or target.width <= 1
+                or target.draft is not None or target.markov is not None):
+            raise ValueError("copy-only speculative round requires a target-only verification round with width > 1")
+        copy_ids = getattr(target.owner, "copy_ids", None)
+        if copy_ids is None or copy_ids.shape[1] < target.width - 1:
+            raise ValueError("copy-only speculative round requires copy_token_ids covering width - 1 drafts")
+        self.target = target
+        self.name = target.name if name is None else name
+        o = target.owner
+        vocab_parallel = getattr(target, "vocabulary_parallel", False)
+        local_vocab = target.probability_shape[-1] if vocab_parallel else 0
+        self.local_vocab_start = persistent_copy(torch.tensor(
+            [o.weights.shard.rank * local_vocab if vocab_parallel else 0],
+            dtype=torch.int64,
+            device=copy_ids.device,
+        ))
+
+    def _round(self):
+        t = self.target
+        o, b, w = t.owner, t.batch, t.width
+        device = o.requests.histogram.device
+        validation_input, present = t.validator.validate()
+        validated = t.validator.begin(t.validation(validation_input), present=present)
+        active = validated.lengths > 0
+        offsets = row_rotary_offsets(validated)
+        slots = o.inputs.row_slot_ids[:b].long()
+        safe = slots.clamp(0, o.requests.capacity - 1)
+        before = o.requests.consumed_tokens[safe]
+        limits = torch.where(active, o.inputs.query_lengths[:b], 0)
+        candidates = torch.zeros((b, w), dtype=torch.int64, device=device)
+        candidates[:, 0].copy_(o.requests.pending_token[safe])
+        drafts = torch.zeros((b, w - 1), dtype=torch.int64, device=device)
+        valid = torch.zeros((b, w - 1), dtype=torch.bool, device=device)
+        probabilities = torch.zeros(t.probability_shape, dtype=torch.float32, device=device)
+        draft_tile_masses = (
+            torch.zeros(t.draft_mass_shape, dtype=torch.float32, device=device)
+            if t.vocabulary_parallel
+            else None
+        )
+        copy_active, copy_tokens = _resolve_copy_proposals(o, active, safe, before, limits, w - 1)
+        copy_offered_mask = _apply_copy_proposals(
+            drafts,
+            probabilities,
+            valid,
+            copy_active,
+            copy_tokens,
+            vocab_start=self.local_vocab_start if t.vocabulary_parallel else 0,
+            tile_masses=draft_tile_masses,
+        )
+        candidates[:, 1:].copy_(drafts)
+        effective_count = copy_active.to(torch.int32).sum(dim=1)
+        effective_limits = torch.where(active, (effective_count + 1).clamp_max(limits), 0)
+        base_offset = torch.zeros(b, dtype=torch.int64, device=device)
+        proposal = DraftProposalState(
+            before,
+            active,
+            candidates,
+            drafts,
+            valid,
+            base_offset,
+            None,
+            None,
+            offsets,
+            draft_tile_masses,
+            copy_offered_mask,
+        )
+        result = t.verify(
+            probabilities=probabilities,
+            proposal=proposal,
+            token_limits=effective_limits,
+        )
+        return proposal, result
+
+    def __call__(self):
+        _, result = self._round()
+        return result
+
+    def observe(self):
+        """Execute one copy-only round and return its metadata and acceptance for diagnostics."""
+        _, result = self._round()
+        metadata, acceptance, committed = result
+        values = {}
+        for field in ("live_counts", "starts", "lengths", "query_start_loc"):
+            values[f"target.{field}"] = getattr(metadata, field)
+        for field in ("offered_drafts", "accepted_drafts", "survival", "valid"):
+            values[f"acceptance.{field}"] = getattr(acceptance, field)
+        for field in ("accepted_drafts", "emitted_count", "emitted_ids"):
+            values[f"commit.{field}"] = getattr(committed, field)
+        return values

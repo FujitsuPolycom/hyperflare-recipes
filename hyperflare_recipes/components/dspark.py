@@ -59,6 +59,7 @@ class SpeculativePreparation:
         vocabulary_parallel_sampling=False,
         sampling_runtime=None,
         logprob_runtime=None,
+        copy_draft_tokens=None,
     ):
         self.forwards = forwards
         self.page_tokens = page_tokens
@@ -75,9 +76,15 @@ class SpeculativePreparation:
         # Only sampling uses the result channel; model forwards receive the collectives above.
         self.result_runtime = result_runtime
         self.block_proposal_broadcast = block_proposal_broadcast
-        self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
+        device = pool.backing.device
+        self.rng = SpeculativeRngState.allocate(device, capacity=requests.capacity)
         self.generation = torch.zeros_like(requests.generation)
         self.offset = torch.zeros_like(requests.generation)
+        copy_width = max(7, draft_tokens, copy_draft_tokens or 0)
+        self.copy_ids = torch.full((requests.capacity, copy_width), -1, dtype=torch.int64, device=device)
+        self.copy_count = torch.zeros(requests.capacity, dtype=torch.int32, device=device)
+        self.copy_expected = torch.full((requests.capacity,), -1, dtype=torch.int64, device=device)
+        self.copy_generation = torch.zeros(requests.capacity, dtype=torch.int64, device=device)
         draft = weights.config.draft
         self.logit_offset = 0
         self.block_size = max(1, draft_tokens)
@@ -86,10 +93,18 @@ class SpeculativePreparation:
             tokens,
             tokens,
             weights.shard.world_size,
-            pool.backing.device,
+            device,
             experts=draft.experts,
             top_k=draft.top_k,
         )
+
+    def buffers(self):
+        return {
+            "copy_token_ids": self.copy_ids,
+            "copy_token_count": self.copy_count,
+            "copy_expected_consumed": self.copy_expected,
+            "copy_generation": self.copy_generation,
+        }
 
     def release_examples(self):
         self.scratch = self.draft_scratch = None

@@ -107,6 +107,7 @@ class PreparationConfig(BasePreparationConfig):
     packed_verification: bool | None = None
     draft_prefix_selection: str | None = None
     speculation_reference_graphs: bool = False
+    copy_verify_shapes: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self):
         if self.mtp_only and (not self.dspark
@@ -172,6 +173,27 @@ class PreparationConfig(BasePreparationConfig):
         self.speculative_shapes
         if self.speculative_fixed_width is not None and self.speculative_fixed_width not in self.speculative_widths:
             raise ValueError("fixed verification width must belong to the prepared widths")
+        if (not isinstance(self.copy_verify_shapes, tuple)
+                or any(not isinstance(shape, tuple) or len(shape) != 2
+                       or any(type(v) is not int for v in shape)
+                       for shape in self.copy_verify_shapes)
+                or len(set(self.copy_verify_shapes)) != len(self.copy_verify_shapes)):
+            raise ValueError("copy_verify_shapes must be a tuple of distinct (batch, width) integer pairs")
+        if self.copy_verify_shapes:
+            if not drafting:
+                raise ValueError("wide copy-verify shapes require enabled DSpark speculation")
+            allowed_batches = set(batch_capacities(self.max_active))
+            base_width = max(self.speculative_widths)
+            max_width = max(width for _, width in self.copy_verify_shapes)
+            token_cap = speculative_token_capacity(
+                self.max_active, max(base_width, max_width), self.speculative_token_capacity)
+            for batch, width in self.copy_verify_shapes:
+                if batch not in allowed_batches:
+                    raise ValueError(f"copy_verify_shapes batch {batch} exceeds prepared batch capacities")
+                if not base_width < width <= 64:
+                    raise ValueError("copy_verify_shapes width must exceed base MTP width and stay within 64")
+                if batch * width > token_cap:
+                    raise ValueError("copy_verify_shapes batch * width exceeds speculative_token_capacity")
         if self.minimum_pages <= 0 or self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("page and snapshot budgets must be positive and headroom nonnegative")
         if self.kv_pages is not None and (type(self.kv_pages) is not int or self.kv_pages < self.minimum_pages):
@@ -206,11 +228,25 @@ class PreparationConfig(BasePreparationConfig):
 
     @property
     def decode_tokens(self):
-        return max(self.request_capacity, max((tokens for _, tokens in self.packed_speculative_shapes), default=0))
+        return max(
+            self.request_capacity,
+            max((tokens for _, tokens in self.packed_speculative_shapes), default=0),
+            max((batch * width for batch, width in self.copy_verify_shapes), default=0),
+        )
 
     @property
     def draft_tokens(self):
         return max(self.speculative_widths) - 1 if self.dspark else 0
+
+    @property
+    def max_copy_drafts(self):
+        return max((width - 1 for _, width in self.copy_verify_shapes), default=0)
+
+    @property
+    def all_speculative_widths(self):
+        if not self.dspark:
+            return ()
+        return tuple(sorted({*self.speculative_widths, *(width for _, width in self.copy_verify_shapes)}))
 
     @property
     def all_reduce_tokens(self):
@@ -224,7 +260,7 @@ class PreparationConfig(BasePreparationConfig):
 
     @property
     def completion_token_capacity(self):
-        return max(self.speculative_widths) if self.dspark else 1
+        return max(self.all_speculative_widths) if self.dspark else 1
 
 
 def _prepare_speculation_catalog(config, speculation, *, add, buffers,
@@ -272,6 +308,32 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
             name=name)
         add(name, forward, "speculative", batch, logical_width, packed_inputs,
             enabled=True, packed_tokens=packed_tokens, draft_tokens=config.draft_tokens)
+    if config.copy_verify_shapes:
+        from hyperflare_recipes.components.parallel_draft import PreparedCopyOnlySpeculativeRound
+
+        if hasattr(speculation, "buffers"):
+            buffers.update(speculation.buffers())
+        copy_inputs = (
+            *forward_inputs,
+            "copy_token_ids",
+            "copy_token_count",
+            "copy_expected_consumed",
+            "copy_generation",
+        )
+        for batch, width in sorted(
+            config.copy_verify_shapes,
+            key=lambda shape: (shape[0] * shape[1], shape[0], shape[1]),
+            reverse=True,
+        ):
+            packed_tokens = batch * width
+            target_name = f"copy-verification{batch}x{width}"
+            target = PreparedParallelDraftRound(speculation, batch, width, target_name,
+                generate_proposals=False, target_token_capacity=packed_tokens)
+            target.prepare()
+            name = f"copy-speculative{batch}x{width}"
+            forward = PreparedCopyOnlySpeculativeRound(target, name=name)
+            add(name, forward, "speculative", batch, width, copy_inputs,
+                enabled=True, packed_tokens=packed_tokens, draft_tokens=width - 1, draft_source=2)
     return confidence
 
 
@@ -286,6 +348,9 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
 
         batch = max(config.batch_capacities)
         layouts = (SpeculativeAcceptance.broadcast_layout(batch, max(config.speculative_widths)),)
+        if config.copy_verify_shapes:
+            for copy_batch, copy_width in sorted(config.copy_verify_shapes):
+                layouts += (SpeculativeAcceptance.broadcast_layout(copy_batch, copy_width),)
         if config.draft_tokens:
             layouts += (PreparedDraftBlockBroadcast.broadcast_layout(batch, config.draft_tokens),)
     if coordinator.spans_hosts:
@@ -401,8 +466,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         admission = AdmissionBuffers.allocate(device, vocab_size=129280, capacity=slots)
         commands = StateCommands.allocate(device, capacity=slots)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
-        verification_samples = (slots * max(config.speculative_widths)
-                                if config.packed_verification else config.decode_tokens)
+        verification_samples = max(
+            slots * max(config.speculative_widths)
+            if config.packed_verification else config.decode_tokens,
+            max((batch * width for batch, width in config.copy_verify_shapes), default=0),
+        )
         collective, prefill_collective, vocabulary_collective, result_collective, draft_vocabulary_collective = _collective_runtimes(
             config, group, device, coordinator=coordinator, core_storage=core_storage,
             verification_samples=verification_samples)
@@ -472,7 +540,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             from hyperflare_recipes.components.dspark import DSparkForwards, SpeculativePreparation
 
             speculation = SpeculativePreparation(weights, tables, pool, requests, inputs, decoder_storage,
-                draft_tokens=config.draft_tokens, completion=completion, frame=frame, sequence=sequence,
+                draft_tokens=config.draft_tokens, copy_draft_tokens=config.max_copy_drafts,
+                completion=completion, frame=frame, sequence=sequence,
                 session=session, workspace=arena,
                 runtime=collective, vocabulary_runtime=vocabulary_collective,
                 markov_runtime=None, coordinator=coordinator, result_runtime=result_collective,
@@ -494,20 +563,24 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                            + terminal_prefill_count
                            + 4 * len(config.batch_capacities))
              + len(config.speculative_shapes) + len(config.packed_speculative_shapes)
+             + len(config.copy_verify_shapes)
              + (len(config.batch_capacities) if False in modes else 0))
     count += len(PATCH_CAPACITIES) if vision_state is not None else 0
     catalog_bytes = {}
     catalog_previous = torch.cuda.memory_allocated(device)
     with phase(progress, "Construct graph catalog", total=count) as stage:
-        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0, draft_tokens=None):
+        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0, draft_tokens=None,
+                draft_source=1):
             nonlocal catalog_previous
             if kind == "scored_prefill":
                 forward = PreparedScoredPrefill(forward, requests, inputs)
                 fields = (*fields, "prompt_target_tokens")
             forwards[name] = forward
+            source_kwargs = {"draft_source": draft_source} if draft_source != 1 else {}
             signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled,
                                               packed_token_capacity=packed_tokens, draft_tokens=draft_tokens,
-                confidence_width=draft_tokens if "speculative_prefix_limits" in fields else 0)
+                confidence_width=draft_tokens if "speculative_prefix_limits" in fields else 0,
+                **source_kwargs)
             allocated = torch.cuda.memory_allocated(device)
             catalog_bytes[kind] = catalog_bytes.get(kind, 0) + allocated - catalog_previous
             catalog_previous = allocated
@@ -636,7 +709,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             image_profile="deepseek_row_major" if vision_state is not None else None),
         "sampling_defaults": RECIPE.sampling_defaults.as_dict(), "assets": assets,
         "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency,
-            page_tokens=PAGE_TOKENS, draft_lag=0 if config.dspark else None, rows=None,
+            page_tokens=PAGE_TOKENS, draft_lag=0 if config.dspark else None,
+            rows=max(config.speculative_widths) if (config.dspark and config.copy_verify_shapes) else None,
             embedding_tables=range(len(tables.sources)))}
     memory = {"rank": rank, "world_size": shard.world_size, "device": config.devices[rank],
         "catalog_operand_bytes": catalog_bytes,
@@ -666,13 +740,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         memory.update(scoring.memory_report())
     memory["draft_prefix_selection"] = config.draft_prefix_selection
     if config.dspark:
-        server_config.update(speculative_widths=config.speculative_widths,
-            speculative_token_capacity=speculative_token_capacity(config.max_active, max(config.speculative_widths), config.speculative_token_capacity),
+        server_config.update(speculative_widths=config.all_speculative_widths,
+            speculative_token_capacity=speculative_token_capacity(
+                config.max_active, max(config.all_speculative_widths), config.speculative_token_capacity),
             speculative_fixed_width=config.speculative_fixed_width)
         memory.update(speculative_shapes=config.speculative_shapes,
             packed_speculative_shapes=config.packed_speculative_shapes,
             speculative_graph_budget=config.speculative_graph_budget,
             packed_speculative_graphs=len(config.packed_speculative_shapes))
+        if config.copy_verify_shapes:
+            memory["copy_verify_shapes"] = config.copy_verify_shapes
     disposable = [tables.buffers()]
     if vision_state is not None:
         disposable.append(vision_state.arena)
