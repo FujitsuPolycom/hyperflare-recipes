@@ -92,7 +92,9 @@ def fixture(batch=1, depth=7, vocab=1024, rank=256, random=True, fp8=False):
     return op
 
 
-@pytest.mark.parametrize("batch,depth,vocab", [(1, 2, 1024), (8, 7, 1024), (1, 1, 129280)])
+@pytest.mark.parametrize("batch,depth,vocab", [
+    (1, 2, 1024), (8, 7, 1024), (16, 7, 1024), (32, 7, 1024), (1, 1, 129280),
+])
 def test_fp8_markov_transition_uses_reconstructed_weights_and_fp32_q(batch, depth, vocab):
     op = fixture(batch, depth, vocab, fp8=True)
     values = op.head.values.double()
@@ -143,7 +145,10 @@ def test_fp8_markov_preserves_grammar_and_invalid_row_contract(kind):
 
 
 @pytest.mark.parametrize(
-    "batch,depth,vocab", [(1, 1, 8), (1, 2, 1024), (1, 6, 1024), (1, 7, 1024), (8, 7, 1024), (1, 7, 129280)]
+    "batch,depth,vocab", [
+        (1, 1, 8), (1, 2, 1024), (1, 6, 1024), (1, 7, 1024),
+        (8, 7, 1024), (16, 7, 1024), (32, 7, 1024), (1, 7, 129280),
+    ]
 )
 def test_fp32_scores_against_exact_bf16_products(batch, depth, vocab):
     op = fixture(batch, depth, vocab)
@@ -313,7 +318,8 @@ def test_packed_proposal_capacity_matches_full_prefix_under_replay(capacity, voc
         proposal_capacity=capacity,
     )
     bounded.prepare()
-    assert len(bounded.kernels) == capacity + 1
+    assert len(bounded.step_ops) == capacity
+    assert len(bounded.kernels) == capacity + max(0, capacity - 1) + 2
     bounded.functional(session=None)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

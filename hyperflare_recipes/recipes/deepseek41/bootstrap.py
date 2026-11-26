@@ -218,6 +218,11 @@ class PreparationConfig(BasePreparationConfig):
                    *(capacity for capacity in self.prefill_capacities if capacity < 512))
 
     @property
+    def pcie_all_reduce_tokens(self):
+        # Cover [5 * decode_tokens, 5120] BF16 Engram reductions in one PCIe all-reduce.
+        return max(self.all_reduce_tokens, 5 * self.decode_tokens)
+
+    @property
     def completion_token_capacity(self):
         return max(self.speculative_widths) if self.dspark else 1
 
@@ -296,7 +301,7 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
             hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage)
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = core_storage.peer_storage
-    collective = create_all_reduce_runtime(group, device, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
+    collective = create_all_reduce_runtime(group, device, max_tokens=config.pcie_all_reduce_tokens, hidden_size=5120, ipc=ipc)
     dma_tokens = ((config.prefill_chunk_size * 6 + 4) // 5 + 63) // 64 * 64
     prefill = create_dma_all_reduce_runtime(group, device,
         max_tokens=dma_tokens, hidden_size=5120, ipc=ipc)

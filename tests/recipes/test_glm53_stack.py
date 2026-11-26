@@ -137,3 +137,146 @@ def test_canonical_layers_share_intermediates_and_own_distinct_state(world, rank
     state.clear_for_preparation()
     assert all(not value.count_nonzero() for _, value in buffers)
     assert torch.cuda.is_initialized() == initialized
+
+
+@pytest.mark.parametrize("fits", [False, True])
+def test_prepared_mtp_selects_fused_all_reduce_rmsnorm_when_runtime_fits(monkeypatch, fits):
+    from types import SimpleNamespace
+    import hyperflare_recipes.recipes.glm53.mtp as mtp_module
+
+    calls = []
+
+    class FakeFused:
+        @staticmethod
+        def fits(runtime, source):
+            return fits
+
+        def __init__(self, source, residual, weight, output, **kwargs):
+            self.name = kwargs["name"]
+            self.weight = weight
+            calls.append(("fused_init", self.name, weight))
+
+        def functional(self, *, session):
+            return self
+
+        def __call__(self, source, residual):
+            calls.append(("fused_call", self.name))
+            residual.add_(source)
+            return residual.clone()
+
+    class FakePlain:
+        def __init__(self, source, output, **kwargs):
+            self.name = kwargs["name"]
+            calls.append(("plain_init", self.name))
+
+        def functional(self, *, session):
+            return self
+
+        def __call__(self, source):
+            calls.append(("plain_call", self.name))
+            return source
+
+    def fake_rms_add(x, residual, weight, eps, x_out=None):
+        calls.append(("rms_add", weight))
+        residual.add_(x)
+        x_out.copy_(residual)
+
+    monkeypatch.setattr(mtp_module, "PreparedAllReduceRMSNorm", FakeFused)
+    monkeypatch.setattr(mtp_module, "PreparedAllReduce", FakePlain)
+    monkeypatch.setattr(mtp_module, "rms_norm_add_residual", fake_rms_add)
+    monkeypatch.setattr(mtp_module, "rms_norm", lambda x, w, out, eps, **kw: out.copy_(x))
+
+    # Exercise PreparedMTP.__init__ selection logic with minimal lightweight stubs.
+    class FakeEmbedding:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, *, token_ids, num_rows):
+            return torch.ones((token_ids.numel(), 4096), dtype=torch.bfloat16)
+
+    class FakeProjection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, joined):
+            return joined[:, :4096].clone()
+
+    class FakeAttention:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, x, indexed):
+            return x * 2
+
+    class FakeMoe:
+        def __init__(self, module, normalized, weights, scratch, **kwargs):
+            self.output = scratch.output if hasattr(scratch, "output") else torch.zeros_like(normalized)
+
+        def __call__(self, x):
+            return x * 3
+
+    class FakeHead:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, x):
+            return x[:, :8]
+
+    import transformers.models.glm5_next.modeling_glm5_next as glm_mod
+
+    monkeypatch.setattr(glm_mod, "Glm5NextTextAttention", lambda cfg, idx: SimpleNamespace(eval=lambda: None))
+    monkeypatch.setattr(glm_mod, "Glm5NextTextMoE", lambda cfg: SimpleNamespace(eval=lambda: None))
+    monkeypatch.setattr(mtp_module, "PreparedEmbedding", FakeEmbedding)
+    monkeypatch.setattr(mtp_module, "UnquantizedProjection", FakeProjection)
+    monkeypatch.setattr(mtp_module, "PreparedGlmMLA", FakeAttention)
+    monkeypatch.setattr(mtp_module, "PreparedGlmMoe", FakeMoe)
+    monkeypatch.setattr(mtp_module, "PreparedVocabularyProjection", FakeHead)
+
+    scratch = mtp_module.MTPScratch.allocate(2, 2, 1, "decode", "cpu")
+    weights = SimpleNamespace(
+        tree=SimpleNamespace(
+            config=SimpleNamespace(text_config=SimpleNamespace(indexer_types=[], rms_norm_eps=1e-5)),
+            model=SimpleNamespace(language_model=SimpleNamespace(embed_tokens=SimpleNamespace(weight=None))),
+        ),
+        shard=SimpleNamespace(world_size=2),
+        head=None,
+        mtp=SimpleNamespace(
+            tensors={
+                "eh_proj": None,
+                "enorm": "enorm",
+                "hnorm": "hnorm",
+                "input_layernorm": "in_norm",
+                "post_attention_layernorm": "post_norm",
+                "shared_head.norm": "head_norm",
+            },
+            attention=None,
+            mlp=None,
+            draft_head=None,
+        ),
+    )
+    meta = SimpleNamespace(
+        token_ids=torch.zeros(2, dtype=torch.int64),
+        num_tokens=torch.tensor([2], dtype=torch.int32),
+        hidden=torch.ones((2, 4096), dtype=torch.bfloat16),
+        indexed=SimpleNamespace(
+            block_table=torch.zeros((2, 1), dtype=torch.int32),
+            positions=torch.tensor([1, 2], dtype=torch.int64),
+        ),
+    )
+    op = mtp_module.PreparedMTP(
+        weights, None, meta, scratch=scratch, mode="decode", workspace=None,
+        runtime=object(), vocabulary_runtime=None, coordinator=None, session=None, name="mtp",
+    )
+    assert op.fused_attention_reduce is fits
+    assert op.fused_mlp_reduce is fits
+
+    hidden, logits = op(meta)
+    # Initial residual = 1, attention = 2 -> residual = 3, moe = 9 -> residual = 12.
+    assert hidden.shape == (2, 4096) and logits.shape == (2, 8)
+    assert torch.all(hidden == 12)
+    if fits:
+        assert [c[0] for c in calls] == ["fused_init", "fused_init", "fused_call", "fused_call"]
+        assert calls[0][2] == "post_norm" and calls[1][2] == "head_norm"
+    else:
+        assert [c[0] for c in calls] == ["plain_init", "plain_init", "plain_call", "rms_add", "plain_call", "rms_add"]
+        assert calls[3][1] == "post_norm" and calls[5][1] == "head_norm"

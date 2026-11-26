@@ -253,6 +253,30 @@ class AttentionScratch:
             zeros((tokens, 32, 128)), zeros((tokens, 32)), zeros((tokens, 128)), zeros((tokens, 128)))
 
 
+@triton.jit
+def _commit_ratio2_pending(
+    Values, Gates, QueryStart, Starts, StateRows, Counts,
+    DestValues, DestGates, DestPosition,
+    vs, gs, dvs, dgs, dps,
+    MAX_ROW: tl.constexpr, WIDTH: tl.constexpr, BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    count = tl.load(Counts + row).to(tl.int64)
+    if count <= 0:
+        return
+    slot = tl.load(StateRows + row).to(tl.int64)
+    position = tl.load(Starts + row).to(tl.int64) + count - 1
+    is_even = (position & 1) == 0
+    tl.store(DestPosition + slot * dps, tl.where(is_even, position, -1))
+    if is_even:
+        src = tl.load(QueryStart + row).to(tl.int64) + count - 1
+        src = tl.minimum(tl.maximum(src, 0), MAX_ROW)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < WIDTH
+        tl.store(DestValues + slot * dvs + cols, tl.load(Values + src * vs + cols, mask=mask), mask=mask)
+        tl.store(DestGates + slot * dgs + cols, tl.load(Gates + src * gs + cols, mask=mask), mask=mask)
+
+
 class PreparedCompressor:
     def __init__(self, layer, weights, source, metadata, pool, slots, *, session, name,
                  deferred=False, examples=None, proj_tokens=None, compress_tokens=None):
@@ -408,13 +432,25 @@ class PreparedCompressor:
             return
         m = metadata
         values, gates = records
+        dest_values = self.pool.region(f"layer{self.layer}.pending_values")
+        dest_gates = self.pool.region(f"layer{self.layer}.pending_gates")
+        dest_position = self.pool.region(f"layer{self.layer}.pending_position")
+        if dest_values.is_cuda:
+            torch.library.wrap_triton(_commit_ratio2_pending)[(m.starts.numel(),)](
+                values, gates, m.query_start_loc, m.starts, m.state_rows, counts,
+                dest_values, dest_gates, dest_position,
+                values.stride(0), gates.stride(0),
+                dest_values.stride(0), dest_gates.stride(0), dest_position.stride(0),
+                values.shape[0] - 1, values.shape[1], triton.next_power_of_2(values.shape[1]),
+            )
+            return
         last = (m.query_start_loc[:-1] + counts - 1).long().clamp(0, values.shape[0] - 1)
         position = m.starts + counts - 1
         pending = (counts > 0) & (position % 2 == 0)
-        for key, source in (("pending_values", values), ("pending_gates", gates)):
-            save_hidden(source[last], self.pool.region(f"layer{self.layer}.{key}"), m.state_rows, pending)
+        for source, destination in ((values, dest_values), (gates, dest_gates)):
+            save_hidden(source[last], destination, m.state_rows, pending)
         tags = torch.where(position % 2 == 0, position, -1).view(-1, 1)
-        save_hidden(tags, self.pool.region(f"layer{self.layer}.pending_position"), m.state_rows, counts > 0)
+        save_hidden(tags, dest_position, m.state_rows, counts > 0)
 
 
 class PreparedGlobalKV:

@@ -92,3 +92,76 @@ def test_layer_consumes_standalone_router_results_with_runtime_image_mask():
     assert torch.equal(observed[0][1], torch.tensor([False, True, False]))
     assert records is residual
     assert actual_selection is selection
+
+
+@pytest.mark.parametrize("mode", ["decode", "verify", "draft", "prefill"])
+def test_layer_wires_live_counts_to_router_for_decode_verify_and_draft(monkeypatch, mode):
+    scratch = decoder.Scratch.allocate(8, 1, 4, "meta")
+    router_init = []
+
+    class Component:
+        plan = object()
+
+        def functional(self, **kwargs):
+            return self
+
+    def fake_router(*args, **kwargs):
+        router_init.append(kwargs)
+        return Component()
+
+    for name in ("PreparedMHC", "PreparedAttention", "PreparedAllReduce", "UnquantizedProjection",
+                 "PreparedRoutedExperts", "PreparedMLP", "PreparedMHCPost"):
+        monkeypatch.setattr(decoder, name, lambda *args, **kwargs: Component())
+    monkeypatch.setattr(decoder, "PreparedRouter", fake_router)
+    monkeypatch.setattr(decoder, "_mhc_weights", lambda *args: None)
+    monkeypatch.setattr(decoder, "register_finalizer", lambda *args, **kwargs: None)
+    text = dict(rms_norm_eps=1e-6, hc_eps=1e-6, hc_sinkhorn_iters=20,
+                scoring_func="sigmoid", norm_topk_prob=True, routed_scaling_factor=1., swiglu_limit=10.)
+    weights = SimpleNamespace(engram=None, attention=None, experts=SimpleNamespace(
+        vision_correction=None, router=None, correction=None, experts=None, shared=None))
+    live_counts = torch.empty(2, dtype=torch.int32, device="meta")
+    metadata = SimpleNamespace(token_ids=torch.empty(8, device="meta"), live_counts=live_counts)
+    layer = decoder.PreparedLayer(3, weights, None, scratch, metadata,
+        SimpleNamespace(config=SimpleNamespace(text=text)), None,
+        shard=SimpleNamespace(world_size=4), mode=mode, runtime=None, coordinator=None,
+        session=object(), name="layer", workspace=SimpleNamespace(overlap=False), carry=False, defer_post=True)
+    expected = mode in ("decode", "verify", "draft")
+    assert layer.has_valid_tokens == expected
+    assert len(router_init) == 1
+    actual_valid = router_init[0]["num_valid_tokens"]
+    if expected:
+        assert actual_valid.shape == (1,) and actual_valid.dtype == torch.int32
+    else:
+        assert actual_valid is None
+
+
+def test_layer_passes_live_counts_at_runtime_when_enabled():
+    layer = object.__new__(decoder.PreparedLayer)
+    layer.engram = layer.concurrent_shared = None
+    layer.has_image_mask = False
+    layer.has_valid_tokens = True
+    residual = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    live_counts = torch.tensor([2, 1], dtype=torch.int32)
+    metadata = SimpleNamespace(token_ids=torch.tensor([7, 8, 0]), live_counts=live_counts)
+    selection = (torch.zeros(3, 1, dtype=torch.int32), None, None)
+    layer.attention_hc = lambda source, **kwargs: (source, source, source, source)
+    layer.attention = lambda source, m, selected, **kwargs: (source, source, selected)
+    layer.attention_reduce = lambda source: source
+    layer.ffn_hc = lambda source, *args, **kwargs: (source, source, source, source)
+    layer.router_projection = lambda source: source
+    observed = []
+
+    def route(logits, *, image_mask=None, num_valid_tokens=None):
+        observed.append((image_mask, num_valid_tokens))
+        return SimpleNamespace(ids=torch.tensor([[0], [1], [-1]]), weights=logits[:, :1],
+                               selected_logits=logits[:, :1])
+
+    layer.router = route
+    layer.experts = lambda source, ids, weights, **kwargs: source
+    layer.shared = lambda source: source
+    layer.mlp_reduce = lambda source: source
+    layer.post = lambda source, *args: source
+    layer((residual,), torch.zeros(3, 4), metadata, None, selection)
+    assert len(observed) == 1
+    assert observed[0][0] is None
+    assert torch.equal(observed[0][1], torch.tensor([2], dtype=torch.int32))

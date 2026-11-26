@@ -80,6 +80,22 @@ def test_short_prefill_still_fits_the_oneshot_channel():
     assert config.all_reduce_tokens == 64
 
 
+@pytest.mark.parametrize("capacity,dspark,draft_width,spec_tokens,prefill,expected", [
+    (32, True, 8, 128, 4096, 640),
+    (32, True, 6, 64, 4096, 320),
+    (1, True, 6, 64, 4096, 256),
+    (1, False, 1, 64, 64, 64),
+])
+def test_pcie_all_reduce_capacity_covers_engram_decode_reductions(
+        capacity, dspark, draft_width, spec_tokens, prefill, expected):
+    config = PreparationConfig(max_active=capacity, dspark=dspark,
+        speculative_widths=tuple(range(1, draft_width + 1)),
+        speculative_token_capacity=spec_tokens, prefill_chunk_size=prefill)
+    assert config.pcie_all_reduce_tokens == expected
+    assert config.pcie_all_reduce_tokens >= 5 * config.decode_tokens
+    assert config.pcie_all_reduce_tokens >= config.all_reduce_tokens
+
+
 def test_three_rank_scratch_preserves_grouped_attention_and_unpadded_experts():
     config = PreparationConfig(devices=(0, 1, 2), max_active=32,
         speculative_widths=tuple(range(1, 9)), image_concurrency=4)

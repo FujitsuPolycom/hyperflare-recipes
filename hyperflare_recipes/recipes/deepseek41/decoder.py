@@ -818,11 +818,16 @@ class PreparedLayer:
                 coordinator=coordinator, session=session, name=name + ".attention_reduce")
             self.router_projection = UnquantizedProjection(s.ffn_hc.normalized, weights.experts.router, s.router_logits,
                 session=session, name=name + ".router")
+            self.has_valid_tokens = (
+                mode in ("decode", "verify", "draft")
+                and getattr(metadata, "live_counts", None) is not None
+            )
             self.router = PreparedRouter(s.router_logits, s.router, session=session, name=name + ".topk",
                 score_func=text["scoring_func"], renormalize=text["norm_topk_prob"],
                 routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
                 image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
-                image_mask=self.image_mask)
+                image_mask=self.image_mask,
+                num_valid_tokens=metadata.live_counts[:1] if self.has_valid_tokens else None)
             self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.experts, s.router.ids,
                 s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
                 router_plan=self.router.plan)
@@ -1529,7 +1534,9 @@ class PreparedLayer:
                 attention_output, residual, post, comb, pre_mix=attn_mix)
             pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
             router_logits = self.router_projection(normalized)
-            route = self.router(router_logits, image_mask=image_mask)
+            router_kwargs = ({"num_valid_tokens": metadata.live_counts[:1]}
+                             if getattr(self, "has_valid_tokens", False) else {})
+            route = self.router(router_logits, image_mask=image_mask, **router_kwargs)
             routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
                                   selected_logits=route.selected_logits, image_mask=image_mask,
                                   prequant_a_values=prequant_v, prequant_a_scales=prequant_s)
@@ -1551,7 +1558,9 @@ class PreparedLayer:
             pre_mix=attn_mix, pre_out=next_mix)
         pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
         router_logits = self.router_projection(normalized)
-        route = self.router(router_logits, image_mask=image_mask)
+        router_kwargs = ({"num_valid_tokens": metadata.live_counts[:1]}
+                         if getattr(self, "has_valid_tokens", False) else {})
+        route = self.router(router_logits, image_mask=image_mask, **router_kwargs)
         routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
                               selected_logits=route.selected_logits, image_mask=image_mask)
         shared = (self.shared(normalized) if self.concurrent_shared is None

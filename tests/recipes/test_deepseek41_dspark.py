@@ -195,3 +195,35 @@ def test_draft_confidence_consumes_local_hidden_before_head_normalization():
         if previous is not None:
             torch.testing.assert_close(previous, embedding[torch.tensor([[1, 2], [3, 4]])], rtol=0, atol=0)
         previous = features
+
+
+def test_ratio_two_compressor_commit_updates_even_pending_rows_and_preserves_inactive():
+    from hyperflare_recipes.recipes.deepseek41.attention import PreparedCompressor
+    from hyperflare_recipes.recipes.deepseek41.config import ModelConfig
+    from hyperflare_recipes.recipes.deepseek41.pool import ContinuationPool
+
+    cfg = ModelConfig({
+        "num_hidden_layers": 4,
+        "hidden_size": 5120,
+        "sliding_window": 128,
+        "rms_norm_eps": 1e-6,
+        "compress_ratios": [0, 0, 2, 2],
+        "kv_source_layer_ids": [2],
+        "index_source_layer_ids": [2],
+    }, {})
+    pool = ContinuationPool.allocate(cfg, 5, 2, "cpu")
+    metadata = Metadata.allocate(12, 3, 2, "cpu", samples=12)
+    metadata.query_start_loc.copy_(torch.tensor([0, 4, 8, 12], dtype=torch.int32))
+    metadata.starts.copy_(torch.tensor([127, 8, 88], dtype=torch.int64))
+    metadata.state_rows.copy_(torch.tensor([1, 2, 3], dtype=torch.int64))
+    op = PreparedCompressor.__new__(PreparedCompressor)
+    op.pool, op.layer, op.ratio = pool, 2, 2
+    values = torch.arange(12 * 512, dtype=torch.float32).view(12, 512)
+    gates = -values
+    for name in ("pending_values", "pending_gates", "pending_position"):
+        pool.region("layer2." + name).fill_(42)
+    op.commit(torch.tensor([2, 2, 0], dtype=torch.int32), (values, gates), metadata)
+    assert pool.region("layer2.pending_position")[:, 0].tolist() == [42, 128, -1, 42, 42]
+    assert torch.equal(pool.region("layer2.pending_values")[1], values[1])
+    assert torch.equal(pool.region("layer2.pending_gates")[1], gates[1])
+    assert pool.region("layer2.pending_values")[2:].eq(42).all()
