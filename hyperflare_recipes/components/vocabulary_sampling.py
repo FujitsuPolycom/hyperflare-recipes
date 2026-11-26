@@ -344,6 +344,8 @@ def _finish_distribution(
     Generation,
     Status,
     Params,
+    CopyActive,
+    CopyTokens,
     LOCAL: tl.constexpr,
     VOCAB: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -358,6 +360,7 @@ def _finish_distribution(
     RANK_PAD: tl.constexpr,
     HAS_MASSES: tl.constexpr = False,
     HAS_LIMITS: tl.constexpr = False,
+    HAS_COPY: tl.constexpr = False,
 ):
     tile, distribution = tl.program_id(0), tl.program_id(1)
     row = distribution if SAMPLE else distribution // WIDTH
@@ -372,6 +375,22 @@ def _finish_distribution(
                 tl.store(Valid + row * WIDTH + position, False)
                 if SAMPLE:
                     tl.store(Tokens + row * WIDTH + position, 0)
+            return
+    if HAS_COPY:
+        if tl.load(CopyActive + row * WIDTH + position) != 0:
+            copy_tok = tl.load(CopyTokens + row * WIDTH + position)
+            col = tile * BLOCK + tl.arange(0, BLOCK)
+            token_id = tl.load(VocabularyOffset).to(tl.int64) + col.to(tl.int64)
+            final_prob = (token_id == copy_tok).to(tl.float32)
+            destination = Probabilities + (row * WIDTH + position) * LOCAL + col
+            tl.store(destination, final_prob, col < LOCAL)
+            if HAS_MASSES:
+                masked_prob = tl.where(col < LOCAL, final_prob, 0.0)
+                tl.store(TileMass + (row * WIDTH + position) * BLOCKS + tile, tl.sum(masked_prob, 0))
+            if tile == 0:
+                tl.store(Valid + row * WIDTH + position, True)
+                if SAMPLE:
+                    tl.store(Tokens + row * WIDTH + position, copy_tok)
             return
     rank = tl.arange(0, RANK_PAD)
     records = Gathered + (distribution * WORLD + rank) * _WORDS
@@ -707,6 +726,8 @@ class PreparedVocabularySoftmax:
         tokens=None,
         tile_masses=None,
         token_limits=None,
+        copy_active=None,
+        copy_tokens=None,
     ):
         if logits.ndim != 3 or logits.dtype not in (torch.bfloat16, torch.float32) or logits.stride(-1) != 1:
             raise ValueError("vocabulary logits require BF16/FP32 [batch,width,local vocabulary]")
@@ -733,6 +754,13 @@ class PreparedVocabularySoftmax:
             _tensor(tile_masses, (b, w, blocks), torch.float32, device, "tile probability masses")
         if token_limits is not None:
             _tensor(token_limits, (b,), torch.int32, device, "token limits")
+        if (copy_active is None) != (copy_tokens is None):
+            raise ValueError("copy proposals require both copy_active and copy_tokens tensors")
+        if copy_active is not None:
+            if not sample:
+                raise ValueError("target softmax cannot attach copy proposals")
+            _tensor(copy_active, (b, w), torch.bool, device, "copy proposal mask")
+            _tensor(copy_tokens, (b, w), torch.int64, device, "copy proposal tokens")
         self.markov = embedding is not None
         fp8 = isinstance(head, RowScaledFP8MarkovWeight)
         values = head.values if fp8 else head
@@ -766,6 +794,7 @@ class PreparedVocabularySoftmax:
         self.logits, self.probabilities, self.valid = logits, probabilities, valid
         self.tile_masses, self.has_masses = tile_masses, tile_masses is not None
         self.limits, self.has_token_limits = token_limits, token_limits is not None
+        self.copy_active, self.copy_tokens, self.has_copy = copy_active, copy_tokens, copy_active is not None
         self.state, self.slots, self.generations, self.live_rows = requests, slots, generations, live_rows
         self.candidates, self.start, self.world, self.batch, self.width, self.local = (
             candidates,
@@ -897,6 +926,8 @@ class PreparedVocabularySoftmax:
                     state.generation,
                     state.status,
                     state.parameters,
+                    self.copy_active,
+                    self.copy_tokens,
                 ),
                 (blocks, summary_rows, 1),
                 LOCAL=local,
@@ -913,6 +944,7 @@ class PreparedVocabularySoftmax:
                 RANK_PAD=triton.next_power_of_2(self.world),
                 HAS_MASSES=self.has_masses,
                 HAS_LIMITS=self.has_token_limits,
+                HAS_COPY=self.has_copy,
                 num_warps=4,
                 enable_fp_fusion=False,
             )
@@ -925,7 +957,8 @@ class PreparedVocabularySoftmax:
         values = dict(self.scratch, logits=self.logits, probabilities=self.probabilities,
             valid=self.valid, candidates=self.candidates, pending=self.pending,
             seeds=self.seeds, offsets=self.offsets, tokens=self.tokens,
-            tile_masses=self.tile_masses, limits=self.limits)
+            tile_masses=self.tile_masses, limits=self.limits,
+            copy_active=self.copy_active, copy_tokens=self.copy_tokens)
         self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()
                              if value is not None}
         names = {id(value): name for name, value in values.items() if value is not None}
@@ -937,34 +970,42 @@ class PreparedVocabularySoftmax:
         self.gather.functional(session=session)
         self.logits = self.probabilities = self.valid = self.candidates = self.pending = None
         self.seeds = self.offsets = self.tokens = self.scratch = self.tile_masses = self.limits = None
+        self.copy_active = self.copy_tokens = None
         return self
 
     def run(self, logits, candidates, *, pending=None, seeds=None, offsets=None,
-            probabilities=None, valid=None, tokens=None, tile_masses=None, token_limits=None):
+            probabilities=None, valid=None, tokens=None, tile_masses=None, token_limits=None,
+            copy_active=None, copy_tokens=None):
         return self._run_steps(self.steps, logits, candidates, pending=pending, seeds=seeds,
             offsets=offsets, probabilities=probabilities, valid=valid, tokens=tokens,
-            tile_masses=tile_masses, token_limits=token_limits)
+            tile_masses=tile_masses, token_limits=token_limits,
+            copy_active=copy_active, copy_tokens=copy_tokens)
 
     def run_step(self, step, logits, candidates, *, pending=None, seeds=None, offsets=None,
-                 probabilities=None, valid=None, tokens=None, tile_masses=None, token_limits=None):
+                 probabilities=None, valid=None, tokens=None, tile_masses=None, token_limits=None,
+                 copy_active=None, copy_tokens=None):
         """Draw one prepared position after its recurrent correction becomes available."""
         if not self.sample or not 0 <= step < self.width:
             raise ValueError("a proposal step must select one prepared sampling position")
         return self._run_steps(self.steps[step:step + 1], logits, candidates, pending=pending,
             seeds=seeds, offsets=offsets, probabilities=probabilities, valid=valid, tokens=tokens,
-            tile_masses=tile_masses, token_limits=token_limits)
+            tile_masses=tile_masses, token_limits=token_limits,
+            copy_active=copy_active, copy_tokens=copy_tokens)
 
     def _run_steps(self, steps, logits, candidates, *, pending, seeds, offsets, probabilities, valid, tokens,
-                   tile_masses=None, token_limits=None):
+                   tile_masses=None, token_limits=None, copy_active=None, copy_tokens=None):
         if (token_limits is not None) != self.has_token_limits:
             raise ValueError("vocabulary distribution token limits must match the prepared mask contract")
         if self.has_masses and tile_masses is None:
             raise ValueError("vocabulary distribution requires caller-owned tile_masses when prepared with masses")
+        if (copy_active is not None) != self.has_copy or (copy_tokens is not None) != self.has_copy:
+            raise ValueError("vocabulary distribution copy proposals must match the prepared copy contract")
         local = {name: torch.empty(shape, dtype=dtype, device=logits.device)
                  for name, (shape, dtype) in self.local_layout.items()
-                 if name not in ("logits", "candidates", "pending", "seeds", "offsets", "limits", "tile_masses")}
+                 if name not in ("logits", "candidates", "pending", "seeds", "offsets", "limits",
+                                 "tile_masses", "copy_active", "copy_tokens")}
         local.update(logits=logits, candidates=candidates, pending=pending, seeds=seeds, offsets=offsets,
-                     limits=token_limits)
+                     limits=token_limits, copy_active=copy_active, copy_tokens=copy_tokens)
         for name, value in (("probabilities", probabilities), ("valid", valid), ("tokens", tokens),
                             ("tile_masses", tile_masses)):
             if value is not None:

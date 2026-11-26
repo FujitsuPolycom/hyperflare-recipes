@@ -7,8 +7,11 @@
 from dataclasses import dataclass
 
 import torch
+import triton
+import triton.language as tl
 
 from ignition.components.collectives import PreparedAllReduce
+from ignition.preparation.persistent import persistent_copy
 from .draft_sampling import DRAFT_CANDIDATES, PreparedDraftDistribution, PreparedDraftBlockBroadcast
 from .paged_batch import Metadata, prepare_batch, row_rotary_offsets
 from .speculation import (
@@ -83,6 +86,59 @@ def _resolve_copy_proposals(owner, active, safe, before, limits, depth):
     return copy_active, tokens
 
 
+def _copy_offered_mask(copy_active):
+    """Pack contiguous copy-draft active flags into a per-row bitmask."""
+    positions = torch.arange(copy_active.shape[1], device=copy_active.device, dtype=torch.int64)
+    return (copy_active.to(torch.int64) << positions[None, :]).sum(dim=1)
+
+
+@triton.jit
+def _apply_copy_proposals_kernel(
+    Drafts,
+    Probabilities,
+    Valid,
+    TileMass,
+    CopyActive,
+    CopyTokens,
+    VocabStartPtr,
+    VOCAB_START_CONST: tl.constexpr,
+    USE_VOCAB_START_PTR: tl.constexpr,
+    LOCAL_VOCAB: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    TILE_BLOCK: tl.constexpr,
+    HAS_MASSES: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    row_depth = tl.program_id(1)
+    if tl.load(CopyActive + row_depth) == 0:
+        return
+    copy_tok = tl.load(CopyTokens + row_depth)
+    if tile == 0:
+        tl.store(Drafts + row_depth, copy_tok)
+        tl.store(Valid + row_depth, True)
+    vocab_start = (
+        tl.load(VocabStartPtr).to(tl.int64)
+        if USE_VOCAB_START_PTR
+        else tl.full((), VOCAB_START_CONST, tl.int64)
+    )
+    local_target = copy_tok - vocab_start
+    col = tile * TILE_BLOCK + tl.arange(0, TILE_BLOCK)
+    mask = col < LOCAL_VOCAB
+    point_mass = (col.to(tl.int64) == local_target).to(Probabilities.dtype.element_ty)
+    tl.store(Probabilities + row_depth * LOCAL_VOCAB + col, point_mass, mask=mask)
+    if HAS_MASSES:
+        tile_start = tile * TILE_BLOCK
+        tile_has_target = (
+            (local_target >= tile_start)
+            & (local_target < tile_start + TILE_BLOCK)
+            & (local_target < LOCAL_VOCAB)
+        )
+        tl.store(
+            TileMass + row_depth * BLOCKS + tile,
+            tl.where(tile_has_target, 1.0, 0.0).to(TileMass.dtype.element_ty),
+        )
+
+
 def _apply_copy_proposals(
     drafts,
     probabilities,
@@ -95,24 +151,66 @@ def _apply_copy_proposals(
     tile_block=256,
 ):
     """Overlay contiguous copy-draft prefixes with point-mass q=1.0 proposal distributions."""
-    _, depth = drafts.shape
+    batch, depth = drafts.shape
     local_vocab = probabilities.shape[-1]
     device = drafts.device
+    blocks = (local_vocab + tile_block - 1) // tile_block if tile_block > 0 else 0
+    if (
+        probabilities.is_cuda
+        and batch > 0
+        and depth > 0
+        and local_vocab > 0
+        and probabilities.is_contiguous()
+        and drafts.is_contiguous()
+        and valid.is_contiguous()
+        and tile_block > 0
+        and (tile_block & (tile_block - 1)) == 0
+        and (tile_masses is None or (tile_masses.is_contiguous() and tile_masses.shape[-1] == blocks))
+    ):
+        from torch.fx.experimental.proxy_tensor import get_proxy_mode
+
+        use_ptr = isinstance(vocab_start, torch.Tensor)
+        vocab_start_ptr = vocab_start.contiguous() if use_ptr else None
+        vocab_start_const = 0 if use_ptr else int(vocab_start)
+        args = (
+            drafts,
+            probabilities,
+            valid,
+            tile_masses,
+            copy_active.contiguous(),
+            copy_tokens.contiguous(),
+            vocab_start_ptr,
+        )
+        kwargs = {
+            "VOCAB_START_CONST": vocab_start_const,
+            "USE_VOCAB_START_PTR": use_ptr,
+            "LOCAL_VOCAB": local_vocab,
+            "BLOCKS": blocks,
+            "TILE_BLOCK": tile_block,
+            "HAS_MASSES": tile_masses is not None,
+            "num_warps": 4,
+        }
+        grid = (blocks, batch * depth)
+        if torch.compiler.is_compiling() or get_proxy_mode() is not None:
+            torch.library.wrap_triton(_apply_copy_proposals_kernel)[grid](*args, **kwargs)
+        else:
+            _apply_copy_proposals_kernel[grid](*args, **kwargs)
+        return _copy_offered_mask(copy_active)
+
     drafts.copy_(torch.where(copy_active, copy_tokens, drafts))
     valid.copy_(torch.where(copy_active, True, valid))
     local_ids = torch.arange(local_vocab, device=device, dtype=torch.int64) + vocab_start
     point_mass = (local_ids[None, None, :] == copy_tokens[:, :, None]).to(probabilities.dtype)
     probabilities.copy_(torch.where(copy_active[:, :, None], point_mass, probabilities))
     if tile_masses is not None:
-        blocks = tile_masses.shape[-1]
+        mass_blocks = tile_masses.shape[-1]
         local_target = copy_tokens - vocab_start
         in_shard = (local_target >= 0) & (local_target < local_vocab)
         target_tile = torch.where(in_shard, local_target // tile_block, -1)
-        tile_ids = torch.arange(blocks, device=device, dtype=torch.int64)
+        tile_ids = torch.arange(mass_blocks, device=device, dtype=torch.int64)
         tile_point_mass = (tile_ids[None, None, :] == target_tile[:, :, None]).to(tile_masses.dtype)
         tile_masses.copy_(torch.where(copy_active[:, :, None], tile_point_mass, tile_masses))
-    positions = torch.arange(depth, device=device, dtype=torch.int64)
-    return (copy_active.to(torch.int64) << positions[None, :]).sum(dim=1)
+    return _copy_offered_mask(copy_active)
 
 
 class PreparedParallelDraftRound:
@@ -230,6 +328,11 @@ class PreparedParallelDraftRound:
         self.drafts = torch.zeros((b, w - 1), dtype=torch.int64, device=device)
 
         local_vocab = o.scratch.local_logits.shape[-1] if self.vocabulary_parallel else o.requests.vocab_size
+        self.local_vocab_start = persistent_copy(torch.tensor(
+            [o.weights.shard.rank * local_vocab if self.vocabulary_parallel else 0],
+            dtype=torch.int64,
+            device=device,
+        ))
         self.probability_shape = (b, w - 1, local_vocab)
         self.draft_mass_shape = (b, w - 1, (local_vocab + 255) // 256)
         self.target_mass_shape = (b, w, (local_vocab + 255) // 256)
@@ -427,11 +530,20 @@ class PreparedParallelDraftRound:
             base = local[:, o.logit_offset:o.logit_offset + w - 1]
             transition = ({} if self.recurrent is not None else dict(
                 embedding=o.weights.draft.markov_embedding, head=o.weights.draft.markov_head))
+            copy_options = (
+                dict(
+                    copy_active=torch.zeros((b, w - 1), dtype=torch.bool, device=o.requests.histogram.device),
+                    copy_tokens=torch.zeros((b, w - 1), dtype=torch.int64, device=o.requests.histogram.device),
+                )
+                if getattr(o, "copy_ids", None) is not None
+                else {}
+            )
             self.full_proposal = PreparedVocabularySoftmax(base, self.probabilities, self.valid, *args,
                 self.drafts, **options, name=self.name + ".proposal", workspace=None,
                 **transition,
                 pending=self.markov_token, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts,
-                tile_masses=self.draft_tile_masses, token_limits=o.inputs.query_lengths[:b])
+                tile_masses=self.draft_tile_masses, token_limits=o.inputs.query_lengths[:b],
+                **copy_options)
             self.full_proposal.prepare()
         if self.proposal_only:
             self.operations = None, (), None, None
@@ -540,13 +652,16 @@ class PreparedParallelDraftRound:
                     unary, shortlist_ids = self.shortlisted_selector.prepare_shortlists(draft_logits, features=selector_features)
             markov_token = torch.where(active, candidates[:, 0], 0)
             block_state = None
+            copy_applied = False
             if self.full_proposal is not None:
                 base = draft_logits[:, o.logit_offset:o.logit_offset + w - 1]
+                fused_copy = copy_active is not None and getattr(self.full_proposal, "has_copy", False)
                 if self.vocabulary_parallel and self.recurrent is not None:
                     hidden = features["hidden"].view(b, block, -1)
                     context = features["recurrent_context"]
                     state = self.recurrent.begin(context)
                     scores = torch.empty_like(draft_logits)[:, o.logit_offset:o.logit_offset + w - 1]
+                    copy_kwargs = dict(copy_active=copy_active, copy_tokens=copy_tokens) if fused_copy else {}
                     for index in range(w - 1):
                         state, logits = self.recurrent.step(state, markov_token,
                             hidden[:, index + o.logit_offset].contiguous(), context,
@@ -554,12 +669,20 @@ class PreparedParallelDraftRound:
                         scores[:, index].copy_(logits)
                         self.full_proposal.run_step(index, scores, drafts, pending=markov_token,
                             seeds=seed, offsets=base_offset, probabilities=probabilities, valid=valid,
-                            tokens=drafts, tile_masses=draft_tile_masses, token_limits=limits)
-                        if copy_active is not None:
+                            tokens=drafts, tile_masses=draft_tile_masses, token_limits=limits,
+                            **copy_kwargs)
+                        if copy_active is not None and not fused_copy:
                             drafts[:, index].copy_(torch.where(copy_active[:, index], copy_tokens[:, index], drafts[:, index]))
                         markov_token = drafts[:, index].clone()
+                    copy_applied = fused_copy
                 elif self.vocabulary_parallel:
-                    if copy_active is not None:
+                    if fused_copy:
+                        self.full_proposal.run(base, drafts, pending=markov_token, seeds=seed, offsets=base_offset,
+                            probabilities=probabilities, valid=valid, tokens=drafts,
+                            tile_masses=draft_tile_masses, token_limits=limits,
+                            copy_active=copy_active, copy_tokens=copy_tokens)
+                        copy_applied = True
+                    elif copy_active is not None:
                         for index in range(w - 1):
                             self.full_proposal.run_step(index, base, drafts, pending=markov_token,
                                 seeds=seed, offsets=base_offset, probabilities=probabilities, valid=valid,
@@ -623,16 +746,21 @@ class PreparedParallelDraftRound:
                 else:
                     self.proposal_block.finish(block_state, drafts, probabilities, valid, sampled, active, limits)
             if copy_active is not None:
-                vocab_start = o.weights.shard.rank * probabilities.shape[-1] if self.vocabulary_parallel else 0
-                copy_offered_mask = _apply_copy_proposals(
-                    drafts,
-                    probabilities,
-                    valid,
-                    copy_active,
-                    copy_tokens,
-                    vocab_start=vocab_start,
-                    tile_masses=draft_tile_masses,
-                )
+                if copy_applied:
+                    copy_offered_mask = _copy_offered_mask(copy_active)
+                else:
+                    vocab_start = getattr(self, "local_vocab_start", None)
+                    if vocab_start is None:
+                        vocab_start = o.weights.shard.rank * probabilities.shape[-1] if self.vocabulary_parallel else 0
+                    copy_offered_mask = _apply_copy_proposals(
+                        drafts,
+                        probabilities,
+                        valid,
+                        copy_active,
+                        copy_tokens,
+                        vocab_start=vocab_start,
+                        tile_masses=draft_tile_masses,
+                    )
         candidates[:, 1:].copy_(drafts)
         proposal = DraftProposalState(before, active, candidates, drafts, valid, base_offset, draft_metadata, features,
             offsets, draft_tile_masses, copy_offered_mask)
