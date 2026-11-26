@@ -69,10 +69,11 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
 
 def _forward_factories(mla_compute_mode, *, vision,
                        draft_vocabulary_runtime=None, examples=None,
-                       row_shard_prefill=False):
+                       row_shard_prefill=False, row_shard_attention=False):
     """Bind attention arithmetic and the proposal head's BF16 gather channel."""
     return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode,
-                    examples=examples, row_shard_prefill=row_shard_prefill),
+                    examples=examples, row_shard_prefill=row_shard_prefill,
+                    row_shard_attention=row_shard_attention),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
                     mla_compute_mode=mla_compute_mode, examples=examples))
 
@@ -118,6 +119,7 @@ class PreparationConfig(BasePreparationConfig):
     expert_scale_compression: str | None = None
     mla_compute_mode: str = "auto"
     row_shard_prefill: bool = False
+    row_shard_attention: bool = False
     packed_verification: bool | None = None
     draft_prefix_selection: str | None = None
     speculation_reference_graphs: bool = False
@@ -163,6 +165,10 @@ class PreparationConfig(BasePreparationConfig):
             raise TypeError("stream_overlap must be a boolean")
         if type(self.row_shard_prefill) is not bool:
             raise TypeError("row_shard_prefill must be a boolean")
+        if type(self.row_shard_attention) is not bool:
+            raise TypeError("row_shard_attention must be a boolean")
+        if self.row_shard_attention and not self.row_shard_prefill:
+            raise ValueError("row_shard_attention requires row_shard_prefill")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
         if (not isinstance(self.devices, tuple) or len(self.devices) not in (3, 4, 6)
                 or len(set(placements)) != len(self.devices)
@@ -344,7 +350,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
                                     vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
-                                    engram_full_projection=load_engram_full)
+                                    engram_full_projection=load_engram_full,
+                                    row_shard_attention=config.row_shard_attention)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -431,7 +438,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
             vision=vision_state,
             draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples,
-            row_shard_prefill=config.row_shard_prefill)
+            row_shard_prefill=config.row_shard_prefill,
+            row_shard_attention=config.row_shard_attention)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
@@ -633,6 +641,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "weights_bytes": weights.allocated_bytes, "mapped_host_bytes": 0,
         "expert_scale_compression": config.expert_scale_compression,
         "mla_compute_mode": config.mla_compute_mode,
+        "row_shard_prefill": config.row_shard_prefill,
+        "row_shard_attention": config.row_shard_attention,
         "draft_head_quantization": config.draft_head_quantization,
         "markov_head_quantization": config.markov_head_quantization,
         "vocabulary_parallel_sampling": config.vocabulary_parallel_sampling,
@@ -669,7 +679,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             forward = forward.forward
         if hasattr(forward, "completion") and hasattr(forward.completion, "scratch_tensors"):
             disposable.append(forward.completion.scratch_tensors)
-    model = PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
+    weight_components = ("embedding", "norm", "head", "vision", "draft")
+    if weights.replicated_attention is not None:
+        weight_components += ("replicated_attention",)
+    model = PreparedModel(rebuild_weights=declare_weights(weights, components=weight_components), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges(disposable), *completion.zero_ranges()),
