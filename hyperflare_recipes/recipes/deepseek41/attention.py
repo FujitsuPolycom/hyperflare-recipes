@@ -677,12 +677,24 @@ class PreparedAttention:
             for w in (weights["qkv_a"], q_b_weight))
         use_a16_qkv = (paired_mxfp8 and prefix_tokens <= 28
                        and not getattr(session, "native_dense_activations", False))
+        norm_quant_kv_rope_dim = (
+            64 if (self.angles is not None and self.angles.split
+                   and getattr(PreparedMLANormQuant, "supports_kv_rope", lambda: False)())
+            else 0
+        )
+        norm_quant_rope_kwargs = (
+            {"kv_rope_dim": norm_quant_kv_rope_dim, "angles": self.angles.values[:prefix_tokens]}
+            if norm_quant_kv_rope_dim > 0 else {}
+        )
         self.norm_quant = (PreparedMLANormQuant(scratch.projected[:prefix_tokens],
             (weights["q_norm"], weights["kv_norm"]), scratch.query_low[:prefix_tokens],
             scratch.window_values[:prefix_tokens],
             eps=self.eps, session=session, name=name + ".qkv_norm",
-            release_dependents=prefix_tokens <= 8, examples=examples)
+            release_dependents=True, examples=examples, **norm_quant_rope_kwargs)
             if paired_mxfp8 and not use_a16_qkv and self.eps == 1e-20 and mla_norm_mxfp8.is_supported(device) else None)
+        self.norm_quant_fused_kv_rope = (
+            self.norm_quant is not None and getattr(self.norm_quant, "kv_rope_dim", 0) > 0
+        )
         for key, w, values, out in (
             ("qkv_a", weights["qkv_a"], source[:prefix_tokens], scratch.projected[:prefix_tokens]),
             ("q_b", q_b_weight, scratch.query_low[:prefix_tokens], query_buf.view(prefix_tokens, -1)),
@@ -915,6 +927,9 @@ class PreparedAttention:
             query_low = self.query_norm(projected[:, :1280])
             window_values = self.window_norm(projected[:, 1280:])
             self.angles.apply(window_values, layer_angles)
+        elif getattr(self, "norm_quant_fused_kv_rope", False):
+            query_low, window_values, encoded_bases = self.norm_quant(
+                projected, cos=layer_angles[:, :32], sin=layer_angles[:, 32:])
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
             self.angles.apply(window_values, layer_angles)
@@ -1083,6 +1098,9 @@ class PreparedAttention:
             query_low = self.query_norm(projected[:, :1280])
             window_values = self.window_norm(projected[:, 1280:])
             self.angles.apply(window_values, layer_angles)
+        elif getattr(self, "norm_quant_fused_kv_rope", False):
+            query_low, window_values, encoded_bases = self.norm_quant(
+                projected, cos=layer_angles[:, :32], sin=layer_angles[:, 32:])
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
             self.angles.apply(window_values, layer_angles)
@@ -1115,6 +1133,9 @@ class PreparedAttention:
             query_low = self.query_norm(projected[:, :1280])
             window_values = self.window_norm(projected[:, 1280:])
             self.angles.apply(window_values, layer_angles)
+        elif getattr(self, "norm_quant_fused_kv_rope", False):
+            query_low, window_values, encoded_bases = self.norm_quant(
+                projected, cos=layer_angles[:, :32], sin=layer_angles[:, 32:])
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
             self.angles.apply(window_values, layer_angles)
@@ -1191,6 +1212,9 @@ class PreparedAttention:
                 projected, self.q_norm_weight, self.kv_norm_weight, layer_angles, self.eps)
         elif self.norm_quant is None:
             query_low = self.query_norm(projected[:, :1280])
+        elif getattr(self, "norm_quant_fused_kv_rope", False):
+            query_low, window_values, encoded_bases = self.norm_quant(
+                projected, cos=layer_angles[:, :32], sin=layer_angles[:, 32:])
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
         pending = None
@@ -1199,7 +1223,7 @@ class PreparedAttention:
                 query_low, source, layer_angles,
                 index_angles=indices.angles[(True, 0)] if self.concurrent_query.has_indexer else None,
                 encoded_bases=encoded_bases)
-        if not self.fused_qkv_norm_rope:
+        if not self.fused_qkv_norm_rope and not getattr(self, "norm_quant_fused_kv_rope", False):
             if self.window_norm is not None:
                 window_values = self.window_norm(projected[:, 1280:])
             self.angles.apply(window_values, layer_angles)

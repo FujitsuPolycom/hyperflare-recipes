@@ -293,7 +293,7 @@ class QuantizedProjection:
                 self.encoded = mxfp8.dense_rows_from_bases(*self.encoded_bases)
                 self.quantizer_plan = mxfp8.plan(mxfp8.query_from_call(
                     source, self.encoded.values, self.encoded.scale_rows, self.encoded.scale_mma,
-                    min_amax=mxfp8_min_amax, release_dependents=rhs_prefetch_ready and rows <= 8))
+                    min_amax=mxfp8_min_amax, release_dependents=rhs_prefetch_ready))
             else:
                 self.encoded_bases = (encoded.values, encoded.scale_rows.view(torch.uint8),
                                       mxfp8.dense_scale_storage(encoded.scale_mma))

@@ -315,7 +315,12 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
 
 
 def _kv_gather_runtime(config, group, device, *, coordinator, core_storage):
-    """Allocate a peer-to-peer KV gather channel for single-host row-sharded attention."""
+    """Allocate a peer-to-peer KV gather channel for single-host row-sharded attention.
+
+    Sizes batch rows to 5x the per-rank shard rows with 512 columns per rank so one
+    DcpAllToAll channel covers both full layers ([st, 512]) and mla_wo layers
+    ([st, 2560] viewed as [5*st, 512]) without extra IPC handles.
+    """
     if (coordinator.spans_hosts
             or not config.row_shard_attention
             or len(config.devices) < 2
@@ -332,7 +337,7 @@ def _kv_gather_runtime(config, group, device, *, coordinator, core_storage):
             or torch.cuda.get_device_properties(device).multi_processor_count < DCP_A2A_REQUIRED_SMS):
         return None
     return create_all_gather_runtime(
-        group, device, max_rows=max_kv_shard_rows,
+        group, device, max_rows=5 * max_kv_shard_rows,
         columns=512 * world, ipc=core_storage.peer_storage)
 
 
