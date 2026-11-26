@@ -979,6 +979,8 @@ class PreparedLayer:
             routed = self.experts(full_vals, route_ids, route_weights,
                                   a_scales=full_srows, router_logits=None,
                                   selected_logits=None, image_mask=None)
+            if getattr(self.shared, "supports_residual", False):
+                return self.shared(full_vals, encoded_bases=ffn_encoded_bases, residual=routed), route_ids
             shared = self.shared(full_vals, encoded_bases=ffn_encoded_bases)
             return routed + shared, route_ids
         route_words = meta_full.contiguous().view(torch.int32)
@@ -988,6 +990,8 @@ class PreparedLayer:
         RouteRecord(route_words).read(route_ids, route_weights)
         routed = self.experts(vals_full_bf16, route_ids, route_weights,
                               router_logits=None, selected_logits=None, image_mask=None)
+        if getattr(self.shared, "supports_residual", False):
+            return self.shared(vals_full_bf16, residual=routed), route_ids
         shared = self.shared(vals_full_bf16)
         return routed + shared, route_ids
 
@@ -1496,8 +1500,11 @@ class PreparedLayer:
             route_a = self.router(logits_a, image_mask=mask_a)
             routed_a = self.experts(norm_a, route_a.ids, route_a.weights, router_logits=logits_a,
                 selected_logits=route_a.selected_logits, image_mask=mask_a)
-            shared_a = self.shared(norm_a)
-            partial_a = routed_a + shared_a
+            if getattr(self.shared, "supports_residual", False):
+                partial_a = self.shared(norm_a, residual=routed_a)
+            else:
+                shared_a = self.shared(norm_a)
+                partial_a = routed_a + shared_a
             att_b = self.cr_att_1.finish(p_att_b, partial_a)
 
             p_mlp_a = self.cr_mlp_0.start(partial_a, dependencies=(att_b,))
@@ -1509,8 +1516,11 @@ class PreparedLayer:
             route_b = self.router(logits_b, image_mask=mask_b)
             routed_b = self.experts(norm_b, route_b.ids, route_b.weights, router_logits=logits_b,
                 selected_logits=route_b.selected_logits, image_mask=mask_b)
-            shared_b = self.shared(norm_b)
-            partial_b = routed_b + shared_b
+            if getattr(self.shared, "supports_residual", False):
+                partial_b = self.shared(norm_b, residual=routed_b)
+            else:
+                shared_b = self.shared(norm_b)
+                partial_b = routed_b + shared_b
             mlp_a = self.cr_mlp_0.finish(p_mlp_a, partial_b)
 
             p_mlp_b = self.cr_mlp_1.start(partial_b, dependencies=(mlp_a,))
@@ -1581,10 +1591,15 @@ class PreparedLayer:
         route = self.router(router_logits, image_mask=image_mask)
         routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
                               selected_logits=route.selected_logits, image_mask=image_mask)
-        shared = (self.shared(normalized) if self.concurrent_shared is None
-                  else self.concurrent_shared.finish(pending, routed))
-        output = (self.mlp_reduce(routed, addend=shared)
-                  if getattr(self.mlp_reduce, "fused_addend", False) else self.mlp_reduce(routed + shared))
+        if (self.concurrent_shared is None
+                and not getattr(self.mlp_reduce, "fused_addend", False)
+                and getattr(self.shared, "supports_residual", False)):
+            output = self.mlp_reduce(self.shared(normalized, residual=routed))
+        else:
+            shared = (self.shared(normalized) if self.concurrent_shared is None
+                      else self.concurrent_shared.finish(pending, routed))
+            output = (self.mlp_reduce(routed, addend=shared)
+                      if getattr(self.mlp_reduce, "fused_addend", False) else self.mlp_reduce(routed + shared))
         incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                     else (output, residual, post, comb))
         observations = {"attention." + key: value for key, value in observations.items()}
