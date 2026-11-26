@@ -10,6 +10,7 @@ import torch
 
 from hyperflare_recipes.components.weights import MLPWeights
 from hyperflare_recipes.components.block_fp8_weights import BlockFP8WeightLoader
+from hyperflare_recipes.components.dense_epilogues import should_pack_unpadded_k64
 from hyperflare_recipes.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 from hyperflare_recipes.components.markov_sampling import fp8_markov_head
 from ignition.preparation.persistent import persistent_copy, allocated_tensor_bytes
@@ -195,8 +196,13 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
         experts = self.load_experts(
             [f"{ffn}.experts.{i}" for i in range(self.config.draft.experts if draft else text["n_routed_experts"])],
             interval)
+        shared_down = (
+            self.load_linear_group((ffn + ".shared_experts.w2",), column_range=interval, k_alignment=64)
+            if should_pack_unpadded_k64(interval[1] - interval[0], self.device)
+            else self.load_linear(ffn + ".shared_experts.w2", columns=interval)
+        )
         shared = MLPWeights(self.load_linear_group((ffn + ".shared_experts.w1", ffn + ".shared_experts.w3"),
-            row_ranges=(interval, interval)), self.load_linear(ffn + ".shared_experts.w2", columns=interval))
+            row_ranges=(interval, interval)), shared_down)
         routed = ExpertWeights(self.load_tensor(ffn + ".gate.weight"),
             self.load_tensor(ffn + ".gate.bias"), experts, shared,
             self.load_tensor(ffn + ".gate.bias_vl") if self.config.vision is not None else None)
