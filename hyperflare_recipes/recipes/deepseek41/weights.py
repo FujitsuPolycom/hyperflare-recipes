@@ -37,6 +37,21 @@ class LayerWeights:
     engram: dict | None
 
 
+def main_projection_partition(hidden_size: int, shard, *, block_size: int = 32):
+    """Return this rank's output-row slice for ``mtp.0.main_proj``, or ``None`` if replicated.
+
+    Sharding output rows along ``dim=0`` keeps each rank's full ``K`` reduction intact so a
+    subsequent column ``AllGather`` reproduces the replicated BF16 output bit-for-bit (0 ULP)
+    while reducing per-rank weight storage and bandwidth by ``world_size``. Sharding requires
+    ``world_size > 1`` and 64-column-aligned rank slices matching ``create_all_gather_runtime``
+    and checkpoint block-scale alignment.
+    """
+    alignment = max(64, block_size)
+    if shard.world_size > 1 and hidden_size % (shard.world_size * alignment) == 0:
+        return shard.partition(hidden_size, alignment=alignment)
+    return None
+
+
 @weight_container(('layers', 'main_projection', 'context_kv', 'main_norm', 'norm', 'markov_embedding', 'markov_head', 'confidence_head', 'draft_head'))
 @dataclass(frozen=True)
 class DSparkWeights:
@@ -56,8 +71,13 @@ class DSparkWeights:
         last = f"mtp.{config.layers - 1}"
         markov_name = last + ".markov_head.head.weight"
         temporary = markov_head_quantization in ("nvfp4", "fp8")
+        main_rows = main_projection_partition(
+            loader.config.text["hidden_size"], loader.shard, block_size=loader.block_size
+        )
         return cls(tuple(loader.load_layer(i, draft=True) for i in range(config.layers)),
-            loader.load_linear("mtp.0.main_proj"),
+            loader.load_linear("mtp.0.main_proj", rows=main_rows),
+            # Keep context_kv ([1536, 5120], ~8.1 MB weight read) replicated: TP4 would save
+            # ~6.1 MB/rank (~3.7 us at 1.65 TB/s), less than a second AllGather (~4.5 us).
             loader.load_linear_group(tuple(f"mtp.{i}.attn.wkv" for i in range(config.layers))),
             loader.load_tensor("mtp.0.main_norm.weight"),
             loader.load_tensor(last + ".norm.weight"), loader.load_tensor(last + ".markov_head.embed.weight"),

@@ -61,6 +61,18 @@ from ignition.preparation.bootstrap import BasePreparationConfig
 _CONTEXT = partial(PreparedContext, compact_prefill=True)
 
 
+def _context_gather_runtime(config, group, device, *, coordinator, core_storage, collective=None):
+    """Allocate a BF16 column-gather channel for output-sharded ``mtp.0.main_proj``."""
+    world = len(config.devices)
+    if not config.dspark or world < 2 or 5120 % (world * 64) != 0:
+        return None
+    if coordinator.spans_hosts:
+        return collective
+    return create_all_gather_runtime(
+        group, device, max_rows=max(128, config.decode_tokens), columns=5120,
+        ipc=core_storage.peer_storage)
+
+
 def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **kwargs):
     # Fixed-width PCIe channels distinguish FP32 target words from BF16 proposals.
     runtime = vocabulary_runtime if draft_vocabulary_runtime is None else draft_vocabulary_runtime
@@ -305,7 +317,12 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
         # Vocabulary partitions and packed sampling results use the same serial gather channel.
         result_bytes = max((packed_broadcast_layout(layout.values())[1] for layout in layouts), default=0)
         _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
+        context_gather_bytes = (
+            max(128, config.decode_tokens) * (5120 // len(config.devices)) * 2
+            if config.dspark and 5120 % (len(config.devices) * 64) == 0 else 0
+        )
         gather_bytes = max(sample_rows * local_vocab * 4,
+                           context_gather_bytes,
                            (result_bytes + 15) // 16 * 16)
         decode_tokens = config.all_reduce_tokens
         runtime = create_roce_runtime(group, device, max_tokens=decode_tokens, pipe_tokens=tokens,
@@ -414,6 +431,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             verification_samples=verification_samples)
         kv_collective = _kv_gather_runtime(
             config, group, device, coordinator=coordinator, core_storage=core_storage)
+        context_collective = _context_gather_runtime(
+            config, group, device, coordinator=coordinator, core_storage=core_storage,
+            collective=collective)
         sampling_collective = logprob_collective = None
         if config.vocabulary_parallel_sampling and shard.world_size > 1:
             sampling_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
@@ -472,6 +492,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             submission_sequence=sequence, **completion.buffers())
         if vision_state is not None:
             buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
+        context_factory = (
+            partial(_CONTEXT, runtime=context_collective, coordinator=coordinator)
+            if context_collective is not None else _CONTEXT
+        )
+        scored_context_factory = (
+            partial(PreparedContext, runtime=context_collective, coordinator=coordinator)
+            if context_collective is not None else PreparedContext
+        )
         forwards, signatures, metadata, scratch = {}, {}, {}, {}
         speculation = None
         if config.dspark:
@@ -485,7 +513,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 block_proposal_broadcast=True,
                 vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
                 sampling_runtime=sampling_collective, logprob_runtime=logprob_collective,
-                forwards=DSparkForwards(decoder_factory, DraftScratch, _CONTEXT,
+                forwards=DSparkForwards(decoder_factory, DraftScratch, context_factory,
                     draft_factory, PreparedMarkov))
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
@@ -553,7 +581,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                             )
                         forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
                             coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
-                            context_factory=PreparedContext if graph_kind == "scored_prefill" else _CONTEXT,
+                            context_factory=scored_context_factory if graph_kind == "scored_prefill" else context_factory,
                             sample=sample)
                         fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
                         add(name, forward, graph_kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
@@ -716,10 +744,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         core_data=tables if rank == 0 else None,
         resources=(scoring, weights, tables, pool, requests, inputs, admission, commands, forwards,
             compiled, stream, graph_pool, session,
-            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, kv_collective, coordinator, speculation, confidence,
+            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, kv_collective, context_collective, coordinator, speculation, confidence,
             vision_state, vision_inputs, vision_prefill, feature_pool),
         close_resources=tuple(dict.fromkeys(c for c in
-            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, kv_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
+            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, kv_collective, context_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
     return model
