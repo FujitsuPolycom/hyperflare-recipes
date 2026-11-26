@@ -11,8 +11,8 @@ from b12x.preparation import PreparedCall
 
 from ignition.components.collectives import (
     ConcurrentAllGather, ConcurrentAllReduce, ConcurrentGatherShards, ConcurrentReduceScatter,
-    PreparedAllReduce, PreparedChunkedGatherShards, PreparedGatherShards, PreparedReduceScatter,
-    row_shard_surfaces,
+    PreparedAllGather, PreparedAllReduce, PreparedChunkedGatherShards, PreparedGatherShards,
+    PreparedReduceScatter, row_shard_surfaces,
 )
 from hyperflare_recipes.components.embedding import PreparedEmbedding
 from hyperflare_recipes.components.expert_overlap import ConcurrentSharedExpert
@@ -29,7 +29,10 @@ from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import declare, register_finalizer
 
-from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
+from .attention import (
+    AttentionGeometry, AttentionIndices, AttentionScratch, PreparedAttention,
+    PreparedGlobalKV, Rotary, ShardAttentionInputs, normalize,
+)
 from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
 
@@ -148,45 +151,46 @@ class PreparedDecoderBoundary:
         self.packing = packing
         self.row_shard_dma = bool(row_shard_dma)
         text = pool.config.text
+        ratio = text["compress_ratios"][index]
+        self.shard_csa1 = self.row_shard_dma and ratio == 1
+        self.norm_gather_0 = self.norm_gather_1 = None
+        self.val_gather_0 = self.val_gather_1 = None
+        self.cr_val_gather_0 = self.cr_val_gather_1 = None
+        self.suffix_gather = None
+        self.res_gather_0 = self.res_gather_1 = self.state_gather_0 = self.state_gather_1 = None
         if self.row_shard_dma:
             tokens = source.attention.output.shape[0]
             h = tokens // 2
             s = h // shard.world_size
+            self.world_size = shard.world_size
+            self.half_tokens = h
             self.shard_tokens = s
+            dev = source.residual.device
+            s0 = shard.rank * s
+            self.shard_offset_a_i64 = persistent_copy(torch.tensor([s0], dtype=torch.int64, device=dev))
+            self.shard_offset_b_i64 = persistent_copy(torch.tensor([h + s0], dtype=torch.int64, device=dev))
             incoming = ((source.mlp_output[:s], source.ffn_hc.residual[:s], source.ffn_hc.post[:s], source.ffn_hc.comb[:s])
                         if carry else (source.residual[:s],))
             self.mhc = PreparedMHC(incoming, _mhc_weights(weights, "attn", "attn_norm"), source.attention_hc.rows(s),
                 session=session, name=name + ".attn_hc", workspace=workspace,
                 pre_mix=source.pre_mix[:s], pre_out=source.attn_mix[:s], rms_eps=text["rms_norm_eps"],
                 norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"], sinkhorn_iters=text["hc_sinkhorn_iters"]).functional()
-            self.norm_gather_0 = PreparedGatherShards(
-                source.attention_hc.normalized[:s], source.attention_hc.normalized[:h],
-                runtime=runtime, session=session, coordinator=coordinator,
-                name=name + ".boundary_norm_gather.0").functional(session=session)
-            self.norm_gather_1 = PreparedGatherShards(
-                source.attention_hc.normalized[:s], source.attention_hc.normalized[h:],
-                runtime=runtime, session=session, coordinator=coordinator,
-                name=name + ".boundary_norm_gather.1").functional(session=session)
+            if not self.shard_csa1:
+                self.norm_gather_0 = PreparedGatherShards(
+                    source.attention_hc.normalized[:s], source.attention_hc.normalized[:h],
+                    runtime=runtime, session=session, coordinator=coordinator,
+                    name=name + ".boundary_norm_gather.0").functional(session=session)
+                self.norm_gather_1 = PreparedGatherShards(
+                    source.attention_hc.normalized[:s], source.attention_hc.normalized[h:],
+                    runtime=runtime, session=session, coordinator=coordinator,
+                    name=name + ".boundary_norm_gather.1").functional(session=session)
             if packing is not None:
-                self.res_gather_0 = PreparedChunkedGatherShards(
-                    source.attention_hc.residual[:s], source.attention_hc.residual[:h],
-                    runtime=runtime, session=session, coordinator=coordinator,
-                    name=name + ".boundary_res_gather.0", examples=examples).functional(session=session)
-                self.res_gather_1 = PreparedChunkedGatherShards(
-                    source.attention_hc.residual[:s], source.attention_hc.residual[h:],
-                    runtime=runtime, session=session, coordinator=coordinator,
-                    name=name + ".boundary_res_gather.1", examples=examples).functional(session=session)
-                dev = source.residual.device
-                state_in = declaration_tensor(examples, "row_shard.boundary_state_in", (s, 48), torch.bfloat16, dev)
-                state_out = declaration_tensor(examples, "row_shard.boundary_state_out", (h, 48), torch.bfloat16, dev)
-                self.state_gather_0 = PreparedGatherShards(
-                    state_in, state_out, runtime=runtime, session=session, coordinator=coordinator,
-                    name=name + ".boundary_state_gather.0").functional(session=session)
-                self.state_gather_1 = PreparedGatherShards(
-                    state_in, state_out, runtime=runtime, session=session, coordinator=coordinator,
-                    name=name + ".boundary_state_gather.1").functional(session=session)
-            else:
-                self.res_gather_0 = self.res_gather_1 = self.state_gather_0 = self.state_gather_1 = None
+                suffix_in = declaration_tensor(examples, "row_shard.boundary_suffix_in", (128, 25648), torch.bfloat16, dev)
+                suffix_out = declaration_tensor(examples, "row_shard.boundary_suffix_out",
+                                                (shard.world_size * 128, 25648), torch.bfloat16, dev)
+                self.suffix_gather = PreparedChunkedGatherShards(
+                    suffix_in, suffix_out, runtime=runtime, session=session, coordinator=coordinator,
+                    name=name + ".boundary_suffix_gather", examples=examples).functional(session=session)
         else:
             incoming = ((source.mlp_output, source.ffn_hc.residual, source.ffn_hc.post, source.ffn_hc.comb)
                         if carry else (source.residual,))
@@ -194,11 +198,40 @@ class PreparedDecoderBoundary:
                 session=session, name=name + ".attn_hc", workspace=workspace,
                 pre_mix=source.pre_mix, pre_out=source.attn_mix, rms_eps=text["rms_norm_eps"],
                 norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"], sinkhorn_iters=text["hc_sinkhorn_iters"]).functional()
-            self.norm_gather_0 = self.norm_gather_1 = None
-            self.res_gather_0 = self.res_gather_1 = self.state_gather_0 = self.state_gather_1 = None
         self.global_kv = PreparedGlobalKV(index, weights.attention, source.attention_hc.normalized, source.attention,
             source_indices.metadata, pool, rotary, session=session, name=name + ".global_kv",
-            indices=source_indices, examples=examples)
+            indices=source_indices, examples=examples,
+            proj_tokens=self.shard_tokens if self.shard_csa1 else None,
+            compress_tokens=self.half_tokens if self.shard_csa1 else None)
+        if self.shard_csa1:
+            dev = source.residual.device
+            h, s = self.half_tokens, self.shard_tokens
+            val_in = declaration_tensor(examples, "row_shard.boundary_val_in", (s, 512), torch.bfloat16, dev)
+            val_out_a = declaration_tensor(examples, "row_shard.boundary_val_out_a", (h, 512), torch.bfloat16, dev)
+            val_out_b = declaration_tensor(examples, "row_shard.boundary_val_out_b", (h, 512), torch.bfloat16, dev)
+            self.val_gather_0 = PreparedGatherShards(
+                val_in, val_out_a, runtime=runtime, session=session, coordinator=coordinator,
+                name=name + ".boundary_val_gather.0")
+            self.val_gather_1 = PreparedGatherShards(
+                val_in, val_out_b, runtime=runtime, session=session, coordinator=coordinator,
+                name=name + ".boundary_val_gather.1")
+            prep_plans = tuple(p for p in (
+                getattr(self.mhc, "plan", None),
+                self.global_kv.compressor.project_values.plan,
+            ) if p is not None)
+            kv_plans = self.global_kv.plans()
+            if (isinstance(workspace, ScratchArena) and workspace.overlap
+                    and not self.val_gather_0.single and self.val_gather_0.dma
+                    and prep_plans and kv_plans):
+                self.cr_val_gather_0 = ConcurrentGatherShards(
+                    self.val_gather_0, workspace=workspace, session=session,
+                    parallel_plans=prep_plans).functional(session=session)
+                self.cr_val_gather_1 = ConcurrentGatherShards(
+                    self.val_gather_1, workspace=workspace, session=session,
+                    parallel_plans=kv_plans).functional(session=session)
+            else:
+                self.val_gather_0.functional(session=session)
+                self.val_gather_1.functional(session=session)
         self.indexer = None
         if packing is None:
             from hyperflare_recipes.components.mxfp4_indexer import PreparedMXFP4Indexer
@@ -227,10 +260,15 @@ class PreparedDecoderBoundary:
                 mode="prefill",
                 **candidates,
             ).functional(session=session)
+            if self.cr_val_gather_1 is not None and self.indexer.plan is not None:
+                workspace.register_parallel(self.val_gather_1.plan, self.indexer.plan)
 
     def __call__(self, incoming, pre_mix, metadata, indices, indexer=None):
         suffix = None if self.packing is None else self.packing.begin(metadata)
-        if self.row_shard_dma:
+        active_indexer = getattr(self, "indexer", None) if indexer is None else indexer
+        angles_map = getattr(indices, "angles", None)
+        kv_angles = None if angles_map is None else angles_map[(True, self.global_kv.ratio)]
+        if getattr(self, "row_shard_dma", False):
             pre_mix_a, pre_mix_b = pre_mix
             if len(incoming) == 8:
                 inc_a = incoming[:4]
@@ -240,34 +278,76 @@ class PreparedDecoderBoundary:
                 inc_b = (incoming[1],)
             attn_mix_a = torch.empty_like(pre_mix_a)
             r_a, p_a, c_a, norm_a_sh = self.mhc(*inc_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
-            attn_mix_b = torch.empty_like(pre_mix_b)
-            r_b, p_b, c_b, norm_b_sh = self.mhc(*inc_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
-            norm_a = self.norm_gather_0(norm_a_sh)
-            norm_b = self.norm_gather_1(norm_b_sh, dependencies=(norm_a,))
-            normalized = torch.cat((norm_a, norm_b), dim=0)
-            self.global_kv(normalized, self.indexer if indexer is None else indexer, metadata,
-                indices.compressed(self.global_kv.ratio),
-                angles=indices.angles[(True, self.global_kv.ratio)])
+            geometry = indices.compressed(self.global_kv.ratio)
+            if getattr(self, "shard_csa1", False):
+                val_a_sh, _ = self.global_kv.compressor.project_shard(norm_a_sh)
+                p_val_a = None
+                if self.cr_val_gather_0 is not None:
+                    p_val_a = self.cr_val_gather_0.start(val_a_sh, dependencies=(val_a_sh,))
+                attn_mix_b = torch.empty_like(pre_mix_b)
+                r_b, p_b, c_b, norm_b_sh = self.mhc(*inc_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
+                val_b_sh, _ = self.global_kv.compressor.project_shard(norm_b_sh)
+                if p_val_a is not None:
+                    val_a = self.cr_val_gather_0.finish(p_val_a, val_b_sh)
+                    p_val_b = self.cr_val_gather_1.start(val_b_sh, dependencies=(val_a,))
+                    latent_a = self.global_kv.run_half(
+                        val_a, None, active_indexer, metadata, geometry, half_idx=0, angles=kv_angles)
+                    val_b = self.cr_val_gather_1.finish(p_val_b, latent_a)
+                else:
+                    val_a = self.val_gather_0(val_a_sh)
+                    val_b = self.val_gather_1(val_b_sh, dependencies=(val_a,))
+                    self.global_kv.run_half(
+                        val_a, None, active_indexer, metadata, geometry, half_idx=0, angles=kv_angles)
+                kv_dep = self.global_kv.run_half(
+                    val_b, None, active_indexer, metadata, geometry, half_idx=1, angles=kv_angles)
+            else:
+                attn_mix_b = torch.empty_like(pre_mix_b)
+                r_b, p_b, c_b, norm_b_sh = self.mhc(*inc_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
+                norm_a = self.norm_gather_0(norm_a_sh)
+                norm_b = self.norm_gather_1(norm_b_sh, dependencies=(norm_a,))
+                normalized = torch.cat((norm_a, norm_b), dim=0)
+                self.global_kv(normalized, active_indexer, metadata, geometry, angles=kv_angles)
+                kv_dep = normalized
             if suffix is None:
                 return None, None, None
-            res_a = self.res_gather_0(r_a, dependencies=(normalized,))
-            res_b = self.res_gather_1(r_b, dependencies=(res_a,))
-            residual = torch.cat((res_a, res_b), dim=0)
-            s = self.shard_tokens
-            st_a = torch.cat((p_a, c_a.view(s, 16), attn_mix_a), dim=1).view(torch.bfloat16)
-            st_b = torch.cat((p_b, c_b.view(s, 16), attn_mix_b), dim=1).view(torch.bfloat16)
-            g_a = self.state_gather_0(st_a).view(torch.float32)
-            g_b = self.state_gather_1(st_b, dependencies=(g_a,)).view(torch.float32)
-            g = torch.cat((g_a, g_b), dim=0)
-            post = g[:, :4].contiguous()
-            comb = g[:, 4:20].contiguous().view(g.shape[0], 4, 4)
-            attn_mix = g[:, 20:24].contiguous()
-            return suffix, tuple(suffix.gather(value) for value in (residual, post, comb, normalized)), suffix.gather(attn_mix)
+            h, s = self.half_tokens, self.shard_tokens
+            idx = suffix.indices
+            in_a = suffix.live & (idx >= self.shard_offset_a_i64) & (idx < self.shard_offset_a_i64 + s)
+            in_b = suffix.live & (idx >= self.shard_offset_b_i64) & (idx < self.shard_offset_b_i64 + s)
+            loc_a = (idx - self.shard_offset_a_i64).clamp(0, s - 1)
+            loc_b = (idx - self.shard_offset_b_i64).clamp(0, s - 1)
+
+            def _select_local_i16(val_a, val_b):
+                fa = val_a.view(s, -1).view(torch.int16)
+                fb = val_b.view(s, -1).view(torch.int16)
+                sa = fa.index_select(0, loc_a)
+                sb = fb.index_select(0, loc_b)
+                return torch.where(in_a[:, None], sa, torch.where(in_b[:, None], sb, torch.zeros_like(sa)))
+
+            st_a = torch.cat((p_a, c_a.view(s, 16), attn_mix_a), dim=1)
+            st_b = torch.cat((p_b, c_b.view(s, 16), attn_mix_b), dim=1)
+            local_128 = torch.cat(
+                (_select_local_i16(r_a, r_b), _select_local_i16(norm_a_sh, norm_b_sh), _select_local_i16(st_a, st_b)),
+                dim=1,
+            ).view(torch.bfloat16)
+            gathered_i16 = self.suffix_gather(local_128, dependencies=(kv_dep,)).view(
+                self.world_size, 128, 25648).view(torch.int16)
+            owner = torch.where(idx < h, idx // s, (idx - h) // s).clamp(0, self.world_size - 1)
+            selected_i16 = gathered_i16[owner, torch.arange(128, device=idx.device)]
+            selected_i16 = torch.where(suffix.live[:, None], selected_i16, 0)
+            selected_128 = selected_i16.view(torch.bfloat16)
+            residual_128 = selected_128[:, :20480].contiguous().view(128, 4, 5120)
+            norm_128 = selected_128[:, 20480:25600].contiguous()
+            state_f32 = selected_i16[:, 25600:].contiguous().view(torch.float32)
+            post_128 = state_f32[:, :4].contiguous()
+            comb_128 = state_f32[:, 4:20].contiguous().view(128, 4, 4)
+            attn_mix_128 = state_f32[:, 20:24].contiguous()
+            return suffix, (residual_128, post_128, comb_128, norm_128), attn_mix_128
         attn_mix = torch.empty_like(pre_mix)
         residual, post, comb, normalized = self.mhc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
-        self.global_kv(normalized, self.indexer if indexer is None else indexer, metadata,
-            indices.compressed(self.global_kv.ratio),
-            angles=indices.angles[(True, self.global_kv.ratio)])
+        kv_kwargs = {} if kv_angles is None else {"angles": kv_angles}
+        self.global_kv(normalized, active_indexer, metadata,
+            indices.compressed(self.global_kv.ratio), **kv_kwargs)
         if suffix is None:
             return None, None, None
         return suffix, tuple(suffix.gather(value) for value in (residual, post, comb, normalized)), suffix.gather(attn_mix)
@@ -279,7 +359,8 @@ class PreparedLayer:
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto",
                  window_metadata=None, examples=None, pipelined_ffn=False, pipelined_attn_hc=False,
                  defer_mlp_b=False, defer_engram_reduce=False, pipelined_attn=None,
-                 row_shard_dma=False, shard_rows=None, replicated_attention=None):
+                 row_shard_dma=False, shard_rows=None, replicated_attention=None,
+                 kv_runtime=None, engram_min_gather_chunks=1):
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
         self.metadata = metadata
@@ -291,6 +372,7 @@ class PreparedLayer:
         self.pipelined_attn = pipelined_attn
         self.defer_mlp_b = bool(defer_mlp_b)
         self.row_shard_dma = bool(row_shard_dma)
+        self.world_size = shard.world_size
         tokens = s.attention.output.shape[0]
         h = tokens // 2
         self.half_tokens = h
@@ -317,10 +399,18 @@ class PreparedLayer:
         self.cr_attn_gather_0 = self.cr_attn_gather_1 = None
         self.kv_gather_0 = self.kv_gather_1 = None
         self.cr_kv_gather_0 = self.cr_kv_gather_1 = None
-        if replicated_attention is not None and (not self.row_shard_dma or self.pipelined_attn != "full"):
-            raise ValueError("replicated attention weights require a row-sharded full-attention encoder layer")
+        if replicated_attention is not None and (not self.row_shard_dma or self.pipelined_attn not in ("full", "mla_wo")):
+            raise ValueError("replicated attention weights require a row-sharded encoder layer")
         self.row_shard_attention = bool(
-            self.row_shard_dma and self.pipelined_attn == "full" and replicated_attention is not None)
+            self.row_shard_dma and self.pipelined_attn in ("full", "mla_wo") and replicated_attention is not None)
+        self.p2p_kv_gather = bool(
+            self.row_shard_attention
+            and self.pipelined_attn == "full"
+            and self.pipelined_attn_hc
+            and kv_runtime is not None
+        )
+        self.shard_prep_plans = ()
+        self.ffn_compute_plans = ()
         self.ffn_vals_0 = self.ffn_vals_1 = self.ffn_meta_0 = self.ffn_meta_1 = None
         self.cr_ffn_vals_0 = self.cr_ffn_vals_1 = self.cr_ffn_meta_0 = self.cr_ffn_meta_1 = None
         if self.pipelined_attn_hc and (not self.pipelined_ffn or not carry or boundary is not None):
@@ -339,7 +429,8 @@ class PreparedLayer:
                 metadata, pool,
                 scratch=s.engram, session=session, name=name + ".engram", workspace=workspace,
                 runtime=runtime, coordinator=coordinator, examples=examples,
-                defer_reduce_functional=defer_engram_reduce, row_shard=engram_row_shard)
+                defer_reduce_functional=defer_engram_reduce, row_shard=engram_row_shard,
+                min_gather_chunks=engram_min_gather_chunks)
             if self.row_shard_dma and self.engram.row_shard is None:
                 raise ValueError("DMA row-sharded prefill requires full-projection Engram all-gather")
         source = s.engram_residual if self.engram is not None else s.residual
@@ -449,12 +540,36 @@ class PreparedLayer:
             if self.row_shard_attention:
                 self.att_reduce_0 = self.att_reduce_1 = None
                 self.cr_att_0 = self.cr_att_1 = None
-                self.kv_gather_0 = PreparedGatherShards(
-                    s.attention.window_values[:st], s.attention.window_values[:h],
-                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".kv_gather.0")
-                self.kv_gather_1 = PreparedGatherShards(
-                    s.attention.window_values[:st], s.attention.window_values[h:],
-                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".kv_gather.1")
+                kv_cols = self.attention.kv_pack_cols
+                if self.p2p_kv_gather:
+                    kv_cols_out = declaration_tensor(
+                        examples, "row_shard.kv_cols_out",
+                        (st, kv_cols * shard.world_size), torch.bfloat16, s.attention.window_values.device)
+                    self.kv_gather_0 = PreparedAllGather(
+                        s.attention.window_values[:st], kv_cols_out,
+                        runtime=kv_runtime, coordinator=coordinator, session=session, name=name + ".kv_gather.0")
+                    self.kv_gather_1 = PreparedAllGather(
+                        s.attention.window_values[:st], kv_cols_out,
+                        runtime=kv_runtime, coordinator=coordinator, session=session, name=name + ".kv_gather.1")
+                else:
+                    if kv_cols == 512:
+                        kv_in = s.attention.window_values[:st]
+                        kv_out_a = s.attention.window_values[:h]
+                        kv_out_b = s.attention.window_values[h:]
+                    else:
+                        dev = s.attention.window_values.device
+                        kv_in = declaration_tensor(examples, f"row_shard.kv_pack_in.{kv_cols}",
+                                                   (st, kv_cols), torch.bfloat16, dev)
+                        kv_out_a = declaration_tensor(examples, f"row_shard.kv_pack_out_a.{kv_cols}",
+                                                      (h, kv_cols), torch.bfloat16, dev)
+                        kv_out_b = declaration_tensor(examples, f"row_shard.kv_pack_out_b.{kv_cols}",
+                                                      (h, kv_cols), torch.bfloat16, dev)
+                    self.kv_gather_0 = PreparedGatherShards(
+                        kv_in, kv_out_a,
+                        runtime=runtime, coordinator=coordinator, session=session, name=name + ".kv_gather.0")
+                    self.kv_gather_1 = PreparedGatherShards(
+                        kv_in, kv_out_b,
+                        runtime=runtime, coordinator=coordinator, session=session, name=name + ".kv_gather.1")
             else:
                 self.attn_gather_0 = PreparedGatherShards(
                     s.attention_hc.normalized[:st] if attn_gather_in is None else attn_gather_in,
@@ -587,6 +702,7 @@ class PreparedLayer:
                 self.router.plan,
                 self.ffn_quantizer_plan,
             ) if p is not None)
+            self.shard_prep_plans = shard_prep_plans
             ffn_compute_plans = tuple(p for p in (
                 self.experts.plan,
                 getattr(self.experts, "scale_plan", None),
@@ -596,17 +712,21 @@ class PreparedLayer:
                 self.shared.down_projection.plan,
                 getattr(self.shared.down_projection, "quantizer_plan", None),
             ) if p is not None)
+            self.ffn_compute_plans = ffn_compute_plans
             attn_parallel = list(self.attention.plans())
             if getattr(self.attention_hc, "plan", None) is not None:
                 attn_parallel.append(self.attention_hc.plan)
             if self.attn_quantizer_plan is not None:
                 attn_parallel.append(self.attn_quantizer_plan)
             if self.row_shard_attention:
-                self.cr_kv_gather_0 = ConcurrentGatherShards(self.kv_gather_0, workspace=workspace, session=session,
-                    parallel_plans=attn_parallel)
-                self.cr_kv_gather_1 = ConcurrentGatherShards(self.kv_gather_1, workspace=workspace, session=session,
-                    parallel_plans=(*attn_parallel, *shard_prep_plans))
-                ffn0_parallel = (*attn_parallel, *shard_prep_plans)
+                if self.p2p_kv_gather:
+                    ffn0_parallel = (*attn_parallel, self.kv_gather_1.plan, *shard_prep_plans)
+                else:
+                    self.cr_kv_gather_0 = ConcurrentGatherShards(self.kv_gather_0, workspace=workspace, session=session,
+                        parallel_plans=attn_parallel)
+                    self.cr_kv_gather_1 = ConcurrentGatherShards(self.kv_gather_1, workspace=workspace, session=session,
+                        parallel_plans=(*attn_parallel, *shard_prep_plans))
+                    ffn0_parallel = (*attn_parallel, *shard_prep_plans)
             else:
                 self.cr_attn_gather_0 = ConcurrentGatherShards(self.attn_gather_0, workspace=workspace, session=session,
                     parallel_plans=tuple(p for p in (self.attention_hc.plan, self.attn_quantizer_plan) if p is not None))
@@ -733,8 +853,12 @@ class PreparedLayer:
             self.attention_hc.functional()
         if self.row_shard_dma:
             if self.row_shard_attention:
-                self.cr_kv_gather_0.functional(session=session)
-                self.cr_kv_gather_1.functional(session=session)
+                if self.p2p_kv_gather:
+                    self.kv_gather_0.functional(session=session)
+                    self.kv_gather_1.functional(session=session)
+                else:
+                    self.cr_kv_gather_0.functional(session=session)
+                    self.cr_kv_gather_1.functional(session=session)
             else:
                 self.cr_attn_gather_0.functional(session=session)
                 if self.cr_attn_gather_1 is not None:
@@ -780,11 +904,11 @@ class PreparedLayer:
 
     def __call__(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
                  image_mask=None, engram_projected=None, engram_gathered=None, engram_overlap=None,
-                 engram_project=None):
+                 engram_project=None, ffn_engram_overlaps=None, shard_inputs=None):
         incoming, next_mix, records, selection, _ = self._run(incoming, pre_mix, metadata, indices,
             selection, boundary=boundary, window_cache=window_cache, image_mask=image_mask,
             engram_projected=engram_projected, engram_gathered=engram_gathered, engram_overlap=engram_overlap,
-            engram_project=engram_project)
+            engram_project=engram_project, ffn_engram_overlaps=ffn_engram_overlaps, shard_inputs=shard_inputs)
         return incoming, next_mix, records, selection
 
     def _prepare_attn_shard(self, normalized):
@@ -831,6 +955,13 @@ class PreparedLayer:
             return local_vals.view(torch.bfloat16), local_meta
         return normalized, packed_routes.packed
 
+    def _gather_kv_shard(self, gather, wv_sh, *, dependencies=()):
+        wv_cols = gather(wv_sh, dependencies=dependencies)
+        if getattr(gather, "single", False):
+            return wv_cols
+        s_tok = wv_sh.shape[0]
+        return wv_cols.view(s_tok, self.world_size, 512).permute(1, 0, 2).contiguous().view(self.half_tokens, 512)
+
     def _run_ffn_gathered(self, vals_full_bf16, meta_full):
         full_rows = vals_full_bf16.shape[0]
         if self.ffn_quantizer_plan is not None:
@@ -862,7 +993,8 @@ class PreparedLayer:
 
     def _run_row_shard_dma(self, incoming, pre_mix, metadata, indices, selection, *,
                            window_cache=None, image_mask=None, engram_projected=None,
-                           engram_gathered=None, engram_overlap=None, engram_project=None):
+                           engram_gathered=None, engram_overlap=None, engram_project=None,
+                           ffn_engram_overlaps=None, shard_inputs=None):
         s_tok = self.shard_tokens
         if self.engram is not None:
             res_cat = torch.cat(incoming, dim=0)
@@ -885,59 +1017,163 @@ class PreparedLayer:
         valid_b = (metadata.live_counts[:1] - self.shard_offset_b).clamp(0, s_tok).to(torch.int32)
 
         if getattr(self, "row_shard_attention", False):
-            if self.pipelined_attn_hc:
+            sh_kw_a = {"half_idx": 0, "shard_inputs": shard_inputs} if shard_inputs is not None else {}
+            sh_kw_b = {"half_idx": 1, "shard_inputs": shard_inputs} if shard_inputs is not None else {}
+            mla_kw = {"shard_inputs": shard_inputs} if shard_inputs is not None else {}
+            if self.pipelined_attn == "mla_wo":
+                if self.pipelined_attn_hc:
+                    mlp_a, prev_res_a, prev_post_a, prev_comb_a, p_mlp_b, prev_res_b, prev_post_b, prev_comb_b = incoming
+                    attn_mix_a = torch.empty_like(pre_mix_a)
+                    res_a, post_a, comb_a, norm_a_sh = self.attention_hc(
+                        mlp_a, prev_res_a, prev_post_a, prev_comb_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
+                    q_a, kv_a_sh, iq_a, iw_a, angles_a = self.attention.run_shard_mla_wo_local(
+                        norm_a_sh, indices=indices, shard_rows=self.shard_rows_a, **sh_kw_a)
+                    mlp_b = self.cr_mlp_1.finish(p_mlp_b, kv_a_sh)
+                    p_kv_a = self.cr_kv_gather_0.start(kv_a_sh, dependencies=(mlp_b,))
+                    attn_mix_b = torch.empty_like(pre_mix_b)
+                    res_b, post_b, comb_b, norm_b_sh = self.attention_hc(
+                        mlp_b, prev_res_b, prev_post_b, prev_comb_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
+                    q_b, kv_b_sh, iq_b, iw_b, angles_b = self.attention.run_shard_mla_wo_local(
+                        norm_b_sh, indices=indices, shard_rows=self.shard_rows_b, **sh_kw_b)
+                else:
+                    src_a, src_b = incoming
+                    attn_mix_a = torch.empty_like(pre_mix_a)
+                    res_a, post_a, comb_a, norm_a_sh = self.attention_hc(
+                        src_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
+                    q_a, kv_a_sh, iq_a, iw_a, angles_a = self.attention.run_shard_mla_wo_local(
+                        norm_a_sh, indices=indices, shard_rows=self.shard_rows_a, **sh_kw_a)
+                    p_kv_a = self.cr_kv_gather_0.start(kv_a_sh, dependencies=(kv_a_sh,))
+                    attn_mix_b = torch.empty_like(pre_mix_b)
+                    res_b, post_b, comb_b, norm_b_sh = self.attention_hc(
+                        src_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
+                    q_b, kv_b_sh, iq_b, iw_b, angles_b = self.attention.run_shard_mla_wo_local(
+                        norm_b_sh, indices=indices, shard_rows=self.shard_rows_b, **sh_kw_b)
+                kv_a_full = self.cr_kv_gather_0.finish(p_kv_a, kv_b_sh)
+                p_kv_b = self.cr_kv_gather_1.start(kv_b_sh, dependencies=(kv_a_full,))
+                wc = self.attention.init_window_cache(metadata, kv_a_full.device) if window_cache is None else window_cache
+                pending_compress = (
+                    self.attention.global_kv.compressor.init_pending(metadata, kv_a_full.device)
+                    if getattr(self.attention, "global_kv", None) is not None else None
+                )
+                att_a, sel_a_sh = self.attention.run_shard_mla_wo_source(
+                    q_a, kv_a_full, iq_a, iw_a, metadata, selection, indices=indices, window_cache=wc,
+                    half_idx=0, shard_rows=self.shard_rows_a, layer_angles=angles_a,
+                    pending_compress=pending_compress, **mla_kw)
+                next_mix_a = torch.empty_like(attn_mix_a)
+                res_a, post_a, comb_a, ffn_norm_a_sh = self.ffn_hc(
+                    att_a, res_a, post_a, comb_a, pre_mix=attn_mix_a, pre_out=next_mix_a)
+                vals_a_sh, meta_a_sh = self._prepare_ffn_shard(ffn_norm_a_sh, mask_a, valid_a)
+                kv_b_full = self.cr_kv_gather_1.finish(p_kv_b, meta_a_sh)
+                p_vals_a = self.cr_ffn_vals_0.start(vals_a_sh, dependencies=(kv_b_full,))
+                p_meta_a = self.cr_ffn_meta_0.start(meta_a_sh, dependencies=(p_vals_a.output,))
+                att_b, sel_b_sh = self.attention.run_shard_mla_wo_source(
+                    q_b, kv_b_full, iq_b, iw_b, metadata, selection, indices=indices, window_cache=wc,
+                    half_idx=1, shard_rows=self.shard_rows_b, layer_angles=angles_b,
+                    pending_compress=pending_compress, **mla_kw)
+                if sel_a_sh is not None:
+                    selection = ((sel_a_sh, sel_b_sh), selection[1], selection[2])
+                records = (wc, None)
+                if self.attention.mode == "prefill":
+                    self.attention.commit(metadata.lengths, records, metadata)
+                next_mix_b = torch.empty_like(attn_mix_b)
+                res_b, post_b, comb_b, ffn_norm_b_sh = self.ffn_hc(
+                    att_b, res_b, post_b, comb_b, pre_mix=attn_mix_b, pre_out=next_mix_b)
+                vals_b_sh, meta_b_sh = self._prepare_ffn_shard(ffn_norm_b_sh, mask_b, valid_b)
+                vals_a_full = self.cr_ffn_vals_0.finish(p_vals_a, meta_b_sh)
+                meta_a_full = self.cr_ffn_meta_0.finish(p_meta_a, vals_a_full)
+                attention_normalized = norm_a_sh
+            elif getattr(self, "p2p_kv_gather", False):
                 mlp_a, prev_res_a, prev_post_a, prev_comb_a, p_mlp_b, prev_res_b, prev_post_b, prev_comb_b = incoming
                 attn_mix_a = torch.empty_like(pre_mix_a)
                 res_a, post_a, comb_a, norm_a_sh = self.attention_hc(
                     mlp_a, prev_res_a, prev_post_a, prev_comb_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
                 q_a, wv_a_sh, angles_a = self.attention.run_shard_qkv_q(
-                    norm_a_sh, indices=indices, shard_rows=self.shard_rows_a)
-                mlp_b = self.cr_mlp_1.finish(p_mlp_b, wv_a_sh)
-                p_kv_a = self.cr_kv_gather_0.start(wv_a_sh, dependencies=(mlp_b,))
+                    norm_a_sh, indices=indices, shard_rows=self.shard_rows_a, **sh_kw_a)
+                wv_a_full = self._gather_kv_shard(self.kv_gather_0, wv_a_sh)
+                wc = self.attention.init_window_cache(metadata, wv_a_full.device) if window_cache is None else window_cache
+                att_a = self.attention.run_shard_mla_wo(
+                    q_a, wv_a_full, metadata, selection, indices=indices, window_cache=wc,
+                    half_idx=0, shard_rows=self.shard_rows_a, layer_angles=angles_a, **mla_kw)
+                next_mix_a = torch.empty_like(attn_mix_a)
+                res_a, post_a, comb_a, ffn_norm_a_sh = self.ffn_hc(
+                    att_a, res_a, post_a, comb_a, pre_mix=attn_mix_a, pre_out=next_mix_a)
+                vals_a_sh, meta_a_sh = self._prepare_ffn_shard(ffn_norm_a_sh, mask_a, valid_a)
+                mlp_b = self.cr_mlp_1.finish(p_mlp_b, meta_a_sh)
+                p_vals_a = self.cr_ffn_vals_0.start(vals_a_sh, dependencies=(mlp_b,))
+                p_meta_a = self.cr_ffn_meta_0.start(meta_a_sh, dependencies=(p_vals_a.output,))
                 attn_mix_b = torch.empty_like(pre_mix_b)
                 res_b, post_b, comb_b, norm_b_sh = self.attention_hc(
                     mlp_b, prev_res_b, prev_post_b, prev_comb_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
                 q_b, wv_b_sh, angles_b = self.attention.run_shard_qkv_q(
-                    norm_b_sh, indices=indices, shard_rows=self.shard_rows_b)
+                    norm_b_sh, indices=indices, shard_rows=self.shard_rows_b, **sh_kw_b)
+                wv_b_full = self._gather_kv_shard(self.kv_gather_1, wv_b_sh, dependencies=(wv_a_full,))
+                att_b = self.attention.run_shard_mla_wo(
+                    q_b, wv_b_full, metadata, selection, indices=indices, window_cache=wc,
+                    half_idx=1, shard_rows=self.shard_rows_b, layer_angles=angles_b, **mla_kw)
+                records = (wc, None)
+                if self.attention.mode == "prefill":
+                    self.attention.commit(metadata.lengths, records, metadata)
+                next_mix_b = torch.empty_like(attn_mix_b)
+                res_b, post_b, comb_b, ffn_norm_b_sh = self.ffn_hc(
+                    att_b, res_b, post_b, comb_b, pre_mix=attn_mix_b, pre_out=next_mix_b)
+                vals_b_sh, meta_b_sh = self._prepare_ffn_shard(ffn_norm_b_sh, mask_b, valid_b)
+                vals_a_full = self.cr_ffn_vals_0.finish(p_vals_a, meta_b_sh)
+                meta_a_full = self.cr_ffn_meta_0.finish(p_meta_a, vals_a_full)
+                attention_normalized = norm_a_sh
             else:
-                src_a, src_b = incoming
-                attn_mix_a = torch.empty_like(pre_mix_a)
-                res_a, post_a, comb_a, norm_a_sh = self.attention_hc(
-                    src_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
-                q_a, wv_a_sh, angles_a = self.attention.run_shard_qkv_q(
-                    norm_a_sh, indices=indices, shard_rows=self.shard_rows_a)
-                p_kv_a = self.cr_kv_gather_0.start(wv_a_sh, dependencies=(wv_a_sh,))
-                attn_mix_b = torch.empty_like(pre_mix_b)
-                res_b, post_b, comb_b, norm_b_sh = self.attention_hc(
-                    src_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
-                q_b, wv_b_sh, angles_b = self.attention.run_shard_qkv_q(
-                    norm_b_sh, indices=indices, shard_rows=self.shard_rows_b)
-            wv_a_full = self.cr_kv_gather_0.finish(p_kv_a, wv_b_sh)
-            p_kv_b = self.cr_kv_gather_1.start(wv_b_sh, dependencies=(wv_a_full,))
-            wc = self.attention.init_window_cache(metadata, wv_a_full.device) if window_cache is None else window_cache
-            att_a = self.attention.run_shard_mla_wo(
-                q_a, wv_a_full, metadata, selection, indices=indices, window_cache=wc,
-                half_idx=0, shard_rows=self.shard_rows_a, layer_angles=angles_a)
-            next_mix_a = torch.empty_like(attn_mix_a)
-            res_a, post_a, comb_a, ffn_norm_a_sh = self.ffn_hc(
-                att_a, res_a, post_a, comb_a, pre_mix=attn_mix_a, pre_out=next_mix_a)
-            vals_a_sh, meta_a_sh = self._prepare_ffn_shard(ffn_norm_a_sh, mask_a, valid_a)
-            wv_b_full = self.cr_kv_gather_1.finish(p_kv_b, meta_a_sh)
-            p_vals_a = self.cr_ffn_vals_0.start(vals_a_sh, dependencies=(wv_b_full,))
-            p_meta_a = self.cr_ffn_meta_0.start(meta_a_sh, dependencies=(p_vals_a.output,))
-            att_b = self.attention.run_shard_mla_wo(
-                q_b, wv_b_full, metadata, selection, indices=indices, window_cache=wc,
-                half_idx=1, shard_rows=self.shard_rows_b, layer_angles=angles_b)
-            records = (wc, None)
-            if self.attention.mode == "prefill":
-                self.attention.commit(metadata.lengths, records, metadata)
-            next_mix_b = torch.empty_like(attn_mix_b)
-            res_b, post_b, comb_b, ffn_norm_b_sh = self.ffn_hc(
-                att_b, res_b, post_b, comb_b, pre_mix=attn_mix_b, pre_out=next_mix_b)
-            vals_b_sh, meta_b_sh = self._prepare_ffn_shard(ffn_norm_b_sh, mask_b, valid_b)
-            vals_a_full = self.cr_ffn_vals_0.finish(p_vals_a, meta_b_sh)
-            meta_a_full = self.cr_ffn_meta_0.finish(p_meta_a, vals_a_full)
-            attention_normalized = norm_a_sh
+                if self.pipelined_attn_hc:
+                    mlp_a, prev_res_a, prev_post_a, prev_comb_a, p_mlp_b, prev_res_b, prev_post_b, prev_comb_b = incoming
+                    attn_mix_a = torch.empty_like(pre_mix_a)
+                    res_a, post_a, comb_a, norm_a_sh = self.attention_hc(
+                        mlp_a, prev_res_a, prev_post_a, prev_comb_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
+                    q_a, wv_a_sh, angles_a = self.attention.run_shard_qkv_q(
+                        norm_a_sh, indices=indices, shard_rows=self.shard_rows_a, **sh_kw_a)
+                    mlp_b = self.cr_mlp_1.finish(p_mlp_b, wv_a_sh)
+                    p_kv_a = self.cr_kv_gather_0.start(wv_a_sh, dependencies=(mlp_b,))
+                    attn_mix_b = torch.empty_like(pre_mix_b)
+                    res_b, post_b, comb_b, norm_b_sh = self.attention_hc(
+                        mlp_b, prev_res_b, prev_post_b, prev_comb_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
+                    q_b, wv_b_sh, angles_b = self.attention.run_shard_qkv_q(
+                        norm_b_sh, indices=indices, shard_rows=self.shard_rows_b, **sh_kw_b)
+                else:
+                    src_a, src_b = incoming
+                    attn_mix_a = torch.empty_like(pre_mix_a)
+                    res_a, post_a, comb_a, norm_a_sh = self.attention_hc(
+                        src_a, pre_mix=pre_mix_a, pre_out=attn_mix_a)
+                    q_a, wv_a_sh, angles_a = self.attention.run_shard_qkv_q(
+                        norm_a_sh, indices=indices, shard_rows=self.shard_rows_a, **sh_kw_a)
+                    p_kv_a = self.cr_kv_gather_0.start(wv_a_sh, dependencies=(wv_a_sh,))
+                    attn_mix_b = torch.empty_like(pre_mix_b)
+                    res_b, post_b, comb_b, norm_b_sh = self.attention_hc(
+                        src_b, pre_mix=pre_mix_b, pre_out=attn_mix_b)
+                    q_b, wv_b_sh, angles_b = self.attention.run_shard_qkv_q(
+                        norm_b_sh, indices=indices, shard_rows=self.shard_rows_b, **sh_kw_b)
+                wv_a_full = self.cr_kv_gather_0.finish(p_kv_a, wv_b_sh)
+                p_kv_b = self.cr_kv_gather_1.start(wv_b_sh, dependencies=(wv_a_full,))
+                wc = self.attention.init_window_cache(metadata, wv_a_full.device) if window_cache is None else window_cache
+                att_a = self.attention.run_shard_mla_wo(
+                    q_a, wv_a_full, metadata, selection, indices=indices, window_cache=wc,
+                    half_idx=0, shard_rows=self.shard_rows_a, layer_angles=angles_a, **mla_kw)
+                next_mix_a = torch.empty_like(attn_mix_a)
+                res_a, post_a, comb_a, ffn_norm_a_sh = self.ffn_hc(
+                    att_a, res_a, post_a, comb_a, pre_mix=attn_mix_a, pre_out=next_mix_a)
+                vals_a_sh, meta_a_sh = self._prepare_ffn_shard(ffn_norm_a_sh, mask_a, valid_a)
+                wv_b_full = self.cr_kv_gather_1.finish(p_kv_b, meta_a_sh)
+                p_vals_a = self.cr_ffn_vals_0.start(vals_a_sh, dependencies=(wv_b_full,))
+                p_meta_a = self.cr_ffn_meta_0.start(meta_a_sh, dependencies=(p_vals_a.output,))
+                att_b = self.attention.run_shard_mla_wo(
+                    q_b, wv_b_full, metadata, selection, indices=indices, window_cache=wc,
+                    half_idx=1, shard_rows=self.shard_rows_b, layer_angles=angles_b, **mla_kw)
+                records = (wc, None)
+                if self.attention.mode == "prefill":
+                    self.attention.commit(metadata.lengths, records, metadata)
+                next_mix_b = torch.empty_like(attn_mix_b)
+                res_b, post_b, comb_b, ffn_norm_b_sh = self.ffn_hc(
+                    att_b, res_b, post_b, comb_b, pre_mix=attn_mix_b, pre_out=next_mix_b)
+                vals_b_sh, meta_b_sh = self._prepare_ffn_shard(ffn_norm_b_sh, mask_b, valid_b)
+                vals_a_full = self.cr_ffn_vals_0.finish(p_vals_a, meta_b_sh)
+                meta_a_full = self.cr_ffn_meta_0.finish(p_meta_a, vals_a_full)
+                attention_normalized = norm_a_sh
         else:
             if self.pipelined_attn_hc:
                 mlp_a, prev_res_a, prev_post_a, prev_comb_a, p_mlp_b, prev_res_b, prev_post_b, prev_comb_b = incoming
@@ -1026,17 +1262,53 @@ class PreparedLayer:
             vals_a_full = self.cr_ffn_vals_0.finish(p_vals_a, meta_b_sh)
             meta_a_full = self.cr_ffn_meta_0.finish(p_meta_a, vals_a_full)
 
+        ffn_eng_0 = ffn_engram_overlaps[0] if ffn_engram_overlaps else None
+        ffn_eng_1 = ffn_engram_overlaps[1] if ffn_engram_overlaps and len(ffn_engram_overlaps) > 1 else None
+        eng_src_0 = None
+        if ffn_eng_0 is not None:
+            prep_e0, cr_e0, (b0, e0), st_e0, use_g0 = ffn_eng_0
+            if prep_e0 is not None:
+                st_e0["partial"] = (
+                    prep_e0.lookup_local(attention_normalized, metadata)
+                    if use_g0 else prep_e0.project(attention_normalized, metadata).view(-1, 5120)
+                )
+            eng_src_0 = st_e0["partial"][b0:e0].clone()
         p_vals_b = self.cr_ffn_vals_1.start(vals_b_sh, dependencies=(meta_a_full,))
         p_meta_b = self.cr_ffn_meta_1.start(meta_b_sh, dependencies=(p_vals_b.output,))
+        p_eng_0 = None
+        if ffn_eng_0 is not None:
+            p_eng_0 = cr_e0.start(eng_src_0, dependencies=(p_meta_b.output,))
         partial_a, route_ids_a = self._run_ffn_gathered(vals_a_full, meta_a_full)
         vals_b_full = self.cr_ffn_vals_1.finish(p_vals_b, partial_a)
         meta_b_full = self.cr_ffn_meta_1.finish(p_meta_b, vals_b_full)
+        mlp0_dep = meta_b_full
+        if p_eng_0 is not None:
+            eng_chunk_0 = cr_e0.finish(p_eng_0, meta_b_full)
+            st_e0["chunks"].append(eng_chunk_0)
+            mlp0_dep = eng_chunk_0
 
-        p_mlp_a = self.cr_mlp_0.start(partial_a, dependencies=(meta_b_full,))
+        eng_src_1 = None
+        if ffn_eng_1 is not None:
+            prep_e1, cr_e1, (b1, e1), st_e1, use_g1 = ffn_eng_1
+            if prep_e1 is not None:
+                st_e1["partial"] = (
+                    prep_e1.lookup_local(attention_normalized, metadata)
+                    if use_g1 else prep_e1.project(attention_normalized, metadata).view(-1, 5120)
+                )
+            eng_src_1 = st_e1["partial"][b1:e1].clone()
+        p_mlp_a = self.cr_mlp_0.start(partial_a, dependencies=(mlp0_dep,))
+        p_eng_1 = None
+        if ffn_eng_1 is not None:
+            p_eng_1 = cr_e1.start(eng_src_1, dependencies=(p_mlp_a.output,))
         partial_b, route_ids_b = self._run_ffn_gathered(vals_b_full, meta_b_full)
         mlp_a = self.cr_mlp_0.finish(p_mlp_a, partial_b)
+        mlp1_dep = mlp_a
+        if p_eng_1 is not None:
+            eng_chunk_1 = cr_e1.finish(p_eng_1, mlp_a)
+            st_e1["chunks"].append(eng_chunk_1)
+            mlp1_dep = eng_chunk_1
 
-        p_mlp_b = self.cr_mlp_1.start(partial_b, dependencies=(mlp_a,))
+        p_mlp_b = self.cr_mlp_1.start(partial_b, dependencies=(mlp1_dep,))
         if self.defer_mlp_b:
             incoming = (mlp_a, res_a, post_a, comb_a, p_mlp_b, res_b, post_b, comb_b)
             next_mix = (next_mix_a, next_mix_b)
@@ -1065,11 +1337,12 @@ class PreparedLayer:
 
     def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
              image_mask=None, engram_projected=None, engram_gathered=None, engram_overlap=None,
-             engram_project=None):
+             engram_project=None, ffn_engram_overlaps=None, shard_inputs=None):
         if getattr(self, "row_shard_dma", False):
             return self._run_row_shard_dma(incoming, pre_mix, metadata, indices, selection,
                 window_cache=window_cache, image_mask=image_mask, engram_projected=engram_projected,
-                engram_gathered=engram_gathered, engram_overlap=engram_overlap, engram_project=engram_project)
+                engram_gathered=engram_gathered, engram_overlap=engram_overlap, engram_project=engram_project,
+                ffn_engram_overlaps=ffn_engram_overlaps, shard_inputs=shard_inputs)
         if self.engram is not None:
             if engram_gathered is not None:
                 incoming = (self.engram.mix(incoming[0], self.engram.project_gathered(engram_gathered), metadata),)
@@ -1324,7 +1597,7 @@ class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
                  vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None,
-                 suffix_runtime=None, encoder_only=False, row_shard_prefill=False,
+                 suffix_runtime=None, kv_runtime=None, encoder_only=False, row_shard_prefill=False,
                  row_shard_attention=False):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
@@ -1436,15 +1709,36 @@ class PreparedDecoder:
         )
         self.half_tokens = encoder_tokens // 2
         self.shard_tokens = self.half_tokens // world if self.row_shard_dma else 0
+        rep_attn = getattr(weights, "replicated_attention", None)
+        mla_wo_kv_fits = True
+        if self.row_shard_dma and any("compressor" in layer.attention and ratios[i] == 2
+                                      for i, layer in enumerate(weights.layers[:decoder_start])):
+            dev = scratch.residual.device
+            mla_wo_kv_in = declaration_tensor(examples, "row_shard.kv_pack_in.2560",
+                                              (self.shard_tokens, 2560), torch.bfloat16, dev)
+            mla_wo_kv_out = declaration_tensor(examples, "row_shard.kv_pack_out_a.2560",
+                                               (self.half_tokens, 2560), torch.bfloat16, dev)
+            mla_wo_kv_fits = PreparedGatherShards.fits(runtime, mla_wo_kv_in, mla_wo_kv_out)
         self.row_shard_attention = (
             bool(row_shard_attention)
             and self.row_shard_dma
-            and getattr(weights, "replicated_attention", None) is not None
+            and rep_attn is not None
+            and all(i in rep_attn for i in range(decoder_start))
             and PreparedGatherShards.fits(
                 runtime,
                 scratch.attention.window_values[:self.shard_tokens],
                 scratch.attention.window_values[:self.half_tokens],
             )
+            and mla_wo_kv_fits
+        )
+        kv_layer_runtime = (
+            kv_runtime
+            if (self.row_shard_attention
+                and kv_runtime is not None
+                and getattr(kv_runtime, "world_size", 0) == world
+                and 0 < self.shard_tokens <= getattr(kv_runtime, "max_batch_size", 0)
+                and getattr(kv_runtime, "heads_per_rank", 0) * getattr(kv_runtime, "query_head_dim", 0) == 512)
+            else None
         )
         if self.row_shard_dma:
             r = getattr(weights.shard, "rank", 0)
@@ -1460,6 +1754,7 @@ class PreparedDecoder:
             shared_shard_rows = None
         self.layers, carry, prev_defer_mlp_b = [], False, False
         self.engram_overlaps = {}
+        self.ffn_engram_overlaps = {}
         self.engram_consumers = {}
         self.engram_projects = {}
         active_layers = weights.layers[:decoder_start] if self.encoder_only else weights.layers
@@ -1495,7 +1790,9 @@ class PreparedDecoder:
                            and layer_pipelined[index + 1] and not next_has_boundary)
             overlap_engram = (can_overlap and _is_dma_runtime(layer_runtime)
                               and layer.engram is not None and weights.shard.world_size > 1
-                              and index >= 8 and ((self.packing is None and not self.encoder_only) or index < decoder_start))
+                              and (index >= 1 if layer_row_shard_dma else index >= 8)
+                              and ((self.packing is None and not self.encoder_only) or index < decoder_start))
+            engram_min_chunks = (2 if index == 1 else 4) if (overlap_engram and layer_row_shard_dma) else 1
             prepared_layer = PreparedLayer(index, layer, tables, layer_scratch, layer_metadata, pool, self.rotary,
                 shard=weights.shard, mode=mode, runtime=layer_runtime,
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
@@ -1508,35 +1805,87 @@ class PreparedDecoder:
                 row_shard_dma=layer_row_shard_dma, shard_rows=shared_shard_rows,
                 replicated_attention=(
                     weights.replicated_attention.get(index)
-                    if self.row_shard_attention and layer_row_shard_dma and pipelined_attn == "full"
+                    if self.row_shard_attention and layer_row_shard_dma and pipelined_attn in ("full", "mla_wo")
                     else None
-                ))
+                ),
+                kv_runtime=(
+                    kv_layer_runtime
+                    if self.row_shard_attention and layer_row_shard_dma and pipelined_attn == "full" and pipelined_attn_hc
+                    else None
+                ),
+                engram_min_gather_chunks=engram_min_chunks)
             if pipelined_attn_hc:
                 prev_plan = self.layers[index - 1].cr_mlp_1.reduce.plan
                 if getattr(prepared_layer.attention_hc, "plan", None) is not None:
                     workspace.register_parallel(prev_plan, prepared_layer.attention_hc.plan)
-                if pipelined_attn == "full":
+                if pipelined_attn == "full" or getattr(prepared_layer, "row_shard_attention", False):
                     for plan in prepared_layer.attention.plans():
+                        workspace.register_parallel(prev_plan, plan)
+                if getattr(prepared_layer, "p2p_kv_gather", False):
+                    workspace.register_parallel(prev_plan, prepared_layer.kv_gather_0.plan)
+                    for plan in getattr(prepared_layer, "shard_prep_plans", ()):
                         workspace.register_parallel(prev_plan, plan)
             if overlap_engram and prepared_layer.engram is not None:
                 engram = prepared_layer.engram
                 if engram.use_all_gather:
                     parts = engram.gather_parts
                     bounds = engram.gather_bounds
-                    # Place single-chunk DMA AllGather on a preceding mla_wo layer (layer 8 for layer 14)
-                    # where prefill_collective is idle during QKV + compressor + indexer + MLA(A).
-                    mla_wo_targets = [t for t in range(2, index)
-                                      if self.layers[t].pipelined_attn == "mla_wo" and t not in self.engram_overlaps]
-                    non_pipe_targets = [t for t in range(2, index)
-                                        if self.layers[t].pipelined_attn is None and t not in self.engram_overlaps]
-                    candidates = mla_wo_targets if len(mla_wo_targets) >= len(parts) else non_pipe_targets
-                    if len(candidates) >= len(parts):
-                        chosen = candidates[-len(parts):]
-                        for ordinal, (target, part, bound) in enumerate(zip(chosen, parts, bounds, strict=True)):
-                            cr_part = ConcurrentAllGather(part, workspace=workspace, session=session,
-                                parallel_plans=self.layers[target].attention.plans()).functional(session=session)
-                            self.engram_overlaps[target] = (index, engram if ordinal == 0 else None, cr_part, bound, True)
-                        self.engram_consumers[index] = (len(parts), True)
+                    placed = False
+                    if layer_row_shard_dma:
+                        prev_engram_idx = max(
+                            (i for i in range(index) if weights.layers[i].engram is not None),
+                            default=-1,
+                        )
+                        start_target = 0 if index == 1 else max(2, prev_engram_idx + 1)
+                        stop_target = index if index == 1 else index - 1
+                        ffn_targets = [
+                            t for t in range(start_target, stop_target)
+                            if getattr(self.layers[t], "row_shard_dma", False)
+                            and getattr(self.layers[t], "ffn_compute_plans", ())
+                            and t not in self.ffn_engram_overlaps
+                            and t not in self.engram_overlaps
+                        ]
+                        if len(parts) <= len(ffn_targets):
+                            chosen_slots = [(t,) for t in ffn_targets[-len(parts):]]
+                        elif len(parts) <= 2 * len(ffn_targets):
+                            needed_layers = (len(parts) + 1) // 2
+                            chosen_layers = ffn_targets[-needed_layers:]
+                            flat_slots = [t for t in chosen_layers for _ in range(2)][:len(parts)]
+                            chosen_slots = [(t,) for t in flat_slots]
+                        else:
+                            chosen_slots = None
+                        if chosen_slots is not None:
+                            for ordinal, ((target,), part, bound) in enumerate(
+                                zip(chosen_slots, parts, bounds, strict=True)
+                            ):
+                                cr_part = ConcurrentAllGather(
+                                    part, workspace=workspace, session=session,
+                                    parallel_plans=self.layers[target].ffn_compute_plans,
+                                ).functional(session=session)
+                                self.ffn_engram_overlaps.setdefault(target, []).append(
+                                    (index, engram if ordinal == 0 else None, cr_part, bound, True)
+                                )
+                            self.engram_consumers[index] = (len(parts), True)
+                            placed = True
+                    else:
+                        mla_wo_targets = [
+                            t for t in range(2, index)
+                            if self.layers[t].pipelined_attn == "mla_wo"
+                            and not getattr(self.layers[t], "row_shard_attention", False)
+                            and t not in self.engram_overlaps
+                        ]
+                        non_pipe_targets = [t for t in range(2, index)
+                                            if self.layers[t].pipelined_attn is None and t not in self.engram_overlaps]
+                        candidates = mla_wo_targets if len(mla_wo_targets) >= len(parts) else non_pipe_targets
+                        if len(candidates) >= len(parts):
+                            chosen = candidates[-len(parts):]
+                            for ordinal, (target, part, bound) in enumerate(zip(chosen, parts, bounds, strict=True)):
+                                cr_part = ConcurrentAllGather(part, workspace=workspace, session=session,
+                                    parallel_plans=self.layers[target].attention.plans()).functional(session=session)
+                                self.engram_overlaps[target] = (index, engram if ordinal == 0 else None, cr_part, bound, True)
+                            self.engram_consumers[index] = (len(parts), True)
+                            placed = True
+                    if placed:
                         prev_layer = self.layers[index - 1]
                         if prev_layer.pipelined_ffn and prev_layer.post is not None:
                             self.engram_projects[index - 1] = (index, engram)
@@ -1638,7 +1987,44 @@ class PreparedDecoder:
             pre_mix[:, 0].fill_(1)
             incoming = (residual,)
         indices = self.window_metadata(metadata)
-        selection = (torch.full((embedding.shape[0], 512), -1, dtype=torch.int32, device=embedding.device), None, None)
+        shard_inputs = None
+        if getattr(self, "row_shard_attention", False) and isinstance(indices, AttentionGeometry):
+            ra, rb = self.shard_rows_a, self.shard_rows_b
+            sh_angles = {
+                key: (torch.index_select(val, 0, ra), torch.index_select(val, 0, rb))
+                for key, val in (indices.angles or {}).items()
+                if key[1] == 0
+            }
+            sh_idx_len = sh_comp_len = sh_pt = active_a = None
+            if 2 in indices.ratios:
+                r2 = indices.ratios[2]
+                sh_idx_len = (torch.index_select(r2.index_lengths, 0, ra), torch.index_select(r2.index_lengths, 0, rb))
+                sh_comp_len = (torch.index_select(r2.lengths, 0, ra), torch.index_select(r2.lengths, 0, rb))
+                sh_pt = (
+                    torch.index_select(metadata.token_page_table, 0, ra),
+                    torch.index_select(metadata.token_page_table, 0, rb),
+                )
+                active_a = r2.lengths[:self.half_tokens].amax().view(1)
+            shard_inputs = ShardAttentionInputs(
+                window_indices=(
+                    torch.index_select(indices.window_indices, 0, ra),
+                    torch.index_select(indices.window_indices, 0, rb),
+                ),
+                window_lengths=(
+                    torch.index_select(indices.window_lengths, 0, ra),
+                    torch.index_select(indices.window_lengths, 0, rb),
+                ),
+                angles=sh_angles,
+                index_lengths=sh_idx_len,
+                compressed_lengths=sh_comp_len,
+                page_table=sh_pt,
+                active_width_a=active_a,
+            )
+        selection = (
+            ((None, None), None, None)
+            if getattr(self, "row_shard_attention", False)
+            else (torch.full((embedding.shape[0], 512), -1, dtype=torch.int32, device=embedding.device), None, None)
+        )
         staging = (None if self.staging_shape is None else torch.empty(
             self.staging_shape, dtype=torch.uint8, device=embedding.device))
         auxiliary = None if self.encoder_only else torch.empty(self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
@@ -1646,6 +2032,7 @@ class PreparedDecoder:
         has_image_mask = any(layer.has_image_mask for layer in self.layers)
         image_mask = metadata.token_ids >= 129280 if has_image_mask else None
         engram_states = {consumer: {"partial": None, "chunks": []} for consumer in self.engram_consumers}
+        decoder_start = self.weights.config.decoder_start
         for index, layer in enumerate(self.layers):
             boundary = None
             if layer.boundary is not None:
@@ -1676,14 +2063,25 @@ class PreparedDecoder:
             if index in self.engram_overlaps:
                 consumer, prepare_engram, cr_part, bound, use_gather = self.engram_overlaps[index]
                 engram_overlap = (prepare_engram, cr_part, bound, engram_states[consumer], use_gather)
+            ffn_engram_overlaps = None
+            if index in self.ffn_engram_overlaps:
+                ffn_engram_overlaps = tuple(
+                    (prepare_engram, cr_part, bound, engram_states[consumer], use_gather)
+                    for consumer, prepare_engram, cr_part, bound, use_gather in self.ffn_engram_overlaps[index]
+                )
             engram_project = None
             if index in self.engram_projects:
                 consumer, consumer_engram = self.engram_projects[index]
                 engram_project = (consumer_engram, engram_states[consumer])
+            layer_kw = {}
+            if ffn_engram_overlaps is not None:
+                layer_kw["ffn_engram_overlaps"] = ffn_engram_overlaps
+            if shard_inputs is not None and (decoder_start is None or index < decoder_start):
+                layer_kw["shard_inputs"] = shard_inputs
             incoming, pre_mix, record, selection = layer(incoming, pre_mix, metadata, indices, selection,
                 boundary=boundary, window_cache=None if staging is None else staging[index],
                 image_mask=image_mask, engram_projected=engram_projected, engram_gathered=engram_gathered,
-                engram_overlap=engram_overlap, engram_project=engram_project)
+                engram_overlap=engram_overlap, engram_project=engram_project, **layer_kw)
             records.append(record)
         if self.encoder_only:
             self.encoder_boundary(incoming, pre_mix, metadata, indices)

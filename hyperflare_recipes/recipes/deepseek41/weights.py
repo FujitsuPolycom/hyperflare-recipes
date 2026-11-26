@@ -14,7 +14,7 @@ from hyperflare_recipes.components.vocabulary import mxfp8_draft_head, nvfp4_dra
 from hyperflare_recipes.components.markov_sampling import fp8_markov_head
 from ignition.preparation.persistent import persistent_copy, allocated_tensor_bytes
 
-from .config import ModelConfig, full_attention_encoder_layers
+from .config import ModelConfig, row_shard_attention_encoder_layers
 from ignition.preparation.rebuild_manifest import weight_container
 
 
@@ -112,7 +112,7 @@ class ModelWeights:
                       if config.vision is not None else None)
             replicated_attention = (
                 {i: loader.load_replicated_attention(i)
-                 for i in full_attention_encoder_layers(config)}
+                 for i in row_shard_attention_encoder_layers(config)}
                 if row_shard_attention and shard.world_size > 1 else None
             )
         return cls(config, shard, embedding, norm, head, layers, draft,

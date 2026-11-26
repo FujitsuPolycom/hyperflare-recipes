@@ -78,6 +78,14 @@ def full_attention_encoder_layers(config):
     return tuple(i for i in range(stop) if i not in kv_sources and i not in index_sources)
 
 
+def row_shard_attention_encoder_layers(config):
+    """Encoder layers prior to `decoder_start` when candidate selection begins at or after the boundary."""
+    stop = config.decoder_start
+    if stop is None or config.text["candidate_source_layer_id"] < stop:
+        return ()
+    return tuple(range(stop))
+
+
 def _mxfp8_packed_bytes(rows: int, cols: int) -> int:
     if rows <= 0 or cols <= 0 or rows % 128 != 0 or cols % 128 != 0:
         raise ValueError("replicated MXFP8 attention projections require positive 128-aligned dimensions")
@@ -109,7 +117,7 @@ def replicated_attention_bytes(world_size, *, prompt_logprobs=False, mtp_only=Fa
         return 0
     if config is None:
         config = ModelConfig({**TEXT_GEOMETRY, **QUALIFIED_ENCODER_SCHEDULE}, {})
-    layers = full_attention_encoder_layers(config)
+    layers = row_shard_attention_encoder_layers(config)
     if not layers:
         return 0
     return len(layers) * replicated_attention_layer_bytes(config.text)
@@ -202,7 +210,8 @@ class ModelConfig:
         return next((i for i in reversed(self.text["index_source_layer_ids"]) if i <= layer), None)
 
     def require_planned_attention_schedule(self):
-        """Reject checkpoints whose full-attention encoder layer set differs from the planned charge."""
+        """Reject checkpoints whose encoder attention schedule differs from the planned charge."""
         qualified = ModelConfig({**TEXT_GEOMETRY, **QUALIFIED_ENCODER_SCHEDULE}, {})
-        if full_attention_encoder_layers(self) != full_attention_encoder_layers(qualified):
-            raise ValueError("row-sharded attention requires the qualified full-attention encoder layer schedule")
+        if (row_shard_attention_encoder_layers(self) != row_shard_attention_encoder_layers(qualified)
+                or full_attention_encoder_layers(self) != full_attention_encoder_layers(qualified)):
+            raise ValueError("row-sharded attention requires the qualified encoder layer schedule")
