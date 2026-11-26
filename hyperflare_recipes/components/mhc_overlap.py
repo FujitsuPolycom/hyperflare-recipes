@@ -15,6 +15,45 @@ from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import register_finalizer
 
 
+def _cluster_size_for_tokens(tokens: int) -> int:
+    from b12x.norm.mhc import _split_lagged
+
+    selector = getattr(_split_lagged, "split_lagged_cluster_size", None)
+    return 8 if selector is None else int(selector(tokens))
+
+
+def _fn_sinkhorn_bucket(tokens: int) -> int | None:
+    from b12x.norm.mhc import _split_lagged
+
+    limit = int(getattr(_split_lagged, "SPLIT_LAGGED_MAX_TOKENS", 8))
+    if limit <= 8:
+        return None
+    return 8 if int(tokens) <= 8 else limit
+
+
+def _compile_fn_sinkhorn(
+    ordinal: int,
+    hidden: int,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    tokens: int,
+):
+    from b12x.norm.mhc._split_lagged import compile_readonly_fn_sinkhorn
+
+    bucket = _fn_sinkhorn_bucket(tokens)
+    if bucket is None:
+        return compile_readonly_fn_sinkhorn(
+            ordinal, hidden, rms_eps, hc_eps, sinkhorn_iters
+        ), None
+    return (
+        compile_readonly_fn_sinkhorn(
+            ordinal, hidden, rms_eps, hc_eps, sinkhorn_iters, max_tokens=bucket
+        ),
+        bucket,
+    )
+
+
 @torch.library.custom_op("flare::mhc_cluster_post_y_norm", mutates_args=("out", "y"))
 def _mhc_cluster_post_y_norm(
     x: torch.Tensor | None,
@@ -36,6 +75,7 @@ def _mhc_cluster_post_y_norm(
         pre_only,
         norm_eps,
         norm_weight.dtype,
+        cluster_size=_cluster_size_for_tokens(int(residual.shape[0])),
         emit_mxfp8=False,
     )
     runner(
@@ -84,6 +124,7 @@ def _mhc_cluster_post_y_norm_mxfp8(
         pre_only,
         norm_eps,
         norm_weight.dtype,
+        cluster_size=_cluster_size_for_tokens(int(residual.shape[0])),
         emit_mxfp8=True,
     )
     runner(
@@ -139,17 +180,16 @@ def _start_mhc_fn_sinkhorn(
     sinkhorn_iters: int,
     stream: int,
 ) -> None:
-    from b12x.norm.mhc._split_lagged import compile_readonly_fn_sinkhorn
-
     main = torch.cuda.current_stream(residual_out.device)
     auxiliary = torch.cuda.ExternalStream(stream, device=residual_out.device)
     auxiliary.wait_stream(main)
-    runner = compile_readonly_fn_sinkhorn(
+    runner, _ = _compile_fn_sinkhorn(
         int(residual_out.device.index or 0),
         int(residual_out.shape[-1]),
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        int(residual_out.shape[0]),
     )
     with torch.cuda.stream(auxiliary):
         runner(
@@ -223,15 +263,16 @@ class PendingMHCSinkhorn:
 
 
 class SplitLaggedMHC:
-    """Split lagged mHC for SM120 decode, verify, and draft (M <= 8).
+    """Split lagged mHC for SM120 decode, verify, and draft (up to b12x's supported M, M <= 128).
 
     Stage 1 (``post_y_norm``) runs ``ClusterMhcPostYNorm`` on the main stream to
     produce ``(residual_out, normalized)`` and optionally pre-quantized MXFP8
     ``(a_values, a_scales)`` for compact W4A8 micro routed experts.
 
     Stage 2 (``start_sinkhorn`` / ``finish_sinkhorn``) runs ``ReadOnlyFnPartialM8``
-    and ``_SplitFinalize`` on ``workspace.auxiliary_stream`` concurrently with the
-    sublayer's tensor-parallel AllReduce.
+    (M <= 8) or ``ReadOnlyFnPartial`` (9 <= M <= 128) and ``_SplitFinalize`` on
+    ``workspace.auxiliary_stream`` concurrently with the sublayer's tensor-parallel
+    AllReduce.
     """
 
     def __init__(
@@ -306,10 +347,7 @@ class SplitLaggedMHC:
     def _finalize(self):
         from b12x._lib.compile_plan import load_programs
         from b12x.moe.fused_moe._binding_ops import supports_prequant_mxfp8
-        from b12x.norm.mhc._split_lagged import (
-            compile_cluster_post_y_norm,
-            compile_readonly_fn_sinkhorn,
-        )
+        from b12x.norm.mhc._split_lagged import compile_cluster_post_y_norm
 
         if self.experts is not None and not getattr(
             self.experts, "integrated_routing", False
@@ -317,12 +355,14 @@ class SplitLaggedMHC:
             self.emit_mxfp8 = supports_prequant_mxfp8(self.experts.plan, self.tokens)
         self.experts = None
         ordinal = int(self.device.index or 0)
+        cluster_size = _cluster_size_for_tokens(self.tokens)
         post_y = compile_cluster_post_y_norm(
             ordinal,
             self.hidden,
             self.pre_only,
             self.norm_eps,
             self.weights.norm.dtype,
+            cluster_size=cluster_size,
             emit_mxfp8=self.emit_mxfp8,
         )
         load_programs(post_y)
@@ -334,15 +374,17 @@ class SplitLaggedMHC:
                 self.pre_only,
                 self.norm_eps,
                 self.weights.norm.dtype,
+                cluster_size,
                 self.emit_mxfp8,
             )
         ] = post_y
-        fn_sink = compile_readonly_fn_sinkhorn(
+        fn_sink, bucket = _compile_fn_sinkhorn(
             ordinal,
             self.hidden,
             self.rms_eps,
             self.hc_eps,
             self.sinkhorn_iters,
+            self.tokens,
         )
         load_programs(fn_sink)
         _SPLIT_MHC_RUNNERS[
@@ -353,6 +395,7 @@ class SplitLaggedMHC:
                 self.rms_eps,
                 self.hc_eps,
                 self.sinkhorn_iters,
+                bucket,
             )
         ] = fn_sink
 
