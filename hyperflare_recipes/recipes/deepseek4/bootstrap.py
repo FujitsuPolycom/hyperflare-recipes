@@ -36,13 +36,8 @@ from ignition.preparation.capture import capture_forwards
 from ignition.preparation.rebuild_manifest import declare_weights
 from .contract import prepare as prepare_contract
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-from ignition.preparation.collectives import (
-    CollectivePreparation,
-    create_all_gather_runtime,
-    create_all_reduce_runtime,
-    create_dma_all_reduce_runtime,
-    create_roce_runtime,
-)
+from ignition.preparation.collectives import CollectivePreparation, create_roce_runtime
+from hyperflare_recipes.components.collectives import create_all_gather_runtime, create_all_reduce_runtime, create_dma_all_reduce_runtime
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import virtual_device_memory, release_unused
@@ -196,7 +191,7 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage):
     tokens = max(config.prefill_chunk_size, config.decode_tokens, slots * config.draft_tokens)
     vocabulary_rows = max(config.decode_samples, slots * config.draft_tokens)
     if coordinator.spans_hosts:
-        from ignition.components.collectives import packed_broadcast_layout
+        from hyperflare_recipes.components.collectives import packed_broadcast_layout
         from hyperflare_recipes.components.draft_sampling import PreparedDraftBlockBroadcast, PreparedDraftDistribution
         from hyperflare_recipes.components.speculation import SpeculativeAcceptance
 

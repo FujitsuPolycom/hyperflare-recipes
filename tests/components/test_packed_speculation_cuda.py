@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.packed_speculation import PreparedPackedSpeculativeRound
 from hyperflare_recipes.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from hyperflare_recipes.components.parallel import TensorParallelShard
@@ -671,8 +671,8 @@ def _tp_rank(rank, rendezvous, sockets):
     from ignition.preparation.execution import GraphSignature, PreparedExecution
     from datetime import timedelta
     import torch.distributed as dist
-    from ignition.preparation.collectives import (CollectivePreparation, create_all_reduce_runtime,
-                                                  create_result_broadcast_runtime)
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime, create_result_broadcast_runtime
     from ignition.preparation.tuning import RecordedPreparationSession
 
     peers, connection = [], None
@@ -1031,8 +1031,8 @@ def _ordinary_generation_rank(rank, rendezvous):
     from datetime import timedelta
     import torch.distributed as dist
     from hyperflare_recipes.components.paged_generation import PreparedGeneration
-    from ignition.preparation.collectives import (CollectivePreparation, create_all_reduce_runtime,
-                                                  create_result_broadcast_runtime)
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime, create_result_broadcast_runtime
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)

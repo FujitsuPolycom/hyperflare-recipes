@@ -268,7 +268,7 @@ class PreparedRoutedExperts:
         self.output_source = output
         self.grouped_output = False
         if route_output is not None and experts.plan.activation.outer_scale == "token":
-            from ignition.components.collectives import WeightedGroupSource
+            from hyperflare_recipes.components.collectives import WeightedGroupSource
 
             output = route_output
             self.output = output
@@ -429,7 +429,7 @@ class PreparedRoutedExperts:
                     self.plan.handle, True, None, None, None, None, None, False,
                     self.precision.get("a4_prefill"))
             if self.grouped_output:
-                from ignition.components.collectives import WeightedGroupSource
+                from hyperflare_recipes.components.collectives import WeightedGroupSource
 
                 return WeightedGroupSource(output, weights, ids, self.num_experts)
             return output

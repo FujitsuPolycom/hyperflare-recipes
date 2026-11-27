@@ -53,7 +53,7 @@ def test_minimax_explicit_metadata_preserves_canonical_unfused_forward():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 def test_minimax_grouped_routes_pass_runtime_weights_and_ids_to_fused_reduction():
-    from ignition.components.collectives import WeightedGroupSource
+    from hyperflare_recipes.components.collectives import WeightedGroupSource
     from hyperflare_recipes.recipes.minimax_m3.decoder import PreparedDecoderLayer
 
     source = torch.arange(8.).view(2, 4).bfloat16()

@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1"
 def _rank(rank, world, rendezvous, snapshot, mode):
     from b12x.comm.pcie import AllReduce
 
-    from ignition.components.collectives import PreparedAllReduce
+    from hyperflare_recipes.components.collectives import PreparedAllReduce
     from hyperflare_recipes.components.parallel import TensorParallelShard
     from hyperflare_recipes.components.recurrent import DeltaMetadata, DeltaState
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint

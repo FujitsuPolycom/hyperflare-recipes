@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.mlp import MLPScratch, PreparedMLP
 from hyperflare_recipes.components.rms_norm import PreparedRMSNorm

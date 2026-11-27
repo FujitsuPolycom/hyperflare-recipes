@@ -11,7 +11,7 @@ from hyperflare_recipes.components.linear import prepare_projection
 from hyperflare_recipes.components.mamba import PreparedMambaScan, PreparedMambaUpdate
 from hyperflare_recipes.components.mamba_speculation import PreparedMambaVerification
 from hyperflare_recipes.components.recurrent import prepare_sequence_binding, run_short_conv
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from ignition.preparation.examples import declaration_tensor
 
 

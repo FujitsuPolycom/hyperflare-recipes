@@ -225,13 +225,8 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
     from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
     from ignition.components.readiness import ReadinessTimings
     from ignition.preparation.aot import ForwardCache
-    from ignition.preparation.collectives import (
-        CollectivePreparation,
-        create_all_gather_runtime,
-        create_all_reduce_runtime,
-        create_dma_all_reduce_runtime,
-        create_result_broadcast_runtime,
-    )
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_gather_runtime, create_all_reduce_runtime, create_dma_all_reduce_runtime, create_result_broadcast_runtime
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from tests.recipes.test_qwen38_pipelined_prefill_cuda import (

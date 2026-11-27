@@ -12,7 +12,7 @@ import triton.language as tl
 from triton.language.extra.cuda import libdevice
 from b12x.attention import dense_mla
 
-from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllReduce, PreparedChunkedAllGather
 from hyperflare_recipes.components.dense_mla import PreparedDenseMLA
 from hyperflare_recipes.components.dflash2 import PreparedDraft as BlockDraft
 from hyperflare_recipes.components.kda_speculation import KDARecords

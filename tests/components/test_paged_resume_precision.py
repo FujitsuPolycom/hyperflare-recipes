@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ignition.components import collectives
+from hyperflare_recipes.components import collectives
 from hyperflare_recipes.components import paged_resume, vocabulary
 from ignition.preparation.scratch import ScratchArena
 
@@ -64,11 +64,13 @@ def test_resume_projection_matches_gather_byte_geometry(monkeypatch, dtype, quan
         def scratch_layout(rows, vocab):
             return {"scores": ((rows, vocab), torch.float32)}
 
+        broadcast_tensors = ()
+
         def prepare(self):
             pass
 
-        def prepare_broadcast(self, **kwargs):
-            pass
+        def attach_broadcast(self, broadcast):
+            return broadcast
 
         def functional(self, *, session):
             self.logits = None
@@ -95,6 +97,7 @@ def test_resume_projection_matches_gather_byte_geometry(monkeypatch, dtype, quan
     plan = SimpleNamespace(request=lambda **kwargs: object())
     monkeypatch.setattr(paged_resume, "PreparedResumeState", State)
     monkeypatch.setattr(paged_resume, "PreparedSampling", Sampling)
+    monkeypatch.setattr(paged_resume, "prepare_sampling_broadcast", lambda *args, **kwargs: None)
     monkeypatch.setattr(vocabulary, "UnquantizedProjection", Projection)
     monkeypatch.setattr(vocabulary, "QuantizedProjection", Projection)
     monkeypatch.setattr(collectives, "_all_gather", lambda source, output, handle: output.copy_(source.repeat(1, 4)))

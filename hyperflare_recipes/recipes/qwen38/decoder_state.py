@@ -442,7 +442,9 @@ class PreparedResume:
             inputs.row_generations[:rows], inputs.live_rows, completion, frame_index, submission_sequence,
             sample_enabled=inputs.sample_enabled[:rows], workspace=sampling_workspace)
         self.sampler.prepare()
-        self.sampler.prepare_broadcast(runtime=vocabulary_runtime if result_runtime is None else result_runtime,
+        from hyperflare_recipes.components.collectives import prepare_sampling_broadcast
+
+        prepare_sampling_broadcast(self.sampler, runtime=vocabulary_runtime if result_runtime is None else result_runtime,
             session=session,
             coordinator=coordinator, name=name + ".sampling")
 

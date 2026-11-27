@@ -11,7 +11,7 @@ import torch
 from torch import nn
 from transformers.models.kimi_k25.modeling_kimi_k25 import Kimi_K25VisionEncoderLayer
 
-from ignition.components.collectives import PreparedChunkedAllReduce
+from hyperflare_recipes.components.collectives import PreparedChunkedAllReduce
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.rms_norm import PreparedTorchRMSNorm
 from hyperflare_recipes.components.rotary import apply_cached_rotary, prepare_cached_rotary

@@ -19,7 +19,7 @@ import triton.language as tl
 from triton.language.extra.cuda import libdevice
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RMSNorm
 
-from ignition.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather
 from hyperflare_recipes.components.embedding import PreparedShardedEmbedding
 from hyperflare_recipes.components.linear import QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.components.mlp import MLPScratch, PreparedMLP

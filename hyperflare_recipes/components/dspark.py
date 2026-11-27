@@ -12,7 +12,7 @@ import triton.language as tl
 
 from hyperflare_recipes.components.speculation import SpeculativeRngState
 
-from ignition.components.collectives import PreparedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from .compressed_mla import PreparedCompressedCacheWriter
@@ -342,7 +342,7 @@ class _ChunkedRoceAllGather:
     """Row-chunked column all-gather for RoCE payloads exceeding ``runtime.max_gather_bytes``."""
 
     def __init__(self, source, output, *, runtime, session, coordinator, name):
-        from ignition.components import collectives
+        from hyperflare_recipes.components import collectives
 
         rows = source.shape[0]
         row_bytes = source.shape[1] * source.element_size()
@@ -373,7 +373,7 @@ class _ChunkedRoceAllGather:
 
 def _prepare_context_gather(source, output, *, runtime, coordinator, session, name):
     """Prepare a functional BF16 column all-gather sized for any context row count."""
-    from ignition.components import collectives
+    from hyperflare_recipes.components import collectives
 
     if collectives._roce(runtime) and source.numel() * source.element_size() > runtime.max_gather_bytes:
         return _ChunkedRoceAllGather(

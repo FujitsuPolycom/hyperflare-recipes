@@ -81,7 +81,8 @@ def test_raw_scores_frames_ties_and_mutated_replay(dtype, width, requested_ids, 
 def _parallel_logprob_rank(rank, rendezvous):
     from datetime import timedelta
     import torch.distributed as dist
-    from ignition.preparation.collectives import CollectivePreparation, create_all_gather_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_gather_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.tuning import RecordedPreparationSession
 

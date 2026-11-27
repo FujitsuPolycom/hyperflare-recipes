@@ -184,7 +184,8 @@ def _prompt_tp_rank(rank, rendezvous):
     from datetime import timedelta
     import torch.distributed as dist
     from hyperflare_recipes.components.prompt_logprobs import PromptOutputs, PreparedPromptReduction
-    from ignition.preparation.collectives import CollectivePreparation, create_all_gather_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_gather_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.tuning import RecordedPreparationSession
 

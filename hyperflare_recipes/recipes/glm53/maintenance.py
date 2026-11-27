@@ -4,7 +4,7 @@
 
 """GLM continuation transitions with b12x rank agreement before mutation."""
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.maintenance import PreparedMaintenance as StateMaintenance
 from ignition.components.state_transfer import PreparedStateTransfer
 

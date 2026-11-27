@@ -88,7 +88,7 @@ def test_remote_channels_cover_vocab_and_sampling_results_without_pcie(monkeypat
     sample_rows = max(config.decode_tokens, config.request_capacity * draft_tokens)
     assert calls[0]["gather_bytes"] >= sample_rows * (129280 // 4) * 4
     if draft_tokens:
-        from ignition.components.collectives import packed_broadcast_layout
+        from hyperflare_recipes.components.collectives import packed_broadcast_layout
         from hyperflare_recipes.components.draft_sampling import PreparedDraftDistribution
         from hyperflare_recipes.components.speculation import SpeculativeAcceptance
 

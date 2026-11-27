@@ -146,7 +146,8 @@ def exercise(rank, rendezvous, output, diagnose=False):
     from b12x.comm.pcie.pcie_dcp_topk import PCIeDCPTopKOwnerExchange
     from hyperflare_recipes.components.paged_batch import Metadata
     from ignition.preparation.capture import capture_forwards
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from hyperflare_recipes.components.head_exchange import create_head_exchange
     from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.execution import GraphSignature

@@ -702,7 +702,8 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
     from hyperflare_recipes.components.weights import DirectWeightLoader
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.capture import capture_forwards
-    from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime, create_all_reduce_runtime)
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_gather_runtime, create_all_reduce_runtime
     from hyperflare_recipes.components.head_exchange import create_head_exchange
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.core_storage import CoreStorage

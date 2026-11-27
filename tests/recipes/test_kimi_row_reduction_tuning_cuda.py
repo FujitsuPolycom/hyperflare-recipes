@@ -12,7 +12,7 @@ import torch
 def _worker(rank, directory):
     import torch.distributed as dist
     from b12x.comm.pcie import AllReduce
-    from ignition.components.collectives import PreparedChunkedAllReduce
+    from hyperflare_recipes.components.collectives import PreparedChunkedAllReduce
     from ignition.preparation.collectives import CollectivePreparation
     from ignition.preparation.tuning import RecordedPreparationSession
     from hyperflare_recipes.recipes.kimi3.row_reductions import RowGeometry, RowReductionTuning

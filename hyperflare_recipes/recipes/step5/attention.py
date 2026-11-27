@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.gated_compression import commit_gated
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.qk_norm_rope import PreparedQKNormRoPE

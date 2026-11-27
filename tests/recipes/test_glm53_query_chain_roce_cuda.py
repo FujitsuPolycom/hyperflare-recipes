@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from ignition.components.collectives import PreparedAllGather, PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedAllReduce
 from hyperflare_recipes.components.linear import BatchedQuantizedProjection, QuantizedProjection
 from hyperflare_recipes.components.weights import quantize_bf16_linear_as_mxfp8
 from ignition.preparation.collectives import CollectivePreparation, create_roce_runtime

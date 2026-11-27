@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import torch
 
-from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedChunkedAllReduce
 from hyperflare_recipes.components.rms_norm import PreparedTorchRMSNorm
 from hyperflare_recipes.components.situ_experts import PreparedSiTUExperts
 from ignition.preparation.examples import declaration_tensor

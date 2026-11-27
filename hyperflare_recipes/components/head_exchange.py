@@ -162,7 +162,7 @@ class PreparedLseReduceScatter:
         import torch.distributed as dist
         from b12x.comm import pcie
         from b12x.preparation import CollectiveRequirement, PreparedCall
-        from ignition.components.collectives import PreparedAllGather, _roce
+        from hyperflare_recipes.components.collectives import PreparedAllGather, _roce
         from ignition.preparation.tuning import declare
 
         rows = partial.shape[0]

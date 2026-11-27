@@ -39,7 +39,7 @@ except ImportError:
     get_island_resnorm7168_wide_launcher = None
 from b12x.preparation import PreparedCall
 
-from ignition.components.collectives import _all_reduce
+from hyperflare_recipes.components.collectives import _all_reduce
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.composition_tuning import PreparedComposition, plan_identity, race_compositions
 from ignition.preparation.execution import GraphSignature

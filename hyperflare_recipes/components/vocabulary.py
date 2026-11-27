@@ -8,7 +8,7 @@ import torch
 
 from ignition.preparation.persistent import persistent_empty
 
-from ignition.components.collectives import PreparedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather
 from .linear import QuantizedProjection, UnquantizedProjection
 
 

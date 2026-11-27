@@ -38,8 +38,8 @@ from hyperflare_recipes.components.deepseek_vision import (PreparedVision, Visio
     PrefillVisionInputs, PreparedVisionGeneration, VisionState)
 from hyperflare_recipes.parameters import ExpertScaleCompressionParameters
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
-    create_all_reduce_runtime, create_dma_all_reduce_runtime, create_result_broadcast_runtime, create_roce_runtime)
+from ignition.preparation.collectives import CollectivePreparation, create_roce_runtime
+from hyperflare_recipes.components.collectives import create_all_gather_runtime, create_all_reduce_runtime, create_dma_all_reduce_runtime, create_result_broadcast_runtime
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import virtual_device_memory, release_unused
@@ -461,7 +461,7 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
         if config.draft_tokens:
             layouts += (PreparedDraftBlockBroadcast.broadcast_layout(batch, config.draft_tokens),)
     if coordinator.spans_hosts:
-        from ignition.components.collectives import packed_broadcast_layout
+        from hyperflare_recipes.components.collectives import packed_broadcast_layout
 
         # Vocabulary partitions and packed sampling results use the same serial gather channel.
         result_bytes = max((packed_broadcast_layout(layout.values())[1] for layout in layouts), default=0)

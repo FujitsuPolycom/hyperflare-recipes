@@ -22,7 +22,8 @@ def rank_main(rank, rendezvous, output):
     from hyperflare_recipes.components.parallel_draft import PreparedParallelDraftRound
     from ignition.components.sampling import DeviceRequestState, RequestAdmission, RUNNING, ERROR
     from ignition.components.completion import CompletionOutputs
-    from ignition.preparation.collectives import CollectivePreparation, create_result_broadcast_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_result_broadcast_runtime
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.graphs import PreparedGraphBundle

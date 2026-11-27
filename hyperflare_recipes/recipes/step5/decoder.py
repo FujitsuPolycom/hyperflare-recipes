@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduce, PreparedAllReduceRMSNorm
+from hyperflare_recipes.components.collectives import PreparedAllReduce, PreparedAllReduceRMSNorm
 from hyperflare_recipes.components.embedding import PreparedShardedEmbedding
 from hyperflare_recipes.components.expert_overlap import ConcurrentSharedExpert
 from hyperflare_recipes.components.linear import UnquantizedProjection

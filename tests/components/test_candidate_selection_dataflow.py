@@ -36,7 +36,7 @@ def test_invocation_packets_preserve_score_bits_and_global_ids(implementation):
 @pytest.mark.parametrize("world,rows", [(8, 128), (16, 128), (16, 127)])
 def test_gathered_owner_packets_restore_exact_rows(monkeypatch, world, rows):
     from types import SimpleNamespace
-    from ignition.components import collectives
+    from hyperflare_recipes.components import collectives
     from hyperflare_recipes.components.row_ownership import PreparedGatheredRows
 
     owned = -(-rows // world)

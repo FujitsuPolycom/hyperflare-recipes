@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from b12x.attention import dense_mla
 
-from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedChunkedAllGather
 from hyperflare_recipes.components.head_exchange import PreparedLseReduceScatter
 from hyperflare_recipes.components.dense_mla import PreparedDenseMLA
 from hyperflare_recipes.components.linear import BatchedUnquantizedProjection

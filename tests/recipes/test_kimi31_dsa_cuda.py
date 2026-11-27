@@ -366,7 +366,7 @@ def _cache_barrier_peer_read_rank(rank, rendezvous, world, rows):
 
     import torch.distributed as dist
 
-    from ignition.components.collectives import PreparedAllGather
+    from hyperflare_recipes.components.collectives import PreparedAllGather
     from hyperflare_recipes.components.peer_record_gather import PreparedPeerRecordGather
     from ignition.preparation.collectives import CollectivePreparation
     from hyperflare_recipes.components.head_exchange import create_head_exchange

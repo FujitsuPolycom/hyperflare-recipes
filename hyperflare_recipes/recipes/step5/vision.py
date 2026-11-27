@@ -12,7 +12,7 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.models.step3p7.modeling_step3p7 import Step3p7VisionEncoderLayer
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.varlen_attention import PreparedVarlenAttention
 

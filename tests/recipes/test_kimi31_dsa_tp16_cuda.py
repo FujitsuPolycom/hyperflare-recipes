@@ -32,7 +32,7 @@ def _records(tokens):
 def _rank(rank, rendezvous):
     import torch.distributed as dist
     from b12x.attention import dense_mla
-    from ignition.components.collectives import PreparedAllGather, PreparedBroadcast
+    from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedBroadcast
     from hyperflare_recipes.components.head_exchange import PreparedLseReduceScatter
     from hyperflare_recipes.components.dense_mla import PreparedDenseMLA
     from hyperflare_recipes.components.row_topk import PreparedRowTopK

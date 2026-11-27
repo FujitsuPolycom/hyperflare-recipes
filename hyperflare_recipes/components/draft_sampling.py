@@ -556,7 +556,7 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
     def prepare_broadcast(self, *, runtime, session, coordinator, name, buffers=None):
         if runtime is None:
             return
-        from ignition.components.collectives import PreparedBroadcast
+        from hyperflare_recipes.components.collectives import PreparedBroadcast
 
         def allocate(shape, dtype):
             return (torch.zeros(shape, dtype=dtype, device=self.logits.device) if buffers is None
@@ -857,7 +857,7 @@ class PreparedDraftBlockBroadcast:
 
     def __init__(self, proposals, drafts, probabilities, valid, sampled, *, runtime,
                  session, coordinator, name):
-        from ignition.components.collectives import PreparedBroadcast
+        from hyperflare_recipes.components.collectives import PreparedBroadcast
 
         batch, depth = drafts.shape
         if not proposals or len(proposals) != depth or any(p.broadcast is not None for p in proposals):

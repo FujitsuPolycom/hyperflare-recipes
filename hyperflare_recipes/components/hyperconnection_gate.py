@@ -11,7 +11,7 @@ from b12x.gemm import hyperconnection_gate
 from b12x.norm.hyperconnection import api as hc
 from b12x.preparation import FrozenMapping, PreparedCall
 
-from ignition.components.collectives import PreparedChunkedAllReduce
+from hyperflare_recipes.components.collectives import PreparedChunkedAllReduce
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.fixtures import hyperconnection as hc_fixtures
 from hyperflare_recipes.fixtures.hyperconnection_gate import HyperconnectionGateInputs

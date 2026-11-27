@@ -86,8 +86,8 @@ def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False
     from hyperflare_recipes.components.parallel_draft import prepare_sampling_broadcasts
     from ignition.components.sampling import DeviceRequestState, RequestAdmission
     from hyperflare_recipes.components.speculation import PreparedStochasticVerification, SpeculativeAcceptance, SpeculativeRngState
-    from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
-                                                create_result_broadcast_runtime)
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_gather_runtime, create_result_broadcast_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.graphs import PreparedGraphBundle
     from ignition.preparation.tuning import RecordedPreparationSession
@@ -271,8 +271,9 @@ def test_native_sampling_divergent_support_tp2(tmp_path, result_channel):
 
 
 def _byte_rank(rank, world, rendezvous):
-    from ignition.components.collectives import PreparedBroadcast
-    from ignition.preparation.collectives import CollectivePreparation, create_result_broadcast_runtime
+    from hyperflare_recipes.components.collectives import PreparedBroadcast
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_result_broadcast_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.graphs import PreparedGraphBundle
     from ignition.preparation.tuning import RecordedPreparationSession

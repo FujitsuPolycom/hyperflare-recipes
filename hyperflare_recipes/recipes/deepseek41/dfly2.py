@@ -27,7 +27,7 @@ from hyperflare_recipes.components.embedding import PreparedEmbedding
 from hyperflare_recipes.components.linear import prepare_projection
 from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from ignition.components.state import gather_rows, gather_rows_three, save_hidden
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tensor_metadata import record_numeric_tensor

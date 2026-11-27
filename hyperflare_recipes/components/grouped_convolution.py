@@ -56,7 +56,7 @@ class PreparedGroupedConvolution:
         self.gather = None
         local = self.coefficients
         if runtime is not None:
-            from ignition.components.collectives import PreparedChunkedAllGather
+            from hyperflare_recipes.components.collectives import PreparedChunkedAllGather
 
             if "local_coefficients" not in buffers:
                 buffers["local_coefficients"] = torch.zeros((capacity, channels // runtime.world_size),

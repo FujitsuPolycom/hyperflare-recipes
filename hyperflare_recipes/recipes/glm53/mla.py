@@ -404,7 +404,7 @@ class PreparedGlmMLA:
                 self.slices.append((start, end, absorb, attention, expand))
             return
         # Each slice gathers every rank's query heads, attends to local records, and keeps this rank's heads.
-        from ignition.components.collectives import PreparedAllGather
+        from hyperflare_recipes.components.collectives import PreparedAllGather
         from hyperflare_recipes.components.head_exchange import PreparedLseReduceScatter
 
         self.slices = []

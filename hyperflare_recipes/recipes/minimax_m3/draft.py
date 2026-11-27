@@ -13,7 +13,7 @@ from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import (
     MiniMaxM3VLRMSNorm,
 )
 
-from ignition.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather
 from hyperflare_recipes.components.embedding import PreparedEmbedding, PreparedShardedEmbedding
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.mlp import MLPScratch, PreparedMLP

@@ -20,10 +20,8 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1"
 @torch.no_grad()
 def _rank(rank, world, rendezvous, vocab, indexed=False, output_dtype=torch.bfloat16, prefix=None):
     from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
-    from ignition.preparation.collectives import (
-        CollectivePreparation,
-        create_all_gather_runtime,
-    )
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_gather_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.execution import GraphSignature, PreparedExecution
     from ignition.preparation.tuning import RecordedPreparationSession

@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ignition.components.collectives import (
+from hyperflare_recipes.components.collectives import (
     ConcurrentAllGather,
     ConcurrentGatherShards,
     PreparedAllGather,

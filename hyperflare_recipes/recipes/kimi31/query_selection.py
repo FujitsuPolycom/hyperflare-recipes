@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ignition.components.collectives import PreparedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather
 from hyperflare_recipes.components.fp8_indexer import PreparedFP8Indexer
 from hyperflare_recipes.components.planar_index_history import PreparedPlanarIndexHistory, global_index_pages
 

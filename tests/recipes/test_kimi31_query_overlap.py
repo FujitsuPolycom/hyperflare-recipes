@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ignition.components import collectives
+from hyperflare_recipes.components import collectives
 from ignition.preparation.scratch import ScratchArena
 from hyperflare_recipes.recipes.kimi31 import attention, indexer
 from hyperflare_recipes.recipes.kimi31.dcp import ContextShards, TOPK, RECORD_BYTES

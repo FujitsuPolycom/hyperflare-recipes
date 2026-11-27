@@ -43,7 +43,7 @@ from b12x.attention.qsa._kernels import (
 )
 from b12x.preparation import PreparedCall
 
-from ignition.components.collectives import PreparedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.scratch import ScratchArena, planned_scratch, prime_owners
 from ignition.preparation.tuning import declare, register_finalizer

@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 from b12x.comm.pcie import _owner_preparation
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from ignition.preparation.tuning import declare, register_finalizer
 
 _OWNERS = weakref.WeakValueDictionary()
@@ -182,7 +182,7 @@ class PreparedGatheredRows:
                 and 0 < source.nbytes // packet_bytes <= runtime.max_batch_size)
 
     def __init__(self, source, output, *, runtime, session, coordinator, name, buffers):
-        from ignition.components.collectives import PreparedAllGather
+        from hyperflare_recipes.components.collectives import PreparedAllGather
 
         self.source, self.output = source, output
         self.rows, self.columns = output.shape

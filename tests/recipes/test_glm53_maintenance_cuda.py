@@ -25,10 +25,8 @@ def _run(rank, world, rendezvous=None):
         RequestAdmission,
     )
     from ignition.components.state_transfer import PreparedStateTransfer, StateCommands
-    from ignition.preparation.collectives import (
-        CollectivePreparation,
-        create_all_reduce_runtime,
-    )
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from ignition.preparation.graphs import PreparedGraphBundle
     from ignition.preparation.tuning import RecordedPreparationSession
     from hyperflare_recipes.recipes.glm53.batch import BatchInputs

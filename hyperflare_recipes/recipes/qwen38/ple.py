@@ -359,10 +359,13 @@ class PreparedPLE:
         sequences = metadata.query_start_loc.numel() - 1
         caps = _caps(table.config, self.device, self.tokens, sequences,
                      rank=table.layout.caps.tp_rank, world_size=table.layout.caps.tp_size)
+        from hyperflare_recipes.components.collectives import readiness_barrier
         from ignition.components.ngram_delivery import PreparedPLELookup
 
         self.embedding_lookup = PreparedPLELookup(table, metadata, scratch.embedding, caps,
-            session=session, name=f"{name}.embedding", runtime=runtime, coordinator=coordinator)
+            session=session, name=f"{name}.embedding",
+            barrier=readiness_barrier(self.device, runtime=runtime, session=session,
+                                      coordinator=coordinator, name=f"{name}.embedding.readiness"))
         self.embedding_output = scratch.embedding
         self.key_projection = UnquantizedProjection(
             self.embedding_output,

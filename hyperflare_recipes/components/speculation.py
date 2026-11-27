@@ -516,7 +516,7 @@ class PreparedStochasticVerification:
         )
 
     def prepare_broadcast(self, **kwargs):
-        from ignition.components.collectives import PreparedBroadcast
+        from hyperflare_recipes.components.collectives import PreparedBroadcast
 
         self.broadcast = PreparedBroadcast(tuple(vars(self.output).values()), **kwargs)
 

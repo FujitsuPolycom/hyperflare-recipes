@@ -10,7 +10,7 @@ import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, rotate_half
 
 from hyperflare_recipes.components.candidate_selector import PreparedCandidateSelector
-from ignition.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather
 from hyperflare_recipes.components.embedding import PreparedShardedEmbedding
 from hyperflare_recipes.components.grouped_convolution import PreparedGroupedConvolution
 from hyperflare_recipes.components.linear import prepare_projection

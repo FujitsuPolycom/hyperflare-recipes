@@ -16,9 +16,10 @@ pytestmark = pytest.mark.skipif(os.getenv("FLARE_RUN_TP_CUDA_TESTS") != "1",
 
 
 def _rank(rank, world, rendezvous):
-    from ignition.components.collectives import PreparedAllReduce, PreparedAllReduceAdd, WeightedGroupSource
+    from hyperflare_recipes.components.collectives import PreparedAllReduce, PreparedAllReduceAdd, WeightedGroupSource
     from hyperflare_recipes.components.rms_norm import PreparedIndexedRMSNorm, PreparedRMSNorm
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession

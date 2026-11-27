@@ -5,7 +5,7 @@
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduceRMSNorm
+from hyperflare_recipes.components.collectives import PreparedAllReduceRMSNorm
 from hyperflare_recipes.components.embedding import PreparedShardedEmbedding
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.paged_batch import Metadata

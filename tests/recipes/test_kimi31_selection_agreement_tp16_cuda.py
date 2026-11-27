@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(os.environ.get('FLARE_RUN_TP_CUDA_TESTS') != '1'
 class MergePipeline:
     def __init__(self, rows, rank, runtime, session, coordinator, buffers, *, ordered):
         from hyperflare_recipes.components.candidate_rows import PreparedCandidateRows
-        from ignition.components.collectives import PreparedAllGather, PreparedBroadcast
+        from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedBroadcast
         from hyperflare_recipes.components.ordered_row_topk import PreparedOrderedRowTopK
         from hyperflare_recipes.components.row_topk import PreparedRowTopK
         from hyperflare_recipes.recipes.kimi3.dcp import ContextShards

@@ -9,7 +9,7 @@ from b12x.preparation import PreparedCall
 from b12x.sequence import embedding
 
 from ignition.preparation.tuning import declare
-from ignition.components.collectives import PreparedChunkedAllGather
+from hyperflare_recipes.components.collectives import PreparedChunkedAllGather
 
 
 class PreparedEmbedding:

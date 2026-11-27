@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 from torch.fx.experimental.proxy_tensor import get_proxy_mode
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.draft_sampling import PreparedDraftDistribution
 from hyperflare_recipes.components.recurrent import DeltaMetadata, DeltaState
 from hyperflare_recipes.components.speculation import (

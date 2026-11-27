@@ -144,7 +144,7 @@ def test_remote_capacities_follow_thirty_two_requests_and_8192_token_chunks(monk
 @pytest.mark.parametrize("drafting", [False, True])
 @pytest.mark.parametrize("chain", [False, True])
 def test_remote_channels_share_one_roce_runtime_without_pcie(monkeypatch, drafting, chain):
-    from ignition.components.collectives import packed_broadcast_layout
+    from hyperflare_recipes.components.collectives import packed_broadcast_layout
     from hyperflare_recipes.components.vocabulary_logprobs import _SUMMARY
     from hyperflare_recipes.components.vocabulary_sampling import SUMMARY_WORDS
 

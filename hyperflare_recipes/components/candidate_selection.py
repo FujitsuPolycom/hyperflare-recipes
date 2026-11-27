@@ -7,7 +7,7 @@ import torch
 from ignition.preparation.tuning import register_finalizer
 
 from .candidate_rows import PreparedCandidateRows
-from ignition.components.collectives import PreparedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather
 from .ordered_row_topk import PreparedOrderedRowTopK
 from .owner_topk import PreparedOwnerTopK
 from .published_candidates import PreparedPublishedTopK

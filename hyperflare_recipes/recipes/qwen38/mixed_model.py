@@ -91,7 +91,9 @@ class PreparedMixedRound:
             self.prompt_sampler.prepare()
             result_runtime = (owner.collectives["vocabulary_runtime"]
                               if getattr(owner, "result_runtime", None) is None else owner.result_runtime)
-            self.prompt_sampler.prepare_broadcast(runtime=result_runtime,
+            from hyperflare_recipes.components.collectives import prepare_sampling_broadcast
+
+            prepare_sampling_broadcast(self.prompt_sampler, runtime=result_runtime,
                 session=owner.session, coordinator=owner.collectives["coordinator"], name=name + ".prompt.sampling")
             return SimpleNamespace(scratch=decode_scratch, forward=self.decoder)
 
@@ -121,7 +123,9 @@ class PreparedMixedRound:
             self.decode_sampler.prepare()
             result_runtime = (owner.collectives["vocabulary_runtime"]
                               if getattr(owner, "result_runtime", None) is None else owner.result_runtime)
-            self.decode_sampler.prepare_broadcast(runtime=result_runtime,
+            from hyperflare_recipes.components.collectives import prepare_sampling_broadcast
+
+            prepare_sampling_broadcast(self.decode_sampler, runtime=result_runtime,
                 session=owner.session, coordinator=owner.collectives["coordinator"], name=name + ".decode.sampling")
 
     def functional(self, *, session):

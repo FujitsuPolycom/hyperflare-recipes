@@ -23,7 +23,7 @@ class SelectedHistory:
                  runtime, coordinator, session, arena, device, name="fixture"):
         from b12x.attention import dense_mla
         from hyperflare_recipes.components.dense_mla import PreparedDenseMLA
-        from ignition.components.collectives import PreparedAllReduce
+        from hyperflare_recipes.components.collectives import PreparedAllReduce
         from hyperflare_recipes.components.interleaved_history import PreparedInterleavedHistory
         from hyperflare_recipes.components.peer_record_gather import PreparedPeerRecordGather
         from hyperflare_recipes.recipes.kimi3.dcp import ContextShards
@@ -162,7 +162,8 @@ def _benchmark_rank(rank, rendezvous, destination, pairs, seeds):
     runtime_patches.apply()
     import torch.distributed as dist
     from hyperflare_recipes.components.shared_pages import SharedPages
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena

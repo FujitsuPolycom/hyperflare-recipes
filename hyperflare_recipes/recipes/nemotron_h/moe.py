@@ -9,7 +9,7 @@ from hyperflare_recipes.components.expert_overlap import ConcurrentSharedExpert
 from hyperflare_recipes.components.linear import UnquantizedProjection, prepare_projection
 from hyperflare_recipes.components.mlp import PreparedUngatedMLP
 from hyperflare_recipes.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.examples import declaration_tensor

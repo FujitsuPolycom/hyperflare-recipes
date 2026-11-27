@@ -17,8 +17,9 @@ pytestmark = pytest.mark.skipif(os.getenv("FLARE_RUN_TP_CUDA_TESTS") != "1",
 
 def _persistent_rows_rank(rank, world, rendezvous):
     from b12x.comm.pcie.pcie_oneshot import _eager_storage_shards
-    from ignition.components.collectives import PreparedAllReduceRMSNorm
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from hyperflare_recipes.components.collectives import PreparedAllReduceRMSNorm
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
 
@@ -113,7 +114,8 @@ def _layer_handoff_rank(rank, world, rendezvous):
     from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import (
         MiniMaxM3VLDecoderLayer, MiniMaxM3VLRMSNorm,
     )
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
     from hyperflare_recipes.recipes.minimax_m3.decoder import PreparedDecoderLayer

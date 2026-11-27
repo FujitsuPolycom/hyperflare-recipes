@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import torch
 
 from hyperflare_recipes.components.causal_convolution import PreparedCausalConvolution
-from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllReduce, _roce
+from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedChunkedAllReduce, _roce
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.rms_norm import PreparedTorchRMSNorm
 from hyperflare_recipes.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch

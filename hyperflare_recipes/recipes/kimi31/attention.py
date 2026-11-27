@@ -8,7 +8,7 @@ from typing import NamedTuple
 import torch
 from b12x.attention import dense_mla
 
-from ignition.components.collectives import ConcurrentAllGather, PreparedAllGather
+from hyperflare_recipes.components.collectives import ConcurrentAllGather, PreparedAllGather
 from hyperflare_recipes.components.head_exchange import PreparedLseReduceScatter
 from hyperflare_recipes.components.dense_mla import PreparedDenseMLA
 from hyperflare_recipes.components.peer_record_gather import PreparedPeerRecordGather

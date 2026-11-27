@@ -12,15 +12,11 @@ import triton
 import triton.language as tl
 from b12x.preparation import PreparedCall
 
-from ignition.components.collectives import (
-    ConcurrentAllGather, ConcurrentAllReduce, ConcurrentGatherShards, ConcurrentReduceScatter,
-    PreparedAllGather, PreparedAllReduce, PreparedChunkedGatherShards, PreparedGatherShards,
-    PreparedReduceScatter, row_shard_surfaces,
+from hyperflare_recipes.components.collectives import (
+    ConcurrentAllGather, ConcurrentAllReduce, ConcurrentAllToAll, ConcurrentGatherShards,
+    ConcurrentReduceScatter, PreparedAllGather, PreparedAllReduce, PreparedChunkedGatherShards,
+    PreparedGatherShards, PreparedReduceScatter, row_shard_surfaces,
 )
-try:
-    from ignition.components.collectives import ConcurrentAllToAll
-except ImportError:
-    ConcurrentAllToAll = None
 from hyperflare_recipes.components.embedding import PreparedEmbedding
 from hyperflare_recipes.components.expert_overlap import ConcurrentSharedExpert
 from hyperflare_recipes.components.ring_commit import PreparedRingCommit

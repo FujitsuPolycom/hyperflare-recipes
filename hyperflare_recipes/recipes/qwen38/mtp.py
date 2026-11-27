@@ -209,7 +209,7 @@ class PreparedMTP:
             session=session, name=f"{name}.attn_combine_norm")
         self.reductions = ()
         if runtime is not None:
-            from ignition.components.collectives import PreparedAllReduce
+            from hyperflare_recipes.components.collectives import PreparedAllReduce
 
             self.reductions = tuple(PreparedAllReduce(value, scratch.hidden, runtime=runtime,
                 session=session, coordinator=coordinator, name=f"{name}.{label}_reduce")

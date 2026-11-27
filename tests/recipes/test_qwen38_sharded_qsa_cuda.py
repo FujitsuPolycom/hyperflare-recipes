@@ -110,7 +110,8 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
         QSAState,
     )
     from ignition.preparation.aot import ForwardCache
-    from ignition.preparation.collectives import CollectivePreparation, create_all_gather_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_gather_runtime
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
 

@@ -21,7 +21,8 @@ def worker(rank, rendezvous, output, rows_catalog=(8, 7, 6, 5, 4, 3, 2, 1), worl
     from hyperflare_recipes.components.candidate_selection import PreparedCandidateSelection, CandidateSelectionForward
     from hyperflare_recipes.components.published_candidates import PublishedCandidateStorage
     from ignition.preparation.capture import capture_forwards
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from hyperflare_recipes.components.head_exchange import create_head_exchange
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.core_storage import CoreStorage

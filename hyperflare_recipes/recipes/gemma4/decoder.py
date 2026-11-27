@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import math
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.embedding import PreparedEmbedding
 from hyperflare_recipes.components.paged_resume import PreparedResume
 from hyperflare_recipes.components.parallel import TensorParallelShard

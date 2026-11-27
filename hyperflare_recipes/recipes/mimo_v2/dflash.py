@@ -10,7 +10,7 @@ from functools import partial
 import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RMSNorm
 
-from ignition.components.collectives import PreparedAllGather, PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedAllReduce
 from hyperflare_recipes.components.embedding import PreparedEmbedding
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.mlp import MLPScratch, PreparedMLP

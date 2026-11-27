@@ -21,7 +21,7 @@ def _rank(rank, world_size, rendezvous, rows, uneven=False):
     from b12x.comm.pcie import AllReduce
     from b12x.preparation import PreparationSession
 
-    from ignition.components.collectives import PreparedAllReduce
+    from hyperflare_recipes.components.collectives import PreparedAllReduce
     from hyperflare_recipes.components.linear import UnquantizedProjection
     from ignition.preparation.collectives import CollectivePreparation
     from ignition.preparation.compilation import compile_forward
@@ -142,7 +142,7 @@ def test_rank_local_projection_between_collectives(world_size, tmp_path):
 def _chunked_rank(rank, world_size, rendezvous, rows, capacity):
     from b12x.comm.pcie import AllReduce
 
-    from ignition.components.collectives import PreparedChunkedAllReduce
+    from hyperflare_recipes.components.collectives import PreparedChunkedAllReduce
     from ignition.preparation.collectives import CollectivePreparation
     from ignition.preparation.tuning import RecordedPreparationSession
 
@@ -184,8 +184,9 @@ def test_chunked_all_reduce_reduces_rows_beyond_the_channel_capacity(world_size,
 
 
 def _chunked_gather_rank(rank, world_size, rendezvous, rows, capacity):
-    from ignition.components.collectives import PreparedChunkedAllGather
-    from ignition.preparation.collectives import CollectivePreparation, create_all_gather_runtime
+    from hyperflare_recipes.components.collectives import PreparedChunkedAllGather
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_gather_runtime
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)

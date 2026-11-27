@@ -10,7 +10,7 @@ import triton.language as tl
 from ignition.preparation.triton import launch_triton, prepare_triton
 from ignition.preparation.persistent import persistent_copy
 
-from ignition.components.collectives import PreparedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather
 from ignition.components.completion import (
     LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS, MAX_LOGPROB_TOKEN_IDS,
     MAX_TOP_LOGPROBS, validate_completion_buffers,

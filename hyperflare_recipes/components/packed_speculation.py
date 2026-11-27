@@ -14,7 +14,7 @@ from dataclasses import replace
 import torch
 
 from .causal_prefix import PreparedCausalPrefixAllocation
-from ignition.components.collectives import PreparedAllReduce, PreparedBroadcast
+from hyperflare_recipes.components.collectives import PreparedAllReduce, PreparedBroadcast
 from .split_draft import PreparedDraftConfidence
 
 

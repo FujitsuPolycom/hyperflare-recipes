@@ -14,7 +14,7 @@ import torch
 from b12x.attention import dense_mla
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
 
-from ignition.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather
 from hyperflare_recipes.components.head_exchange import PreparedLseReduceScatter
 from hyperflare_recipes.components.dense_mla import PreparedDenseMLA
 from hyperflare_recipes.components.embedding import PreparedShardedEmbedding

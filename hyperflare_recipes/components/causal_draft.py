@@ -5,7 +5,7 @@
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.draft_sampling import PreparedDraftDistribution
 from hyperflare_recipes.components.paged_batch import Metadata, PreparedBatch
 from hyperflare_recipes.components.speculation import (

@@ -17,7 +17,7 @@ from ignition.preparation.scratch import bind_scratch
 from ignition.preparation.triton import launch_triton, prepare_triton
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tensor_metadata import record_numeric_tensor
-from ignition.components.collectives import PreparedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather
 from .markov_sampling import _row_live, _token_noise, _transition_bias, RowScaledFP8MarkovWeight
 from .speculation import SpeculativeAcceptance, TARGET_RNG_DOMAIN, _geometry, _metadata, _tensor
 

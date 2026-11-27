@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from ignition.preparation.triton import prepare_triton
 

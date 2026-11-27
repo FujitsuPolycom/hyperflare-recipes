@@ -22,7 +22,7 @@ WORLD, WIDTH, TOPK = 16, 32768, 2048
 class FoldBroadcast:
     def __init__(self, rows, *, compact, device, session, runtime, coordinator):
         from hyperflare_recipes.components.candidate_rows import PreparedCandidateRows
-        from ignition.components.collectives import PreparedBroadcast
+        from hyperflare_recipes.components.collectives import PreparedBroadcast
         from hyperflare_recipes.components.row_topk import PreparedRowTopK
         from hyperflare_recipes.recipes.kimi31.indexer import SharedBuffers
 
@@ -73,8 +73,9 @@ def rank_main(rank, rendezvous, args):
     from ignition import runtime_patches
     runtime_patches.apply()
     import torch.distributed as dist
-    from ignition.components.collectives import PreparedAllReduce
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from hyperflare_recipes.components.collectives import PreparedAllReduce
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from hyperflare_recipes.components.head_exchange import create_head_exchange
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.core_storage import CoreStorage

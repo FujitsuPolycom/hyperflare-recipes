@@ -1463,7 +1463,7 @@ class PreparedDraftTokenBroadcast:
     """Broadcast proposal IDs and validity while preserving rank-local full q."""
 
     def __init__(self, tokens, valid, sampled, *, runtime, session, coordinator, name):
-        from ignition.components.collectives import PreparedBroadcast
+        from hyperflare_recipes.components.collectives import PreparedBroadcast
 
         self.broadcast = PreparedBroadcast((tokens, valid), runtime=runtime, session=session,
             coordinator=coordinator, name=name).functional(session=session)

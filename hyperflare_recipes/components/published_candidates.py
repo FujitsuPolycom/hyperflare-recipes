@@ -5,7 +5,7 @@
 import torch
 
 from hyperflare_recipes.components.candidate_rows import PreparedCandidateRows
-from ignition.components.collectives import PreparedAllReduce, _all_reduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce, _all_reduce
 from hyperflare_recipes.components.ordered_row_topk import PreparedOrderedRowTopK
 from hyperflare_recipes.components.peer_record_gather import PreparedPeerRecordGather
 from hyperflare_recipes.components.row_ownership import PreparedGatheredRows

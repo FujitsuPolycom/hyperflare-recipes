@@ -9,7 +9,7 @@ test suites for [Flare](https://github.com/NVIDIA/hyperflare-inference)
 The core engine repository (`NVIDIA/hyperflare-inference`) owns the Helios Rust
 serving runtime (`helios/`), the `flare` and `flare-cli` serving binaries, the
 `flare_heliopause` extension (`heliopause/`), and the recipe-free `ignition`
-preparation library and CLI runner (`ignition/`), including the 13 Helios-ABI
+preparation library and CLI runner (`ignition/`), including the 12 Helios-ABI
 interface modules in `ignition/components/`. This repository depends on
 `ignition[prepare]` from `NVIDIA/hyperflare-inference`, houses the model recipes
 in `hyperflare_recipes/recipes/`, reusable b12x/Triton model components in
@@ -293,7 +293,7 @@ violating them. Resolve architectural boundary issues before committing.
   attention, MLA, GDN, Mamba, head exchange, and speculative drafting belong
   there rather than being copied between recipes.
 - Core `ignition` (in `NVIDIA/hyperflare-inference`) remains completely
-  recipe-free. Only the 13 Helios-ABI interface modules live in core
+  recipe-free. Only the 12 Helios-ABI interface modules live in core
   `ignition/components/`. Never introduce model-name branches, recipe imports,
   or plugin discovery into core `ignition` or `helios`.
 - `PreparedContract`, which Helios decodes from the core's Protobuf

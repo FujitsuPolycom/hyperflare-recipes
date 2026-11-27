@@ -4,7 +4,7 @@
 
 """Collective text execution and request completion."""
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce, prepare_sampling_broadcast
 from ignition.components.sampling import PreparedSampling
 from ignition.components.state import save_hidden
 
@@ -51,7 +51,7 @@ class PreparedGeneration:
         self.completion = PreparedSampling(decoder.scratch.logits, *args, sample_enabled=b.sample_enabled[:rows])
         self.completion.prepare()
         if self.sample:
-            self.completion.prepare_broadcast(runtime=decoder.head.gather.runtime, session=session,
+            prepare_sampling_broadcast(self.completion, runtime=decoder.head.gather.runtime, session=session,
                 coordinator=coordinator, name=name + ".sampling")
         self.completion.functional(session=session)
         self.context = None

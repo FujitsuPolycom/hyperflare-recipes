@@ -324,7 +324,7 @@ class ConcurrentSharedExpert:
                             self.bound_encoded, self.encoding_offsets, self.quantizers)
 
     def finish(self, source, routed):
-        from ignition.components.collectives import WeightedGroupSource
+        from hyperflare_recipes.components.collectives import WeightedGroupSource
 
         if isinstance(routed, WeightedGroupSource):
             routed = routed.values

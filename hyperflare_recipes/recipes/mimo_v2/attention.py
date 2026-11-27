@@ -9,7 +9,7 @@ import math
 import torch
 
 from hyperflare_recipes.components.block_fp8 import BlockFP8Projection, BlockFP8Weight
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from hyperflare_recipes.components.window_attention import stage_windows, commit_window

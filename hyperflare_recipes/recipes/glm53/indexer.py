@@ -198,7 +198,7 @@ class PreparedGlmIndexer:
             *(selector.plan for selector in self.selectors if isinstance(selector, PreparedSparseIndexer)))
         self.gathers = ()
         if context is not None:
-            from ignition.components.collectives import PreparedAllGather
+            from hyperflare_recipes.components.collectives import PreparedAllGather
 
             columns, world = 1024, context.shards.world
             self.gathers = tuple(PreparedAllGather(scratch.candidates[start:end].view(torch.bfloat16).view(-1, 2 * columns),

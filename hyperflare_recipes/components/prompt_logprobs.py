@@ -11,7 +11,7 @@ import triton.language as tl
 
 from ignition.preparation.triton import launch_triton, prepare_triton
 
-from ignition.components.collectives import PreparedAllGather
+from hyperflare_recipes.components.collectives import PreparedAllGather
 from ignition.components.completion import MAX_TOP_LOGPROBS
 from .linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.logprobs import _sort_key, _sort_pair
@@ -263,7 +263,7 @@ class PromptScoring:
         self.rank = 0
         if group is not None:
             import torch.distributed as dist
-            from ignition.preparation.collectives import create_all_gather_runtime
+            from hyperflare_recipes.components.collectives import create_all_gather_runtime
 
             self.rank = dist.get_rank(group)
             if self.runtime is None:

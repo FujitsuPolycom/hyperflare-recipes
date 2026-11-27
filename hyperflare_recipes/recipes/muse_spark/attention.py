@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from hyperflare_recipes.components.window_attention import stage_windows, commit_window

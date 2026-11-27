@@ -7,7 +7,7 @@
 import torch
 from dataclasses import dataclass
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from ignition.components.sampling import PreparedSampling
 from ignition.components.state import save_hidden
 
@@ -48,7 +48,9 @@ class PreparedGeneration:
         self.completion = PreparedSampling(
             decoder.scratch.logits, *arguments, sample_enabled=b.sample_enabled[:rows])
         self.completion.prepare()
-        self.completion.prepare_broadcast(runtime=decoder.lm_head.gather.runtime, session=session,
+        from hyperflare_recipes.components.collectives import prepare_sampling_broadcast
+
+        prepare_sampling_broadcast(self.completion, runtime=decoder.lm_head.gather.runtime, session=session,
             coordinator=coordinator, name=name + ".sampling")
         self.validation.functional(session=session)
         self.completion.functional(session=session)

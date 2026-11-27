@@ -22,7 +22,7 @@ qualification drivers for preparing runtime cores served by
   blocks in `hyperflare_recipes/components/`.
 - **Keep core Flare small and recipe-free.** Core `ignition` in
   `NVIDIA/hyperflare-inference` owns preparation orchestration, planning,
-  export, and the 13 Helios-ABI component interfaces; Helios owns scheduling,
+  export, and the 12 Helios-ABI component interfaces; Helios owns scheduling,
   cache storage, and request handling.
 
 ## Repository layout

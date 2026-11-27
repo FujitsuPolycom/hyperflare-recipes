@@ -28,8 +28,8 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
-    create_all_reduce_runtime, create_dma_all_reduce_runtime, create_roce_runtime)
+from ignition.preparation.collectives import CollectivePreparation, create_roce_runtime
+from hyperflare_recipes.components.collectives import create_all_gather_runtime, create_all_reduce_runtime, create_dma_all_reduce_runtime
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from hyperflare_recipes.fixtures.recurrent import register_benchmark_state

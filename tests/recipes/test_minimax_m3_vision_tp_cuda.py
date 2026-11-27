@@ -114,10 +114,8 @@ def _rank(rank, rendezvous, snapshot):
     )
     from hyperflare_recipes.components.parallel import TensorParallelShard
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-    from ignition.preparation.collectives import (
-        CollectivePreparation,
-        create_dma_all_reduce_runtime,
-    )
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_dma_all_reduce_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession

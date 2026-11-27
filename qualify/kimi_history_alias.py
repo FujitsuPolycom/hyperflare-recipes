@@ -213,7 +213,8 @@ def worker(rank, rendezvous, checkpoint, config_path, maximum):
     from hyperflare_recipes.components.shared_pages import SharedPages
     from ignition.preparation.capture import capture_forwards
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from hyperflare_recipes.components.head_exchange import create_head_exchange
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.core_storage import CoreStorage

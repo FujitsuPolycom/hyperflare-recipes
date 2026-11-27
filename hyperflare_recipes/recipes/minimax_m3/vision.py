@@ -14,7 +14,7 @@ from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import (
     MiniMaxM3VLVisionRotaryEmbedding,
 )
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.varlen_attention import PreparedVarlenAttention
 from ignition.preparation.persistent import persistent_copy

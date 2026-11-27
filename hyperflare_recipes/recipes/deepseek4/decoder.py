@@ -9,7 +9,7 @@ from dataclasses import dataclass, fields
 import torch
 import torch.nn.functional as F
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.dspark import PreparedFeedbackCapture
 from hyperflare_recipes.components.embedding import PreparedEmbedding
 from hyperflare_recipes.components.expert_overlap import ConcurrentSharedExpert

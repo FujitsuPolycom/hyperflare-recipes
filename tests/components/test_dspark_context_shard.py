@@ -18,7 +18,7 @@ from hyperflare_recipes.recipes.deepseek41 import bootstrap
 from hyperflare_recipes.recipes.deepseek41.config import ModelConfig, QUALIFIED_ENCODER_SCHEDULE, TEXT_GEOMETRY
 from hyperflare_recipes.recipes.deepseek41.pool import ContinuationPool
 from hyperflare_recipes.recipes.deepseek41.weights import DSparkWeights, main_projection_partition
-from ignition.components import collectives
+from hyperflare_recipes.components import collectives
 from ignition.parameters import SpeculationParameters
 
 

@@ -70,7 +70,7 @@ class ProjectionRouting:
                  row_sharded, reduction, router_runtime, pair_runtime, session, coordinator,
                  buffers, name):
         from hyperflare_recipes.components.column_pair_gather import PreparedColumnPairGather
-        from ignition.components.collectives import PreparedChunkedAllGather, PreparedChunkedAllReduce
+        from hyperflare_recipes.components.collectives import PreparedChunkedAllGather, PreparedChunkedAllReduce
         from hyperflare_recipes.components.linear import UnquantizedProjection
         from hyperflare_recipes.components.moe import PreparedRouter, RouterScratch
 
@@ -126,7 +126,8 @@ def worker(rank, rendezvous, checkpoint, destination, policy):
     import torch.distributed as dist
     from hyperflare_recipes.components.parallel import TensorParallelShard
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-    from ignition.preparation.collectives import CollectivePreparation, create_all_gather_runtime, create_all_reduce_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_gather_runtime, create_all_reduce_runtime
     from hyperflare_recipes.components.head_exchange import create_head_exchange
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.tuning import RecordedPreparationSession

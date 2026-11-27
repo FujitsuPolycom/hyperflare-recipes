@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from ignition.preparation.persistent import persistent_copy
 from .draft_sampling import DRAFT_CANDIDATES, PreparedDraftDistribution, PreparedDraftBlockBroadcast
 from .paged_batch import Metadata, prepare_batch, row_rotary_offsets

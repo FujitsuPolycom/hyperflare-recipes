@@ -42,10 +42,10 @@ def test_result_broadcast_channel_uses_captured_payloads(
         monkeypatch, batches, offsets, payload_bytes, transport_rows):
     import torch
 
+    from hyperflare_recipes.components import collectives
+    from hyperflare_recipes.components.collectives import packed_broadcast_layout
     from hyperflare_recipes.components.draft_sampling import PreparedDraftDistribution
-    from ignition.components.collectives import packed_broadcast_layout
     from hyperflare_recipes.components.speculation import SpeculativeAcceptance
-    from ignition.preparation import collectives
 
     catalog = SimpleNamespace(batch_capacities=batches, request_capacity=64)
     batch = max(catalog.batch_capacities)
@@ -73,7 +73,7 @@ def test_result_broadcast_channel_uses_captured_payloads(
 
 @pytest.mark.parametrize("layouts", [(), ({},)])
 def test_result_broadcast_channel_rejects_empty_payloads(layouts):
-    from ignition.preparation.collectives import create_result_broadcast_runtime
+    from hyperflare_recipes.components.collectives import create_result_broadcast_runtime
 
     with pytest.raises(ValueError, match="nonempty payload layouts"):
         create_result_broadcast_runtime(object(), object(), layouts=layouts)
@@ -450,7 +450,7 @@ def test_differing_tuning_races_report_bounded_counts_and_release_job(monkeypatc
 
 def test_create_all_reduce_runtime_uses_static_pcie_channel(monkeypatch):
     from b12x.comm.pcie import AllReduce
-    from ignition.preparation.collectives import create_all_reduce_runtime
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
 
     calls = []
     result, group, device, ipc = object(), object(), object(), object()

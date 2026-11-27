@@ -13,7 +13,7 @@ import triton.language as tl
 from b12x.attention.dsa_indexer import glm_pool
 from flashinfer.triton.norm import rms_norm, rms_norm_add_residual
 
-from ignition.components.collectives import PreparedAllReduce, PreparedAllReduceRMSNorm
+from hyperflare_recipes.components.collectives import PreparedAllReduce, PreparedAllReduceRMSNorm
 from hyperflare_recipes.components.embedding import PreparedEmbedding
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection

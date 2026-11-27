@@ -7,7 +7,7 @@ import math
 from typing import NamedTuple
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.linear import QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from hyperflare_recipes.components.parallel import TensorParallelShard

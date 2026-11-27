@@ -361,7 +361,7 @@ def test_qwen38_decoder_routes_ple_barrier_to_barrier_runtime(monkeypatch):
     import hyperflare_recipes.recipes.qwen38.hyperconnection as hc_mod
     import hyperflare_recipes.recipes.qwen38.moe as moe_mod
     import hyperflare_recipes.recipes.qwen38.ple as ple_mod
-    import ignition.components.collectives as collectives_mod
+    import hyperflare_recipes.components.collectives as collectives_mod
 
     seen = {"hc": [], "reduce": [], "ple": [], "attn": []}
 
@@ -498,7 +498,7 @@ def _build_stub_decoder_env(monkeypatch, *, tokens=4096, rows=1, mode="prefill",
     import hyperflare_recipes.recipes.qwen38.hyperconnection as hc_mod
     import hyperflare_recipes.recipes.qwen38.moe as moe_mod
     import hyperflare_recipes.recipes.qwen38.ple as ple_mod
-    import ignition.components.collectives as collectives_mod
+    import hyperflare_recipes.components.collectives as collectives_mod
     import ignition.components.sampling as sampling_mod
 
     events = {"combine_norm": [], "completion": 0, "sampling": 0, "rope_delta": 0, "hidden": 0, "residual": 0}
@@ -539,14 +539,16 @@ def _build_stub_decoder_env(monkeypatch, *, tokens=4096, rows=1, mode="prefill",
             events["completion"] += 1
 
     class DummySampling:
+        broadcast_tensors = ()
+
         def __init__(self, *args, **kwargs):
             pass
 
         def prepare(self):
             events["sampling"] += 1
 
-        def prepare_broadcast(self, *args, **kwargs):
-            pass
+        def attach_broadcast(self, broadcast):
+            return broadcast
 
     monkeypatch.setattr(embedding_mod, "PreparedEmbedding", DummyOp)
     monkeypatch.setattr(hc_mod, "PreparedHyperconnection", DummyOp)
@@ -555,6 +557,7 @@ def _build_stub_decoder_env(monkeypatch, *, tokens=4096, rows=1, mode="prefill",
     monkeypatch.setattr(moe_mod, "PreparedQwenMoe", DummyOp)
     monkeypatch.setattr(ple_mod, "PreparedPLE", DummyOp)
     monkeypatch.setattr(collectives_mod, "PreparedAllReduce", DummyOp)
+    monkeypatch.setattr(collectives_mod, "PreparedBroadcast", DummyOp)
     monkeypatch.setattr(collectives_mod, "ConcurrentAllReduce", DummyOp)
     monkeypatch.setattr(vocab_mod, "PreparedVocabularyProjection", DummyOp)
     monkeypatch.setattr(linear_mod, "UnquantizedProjection", DummyOp)
@@ -846,13 +849,10 @@ def test_qualify_replay_floor_prefill_graph_name():
 def _tp2_dma_and_barrier_worker(rank, world, port, error_queue):
     import os
     import torch.distributed as dist
-    from ignition.components.collectives import PreparedAllReduce
+    from hyperflare_recipes.components.collectives import PreparedAllReduce
     from ignition.components.readiness import PreparedReadinessWait, wait_for_readiness
-    from ignition.preparation.collectives import (
-        CollectivePreparation,
-        create_all_reduce_runtime,
-        create_dma_all_reduce_runtime,
-    )
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime, create_dma_all_reduce_runtime
     from ignition.preparation.tuning import RecordedPreparationSession
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -878,15 +878,17 @@ def _tp2_dma_and_barrier_worker(rank, world, port, error_queue):
         )
         session.__enter__()
 
+        from hyperflare_recipes.components.collectives import readiness_barrier
         from ignition.components.readiness import ReadinessTimings
 
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         timings = ReadinessTimings.allocate(frame, 1)
         # Verify DmaAllReduce rejects the 16-byte PLE readiness barrier while PCIeAllReduce accepts it.
         with pytest.raises(ValueError, match="alignment"):
-            PreparedReadinessWait(timings, 0, runtime=dma_rt, session=session, coordinator=coordinator, name="bad")
+            readiness_barrier(device, runtime=dma_rt, session=session, coordinator=coordinator, name="bad")
         wait = PreparedReadinessWait(
-            timings, 0, runtime=pcie_rt, session=session, coordinator=coordinator, name="ple.readiness"
+            timings, 0,
+            barrier=readiness_barrier(device, runtime=pcie_rt, session=session, coordinator=coordinator, name="ple.readiness"),
         )
         source = torch.empty((1024, 2560), dtype=torch.bfloat16, device=device)
         output = torch.empty_like(source)

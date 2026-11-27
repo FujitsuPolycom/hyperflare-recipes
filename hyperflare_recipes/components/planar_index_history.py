@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 
 PAGE_BYTES = 64 * 132
 PAGE_WORDS = PAGE_BYTES // 4

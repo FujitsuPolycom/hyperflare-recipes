@@ -37,13 +37,8 @@ from ignition.preparation.contract import history_region
 from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation import runtime_core_pb2 as contract_proto
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-from ignition.preparation.collectives import (
-    CollectivePreparation,
-    create_all_gather_runtime,
-    create_all_reduce_runtime,
-    create_dma_all_reduce_runtime,
-    create_roce_runtime,
-)
+from ignition.preparation.collectives import CollectivePreparation, create_roce_runtime
+from hyperflare_recipes.components.collectives import create_all_gather_runtime, create_all_reduce_runtime, create_dma_all_reduce_runtime
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import release_unused
@@ -227,7 +222,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             gather_bytes = max(gather_rows * (152576 // shard.world_size) * 2,
                                tokens * (hidden // shard.world_size) * 2)
             if config.dflash:
-                from ignition.components.collectives import packed_broadcast_layout
+                from hyperflare_recipes.components.collectives import packed_broadcast_layout
                 from hyperflare_recipes.components.speculation import SpeculativeAcceptance
 
                 acceptance = SpeculativeAcceptance.broadcast_layout(max(config.batch_capacities), max(config.speculative_widths))

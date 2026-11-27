@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.mhc import MHCScratch, MHCWeights, PreparedMHC, PreparedMHCPost
 from hyperflare_recipes.components.mlp import MLPScratch, PreparedMLP
 

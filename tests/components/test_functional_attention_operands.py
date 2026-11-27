@@ -158,7 +158,7 @@ def test_compressor_join_carries_runtime_metadata_and_angles(monkeypatch, with_a
 
 
 def test_varlen_gather_source_alias_is_explicit(monkeypatch):
-    from ignition.components import collectives as module
+    from hyperflare_recipes.components import collectives as module
     op = object.__new__(module.PreparedVarlenGather)
     op.source = op.output = op.counts = torch.zeros(1)
     op.local_rank, op.handle = 1, 31
@@ -175,7 +175,7 @@ def test_varlen_gather_source_alias_is_explicit(monkeypatch):
 
 @pytest.mark.parametrize("compiled", [False, True])
 def test_fused_reduction_runtime_addends_and_residual_mutation(monkeypatch, compiled):
-    from ignition.components import collectives as module
+    from hyperflare_recipes.components import collectives as module
     op = object.__new__(module.PreparedAllReduceRMSNorm)
     op.output = torch.empty(2, 4)
     op.residual = op.input_addend = op.group_weights = op.group_ids = torch.zeros(2, 4)

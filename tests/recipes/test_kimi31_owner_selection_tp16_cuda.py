@@ -60,10 +60,11 @@ def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128,
     runtime_patches.apply()
     import torch.distributed as dist
     from b12x.comm.pcie.pcie_dcp_topk import PCIeDCPTopKOwnerExchange
-    from ignition.components.collectives import PreparedAllReduce
+    from hyperflare_recipes.components.collectives import PreparedAllReduce
     from hyperflare_recipes.components import row_ownership
     from ignition.preparation.capture import capture_forwards
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from hyperflare_recipes.components.head_exchange import create_head_exchange
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.core_storage import CoreStorage

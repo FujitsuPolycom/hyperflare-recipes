@@ -450,7 +450,7 @@ class PreparedDecoder:
                 projection_workspace=workspaces, prefill=state.mode == "prefill")
             self.layers.append((attn_hc, attention, mlp_hc, moe))
             if self.pipelined_prefill:
-                from ignition.components.collectives import ConcurrentAllReduce, PreparedAllReduce
+                from hyperflare_recipes.components.collectives import ConcurrentAllReduce, PreparedAllReduce
 
                 att_reduce_0 = PreparedAllReduce(attention.scratch.output, layer_scratch.hidden,
                     runtime=runtime, session=session, coordinator=coordinator, name=f"{prefix}.attention_reduce.0")
@@ -473,7 +473,7 @@ class PreparedDecoder:
                         parallel_plans=_hc_plans(mlp_hc)),
                 ))
             elif runtime is not None:
-                from ignition.components.collectives import PreparedAllReduce
+                from hyperflare_recipes.components.collectives import PreparedAllReduce
 
                 self.reductions.append(tuple(PreparedAllReduce(value, scratch.hidden,
                     runtime=runtime, session=session, coordinator=coordinator, name=f"{prefix}.{label}_reduce")
@@ -544,7 +544,9 @@ class PreparedDecoder:
                     inputs.live_rows, completion, frame_index, submission_sequence,
                     sample_enabled=inputs.sample_enabled[:state.rows], workspace=sampling_workspace)
                 self.sampler.prepare()
-                self.sampler.prepare_broadcast(runtime=vocabulary_runtime if result_runtime is None else result_runtime,
+                from hyperflare_recipes.components.collectives import prepare_sampling_broadcast
+
+                prepare_sampling_broadcast(self.sampler, runtime=vocabulary_runtime if result_runtime is None else result_runtime,
                     session=session,
                     coordinator=coordinator, name=name + ".sampling")
             else:

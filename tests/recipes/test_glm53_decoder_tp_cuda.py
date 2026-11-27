@@ -21,10 +21,8 @@ def _rank(rank, world, rendezvous, snapshot, mode, capacity, layer_index, follow
     from hyperflare_recipes.components.parallel import TensorParallelShard
     from hyperflare_recipes.components.recurrent import DeltaMetadata, DeltaState
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-    from ignition.preparation.collectives import (
-        CollectivePreparation,
-        create_all_reduce_runtime,
-    )
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.execution import GraphSignature, PreparedExecution
     from ignition.preparation.scratch import ScratchArena

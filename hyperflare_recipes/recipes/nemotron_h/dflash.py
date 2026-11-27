@@ -18,7 +18,7 @@ from hyperflare_recipes.components.paged_attention import PreparedPagedAttention
 from hyperflare_recipes.components.projection_overlap import ConcurrentProjectionChain
 from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
 from hyperflare_recipes.components.speculation import SpeculativeRngState
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from ignition.components.state import save_hidden
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
 from hyperflare_recipes.components.window_attention import stage_windows

@@ -19,7 +19,8 @@ def _rank(rank, rendezvous, fp8):
     from ignition.components.sampling import DeviceRequestState, RUNNING
     from hyperflare_recipes.components.speculation import DRAFT_RNG_DOMAIN, SpeculativeRngState
     from hyperflare_recipes.components.vocabulary_sampling import PreparedVocabularySoftmax, PreparedVocabularyBlockVerification
-    from ignition.preparation.collectives import CollectivePreparation, create_all_gather_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_gather_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.graphs import PreparedGraphBundle
     from ignition.preparation.tuning import RecordedPreparationSession

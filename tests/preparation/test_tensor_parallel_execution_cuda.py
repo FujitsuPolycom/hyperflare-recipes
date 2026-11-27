@@ -32,7 +32,7 @@ class RankForward:
 
 
 def _rank(rank, world, rendezvous, sockets, fields, compilation):
-    from ignition.components.collectives import PreparedAllReduce
+    from hyperflare_recipes.components.collectives import PreparedAllReduce
     from hyperflare_recipes.components.parallel import TensorParallelShard
     from ignition.components.sampling import (
         AdmissionBuffers,
@@ -42,10 +42,8 @@ def _rank(rank, world, rendezvous, sockets, fields, compilation):
         PreparedSampling,
         RequestAdmission,
     )
-    from ignition.preparation.collectives import (
-        CollectivePreparation,
-        create_all_reduce_runtime,
-    )
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.execution import GraphSignature, PreparedExecution
     from ignition.preparation.tuning import RecordedPreparationSession
@@ -227,8 +225,9 @@ def test_native_rank_coordination(world, fields, compilation, tmp_path, monkeypa
 
 
 def _startup_rank(rank, world, rendezvous, sockets, fail_peer):
-    from ignition.components.collectives import PreparedAllReduce
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from hyperflare_recipes.components.collectives import PreparedAllReduce
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from ignition.preparation.execution import GraphSignature, PreparedExecution, TunedBinding, TuningGraph
     from ignition.preparation.tuning import RecordedPreparationSession
 

@@ -86,9 +86,10 @@ def _tp_worker(directory, member, connection, replicas=2, tensor_parallel=2, che
     from datetime import timedelta
     import torch
     import torch.distributed as dist
-    from ignition.components.collectives import PreparedAllReduce
+    from hyperflare_recipes.components.collectives import PreparedAllReduce
     from hyperflare_recipes.components.linear import UnquantizedProjection
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.preparation.tuning_replicas import TuningComplete, TuningReplica
     from b12x.preparation.session import PreparationJob

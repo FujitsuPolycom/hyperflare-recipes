@@ -28,14 +28,8 @@ from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.preparation.tuning import with_autotune_effort
 
 from hyperflare_recipes.components.parallel import TensorParallelShard
-from ignition.preparation.collectives import (
-    CollectivePreparation,
-    create_all_gather_runtime,
-    create_all_reduce_runtime,
-    create_dma_all_reduce_runtime,
-    create_result_broadcast_runtime,
-    create_roce_runtime,
-)
+from ignition.preparation.collectives import CollectivePreparation, create_roce_runtime
+from hyperflare_recipes.components.collectives import create_all_gather_runtime, create_all_reduce_runtime, create_dma_all_reduce_runtime, create_result_broadcast_runtime
 from ignition.components.capacity import speculative_token_capacity, batch_capacities, request_capacity, serving_modes
 from ignition.components.sampling import AdmissionBuffers
 from hyperflare_recipes.recipes.qwen38.checkpoint import inspect_qwen38_checkpoint
@@ -410,7 +404,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     PreparedDraftBlockBroadcast.broadcast_layout(slots_capacity, max_width - 1),
                 )
     if coordinator is not None and coordinator.spans_hosts:
-        from ignition.components.collectives import packed_broadcast_layout
+        from hyperflare_recipes.components.collectives import packed_broadcast_layout
 
         # Ranks on separate Sparks reduce and gather through one RoCEnante runtime: decode rows
         # one-shot, prefill chunks through the pipelined two-shot path.

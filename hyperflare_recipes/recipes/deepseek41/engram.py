@@ -17,11 +17,7 @@ from ignition.components.engram import EngramInputs, PreparedEngramLookup, Prepa
 from ignition.components.readiness import ReadinessTimings
 from hyperflare_recipes.components.embedding_partition import EmbeddingHeadPartition
 from hyperflare_recipes.components.linear import QuantizedProjection
-from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllReduce
-try:
-    from ignition.components.collectives import PreparedAllToAll
-except ImportError:
-    PreparedAllToAll = None
+from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedAllToAll, PreparedChunkedAllReduce
 from ignition.components.state import gather_rows, save_hidden
 from ignition.preparation.runtime_core import FileSource
 from ignition.preparation.persistent import persistent_copy
@@ -267,10 +263,15 @@ class PreparedEngram:
         for tensor, shape, dtype in checks:
             if tensor.shape != shape or tensor.dtype != dtype or tensor.device != device or not tensor.is_contiguous():
                 raise ValueError("Engram scratch must match the contiguous lookup and projection geometry")
+        from hyperflare_recipes.components.collectives import readiness_barrier
+
         lookup_output = self.local if self.compact_lookup else self.gathered
         self.lookup = PreparedEngramLookup(tables.inputs[layer], lookup_output, metadata.live_counts[:1],
             layer=layer, token_map=tables.token_map, geometry=tables.geometry,
-            session=session, name=name + ".lookup", runtime=tables.readiness_runtime, coordinator=coordinator).functional(session=session)
+            session=session, name=name + ".lookup",
+            barrier=readiness_barrier(device, runtime=tables.readiness_runtime, session=session,
+                                      coordinator=coordinator, name=name + ".lookup.readiness"),
+            world_size=tables.shard.world_size).functional(session=session)
         # For prefills >= 512 tokens on local PCIe DMA runtimes, gather the 6144-col
         # Engram activations first and run one full projection (`projection_full`).
         # Note: the full projection accumulates across all 24 heads in FP32 before a

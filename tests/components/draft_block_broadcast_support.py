@@ -74,7 +74,8 @@ def rank_main(rank, rendezvous, output):
     from hyperflare_recipes.components.parallel_draft import prepare_sampling_broadcasts
     from ignition.components.sampling import DeviceRequestState, RUNNING
     from hyperflare_recipes.components.speculation import DRAFT_RNG_DOMAIN
-    from ignition.preparation.collectives import CollectivePreparation, create_result_broadcast_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_result_broadcast_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.graphs import PreparedGraphBundle
     from ignition.preparation.tuning import RecordedPreparationSession

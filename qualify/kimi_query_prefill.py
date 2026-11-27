@@ -61,7 +61,7 @@ class BroadcastIndexSelection:
                  start, end, session, name, workspace):
         import torch
         from hyperflare_recipes.components.candidate_rows import PreparedCandidateRows
-        from ignition.components.collectives import PreparedAllGather, PreparedBroadcast
+        from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedBroadcast
         from hyperflare_recipes.components.fp8_indexer import PreparedFP8Indexer
         from hyperflare_recipes.components.row_topk import PreparedRowTopK
         from hyperflare_recipes.recipes.kimi31.indexer import SharedBuffers
@@ -241,7 +241,8 @@ def _worker(rank, rendezvous, checkpoint, destination, policy, compiled, maximum
     from hyperflare_recipes.components.dense_mla import PreparedDenseMLA
     from hyperflare_recipes.components.fp8_indexer import write_fp8_index_keys
     from hyperflare_recipes.components.shared_pages import SharedPages
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from hyperflare_recipes.components.head_exchange import create_head_exchange
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.core_storage import CoreStorage

@@ -20,7 +20,8 @@ def _worker(rank, rendezvous):
     runtime_patches.apply()
     import torch.distributed as dist
     from ignition.preparation.capture import capture_forwards
-    from ignition.preparation.collectives import CollectivePreparation, create_varlen_gather_runtime
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_varlen_gather_runtime
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.tuning import RecordedPreparationSession
     from hyperflare_recipes.recipes.glm53.dcp import ContextParallel, ContextShards
@@ -185,8 +186,8 @@ def _model_worker(rank, rendezvous, snapshot, indexer_selects=False):
     from hyperflare_recipes.components.shared_pages import SharedPages
     from ignition.preparation.capture import capture_forwards
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-    from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
-        create_varlen_gather_runtime)
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_gather_runtime, create_varlen_gather_runtime
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession

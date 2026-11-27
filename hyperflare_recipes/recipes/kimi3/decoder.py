@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import torch
 import triton
 
-from ignition.components.collectives import (
+from hyperflare_recipes.components.collectives import (
     ConcurrentAllReduce,
     ConcurrentChunkedAllReduce,
     ConcurrentGatherShards,
@@ -63,7 +63,7 @@ def _is_dma_runtime(runtime):
 def _route_max_rows(runtime, config, world):
     if runtime is None:
         return 0
-    from ignition.components.collectives import _island_row_shard
+    from hyperflare_recipes.components.collectives import _island_row_shard
 
     if _is_dma_runtime(runtime):
         c = config.text
@@ -80,7 +80,7 @@ def _runtime_accepts_chunk(runtime, tensor):
     if runtime is None:
         return False
     from b12x.comm import pcie
-    from ignition.components.collectives import _roce
+    from hyperflare_recipes.components.collectives import _roce
 
     if _roce(runtime):
         return False
@@ -409,7 +409,7 @@ class PreparedLatentMoE:
                     else logits_chunk
                 )
                 if prefill_route_runtime is not None:
-                    from ignition.components.collectives import _island_row_shard
+                    from hyperflare_recipes.components.collectives import _island_row_shard
 
                     down_output = buffer("local_down", latent // shard.world_size)
                     self.down = prepare_projection(work_source, weights["latent_down_rows"], down_output,

@@ -21,10 +21,8 @@ def _rank(rank, world, rendezvous, snapshot):
     from hyperflare_recipes.components.parallel import TensorParallelShard
     from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-    from ignition.preparation.collectives import (
-        CollectivePreparation,
-        create_all_reduce_runtime,
-    )
+    from ignition.preparation.collectives import CollectivePreparation
+    from hyperflare_recipes.components.collectives import create_all_reduce_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena

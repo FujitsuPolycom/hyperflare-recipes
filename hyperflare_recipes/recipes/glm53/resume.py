@@ -6,7 +6,7 @@
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.resume import PreparedResumeState
 from ignition.components.sampling import PreparedSampling
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
@@ -29,7 +29,9 @@ class PreparedResume:
                      records, frame, sequence)
         self.completion = PreparedSampling(self.logits, *arguments)
         self.completion.prepare()
-        self.completion.prepare_broadcast(runtime=vocabulary_runtime, session=session,
+        from hyperflare_recipes.components.collectives import prepare_sampling_broadcast
+
+        prepare_sampling_broadcast(self.completion, runtime=vocabulary_runtime, session=session,
             coordinator=coordinator, name=name + ".sampling")
         self.state.functional()
         self.validation.functional(session=session)

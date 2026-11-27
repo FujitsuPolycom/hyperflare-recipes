@@ -7,7 +7,7 @@ import torch
 
 from hyperflare_recipes.components.linear import prepare_projection
 from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
-from ignition.components.collectives import PreparedAllReduce
+from hyperflare_recipes.components.collectives import PreparedAllReduce
 
 from ignition.preparation.examples import declaration_tensor
 

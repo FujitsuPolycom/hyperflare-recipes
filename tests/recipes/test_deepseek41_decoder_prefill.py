@@ -227,7 +227,7 @@ def test_prepared_generation_record_only_skips_sampling_and_context(monkeypatch)
         def prepare(self):
             events.append("sampling_prepare")
 
-        def prepare_broadcast(self, **kwargs):
+        def attach_broadcast(self, broadcast):
             pytest.fail("record-only generation must not prepare sampling broadcast")
 
         def functional(self, **kwargs):
@@ -241,6 +241,8 @@ def test_prepared_generation_record_only_skips_sampling_and_context(monkeypatch)
 
     monkeypatch.setattr(pg, "PreparedAllReduce", FakeAllReduce)
     monkeypatch.setattr(pg, "PreparedSampling", FakeSampling)
+    monkeypatch.setattr(pg, "prepare_sampling_broadcast",
+                        lambda *args, **kwargs: pytest.fail("record-only generation must not prepare sampling broadcast"))
     monkeypatch.setattr(pg, "save_hidden",
                         lambda *args, **kwargs: pytest.fail("record-only generation must not save hidden"))
 

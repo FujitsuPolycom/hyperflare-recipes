@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from hyperflare_recipes.components.bf16_experts import BF16ExpertScratch, PreparedBF16Experts
-from ignition.components.collectives import PreparedChunkedAllGather, PreparedChunkedAllReduce
+from hyperflare_recipes.components.collectives import PreparedChunkedAllGather, PreparedChunkedAllReduce
 from hyperflare_recipes.components.embedding import PreparedShardedEmbedding
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.moe import PreparedRoutedExperts, RouterScratch
