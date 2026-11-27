@@ -12,6 +12,7 @@ import torch
 from hyperflare_recipes.components.dense_epilogues import (
     allocate_mxfp8_activation_bases,
     is_fused_swiglu_down_plan,
+    mxfp8_bases_from_byte_buffer,
     run_fused_swiglu_down,
 )
 from hyperflare_recipes.components.linear import QuantizedProjection
@@ -228,6 +229,7 @@ class ConcurrentSharedExpert:
         if self.outputs is not None:
             self.output_layouts = tuple((tuple(t.shape), t.stride(), t.dtype) for t in self.outputs)
             self.outputs = None
+            self.bound_encoded = []
             self.mlp.functional(session=session)
             for projection in self.projections:
                 projection.functional(session=session)
@@ -255,7 +257,7 @@ class ConcurrentSharedExpert:
                 self.fused_down_layout = (len(self.encoded_layouts), projection.encoded_layout)
                 self.encoded_layouts.extend(projection.encoded_layout)
                 self.weights[index], self.scales[index] = projection.parts[:2]
-                sizes.append(projection.plan.memory_requirements().scratch_nbytes)
+                sizes.append(0)
             else:
                 layout = getattr(projection, "encoded_layout", None)
                 if layout is not None:
@@ -287,6 +289,17 @@ class ConcurrentSharedExpert:
         main_bytes = max(plan.memory_requirements().scratch_nbytes for plan in parallel_plans)
         shared_bytes = max(projection.plan.memory_requirements().scratch_nbytes for projection in self.projections)
         _, self.workspace = arena.views(((main_bytes,), torch.uint8), ((shared_bytes,), torch.uint8))
+        if self.outputs is not None:
+            refreshed = []
+            for projection in self.projections:
+                if getattr(projection, "is_fused_swiglu_down", False):
+                    refreshed.extend(
+                        mxfp8_bases_from_byte_buffer(
+                            self.workspace, projection.encoded_layout, projection.rows
+                        )
+                    )
+            if refreshed:
+                self.bound_encoded = refreshed
 
     def start(self, source):
         if self.outputs is None:

@@ -84,6 +84,7 @@ class PreparedMLP:
         ):
             self.fused_swiglu_down = PreparedFusedSwiGLUDown(
                 gate_up, weights.down, output, session=session, name=f"{name}.down",
+                workspace=workspace,
                 limit=swiglu_limit, round_silu=round_silu,
                 clamp_after_silu=clamp_after_silu,
                 swiglu_alpha=swiglu_alpha, swiglu_beta=swiglu_beta,

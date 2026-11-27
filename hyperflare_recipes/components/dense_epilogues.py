@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import math
 import weakref
 from dataclasses import dataclass
 
@@ -22,6 +23,7 @@ from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x.preparation import PreparedCall
 from b12x.preparation.types import plan_from_handle, require_prepared
+from ignition.preparation.scratch import ScratchArena, prime_owners
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import declare, register_finalizer
 
@@ -188,6 +190,16 @@ def _scale_mma_view_from_physical(scale_mma_base: torch.Tensor) -> torch.Tensor:
     return scale_mma_base.view(torch.float8_e8m0fnu).permute(3, 4, 1, 5, 2, 0)
 
 
+def _cuda_stream_context(stream, device: torch.device):
+    if stream is None:
+        return contextlib.nullcontext()
+    if isinstance(stream, torch.cuda.Stream):
+        return torch.cuda.stream(stream)
+    if isinstance(stream, int) and device.type == "cuda":
+        return torch.cuda.stream(torch.cuda.ExternalStream(stream, device=device))
+    return contextlib.nullcontext()
+
+
 def _stream_to_int(stream) -> int | None:
     if stream is None:
         return None
@@ -310,10 +322,11 @@ def _resolve_dense_rope_runner(
         plan = None
     if plan is not None:
         target = _extract_dense_rope_target(plan)
-        current_lowering = None if target is None else target[0]
-        if entry is None or (
-            current_lowering is not None and entry[2] != current_lowering
-        ):
+        if target is None:
+            _DENSE_ROPE_RUNNERS.pop(key, None)
+            return None
+        current_lowering = target[0]
+        if entry is None or entry[2] != current_lowering:
             if register_dense_gemm_rope(
                 plan,
                 head_dim=head_dim,
@@ -323,6 +336,7 @@ def _resolve_dense_rope_runner(
             ):
                 entry = _DENSE_ROPE_RUNNERS.get(key)
             else:
+                _DENSE_ROPE_RUNNERS.pop(key, None)
                 return None
     return entry
 
@@ -336,14 +350,26 @@ def register_dense_gemm_rope(
     rope_inverse: bool = False,
 ) -> bool:
     """Precompile a fused tail-64 Q-RoPE DenseGemm runner when `plan` is in a winning regime."""
+    head_dim, rope_dim = int(head_dim), int(rope_dim)
+    handle = getattr(plan, "handle", None)
+    key = (
+        None
+        if handle is None
+        else (int(handle), head_dim, rope_dim, bool(rope_split), bool(rope_inverse))
+    )
     if not supports_dense_rope_epilogue():
+        if key is not None:
+            _DENSE_ROPE_RUNNERS.pop(key, None)
         return False
     target = _extract_dense_rope_target(plan)
     if target is None:
+        if key is not None:
+            _DENSE_ROPE_RUNNERS.pop(key, None)
         return False
     lowering, rows, device, alpha_one = target
-    head_dim, rope_dim = int(head_dim), int(rope_dim)
     if not should_fuse_dense_rope(rows, head_dim=head_dim, rope_dim=rope_dim):
+        if key is not None:
+            _DENSE_ROPE_RUNNERS.pop(key, None)
         return False
     if (
         lowering.ab_dtype != "float8_e4m3fn"
@@ -358,8 +384,10 @@ def register_dense_gemm_rope(
         or lowering.policy.split_k_slices != 1
         or lowering.n % head_dim != 0
     ):
+        if key is not None:
+            _DENSE_ROPE_RUNNERS.pop(key, None)
         return False
-    key = (int(plan.handle), head_dim, rope_dim, bool(rope_split), bool(rope_inverse))
+    assert key is not None
     existing = _DENSE_ROPE_RUNNERS.get(key)
     if existing is not None and existing[2] == lowering:
         return True
@@ -836,24 +864,32 @@ class _FusedSwiGLUDownState:
         rows = int(gate_up.shape[0])
         k = self.query.padded_k
         n = self.query.out_features
-        stream_ctx = (
-            torch.cuda.stream(stream)
-            if isinstance(stream, torch.cuda.Stream)
-            else contextlib.nullcontext()
-        )
-        with stream_ctx:
+        sfa = _scale_mma_view_from_physical(scale_mma)
+        sfb = _scale_mma_view_from_physical(weight_mma_base)
+        stream_int = _stream_to_int(stream)
+        with _cuda_stream_context(stream, gate_up.device):
             self.swiglu_quant(
                 gate_up,
                 values,
                 scale_rows.view(rows, -1),
                 scale_mma.view(-1),
             )
-        sfa = _scale_mma_view_from_physical(scale_mma)
-        sfb = _scale_mma_view_from_physical(weight_mma_base)
-        stream_int = _stream_to_int(stream)
-        if residual is not None:
-            if self.dense_residual is None or not _can_fuse_residual(residual, output):
-                self.dense(
+            if residual is not None:
+                if self.dense_residual is None or not _can_fuse_residual(
+                    residual, output
+                ):
+                    self.dense(
+                        a_tensor_gpu=values.view(rows, k, 1),
+                        b_tensor_gpu=weight_values.view(n, k, 1),
+                        sfa_tensor_gpu=sfa,
+                        sfb_tensor_gpu=sfb,
+                        c_tensor_gpu=output.view(rows, n, 1),
+                        alpha_tensor_gpu=self.alpha_one,
+                        stream_int=stream_int,
+                    )
+                    output.add_(residual)
+                    return
+                self.dense_residual(
                     a_tensor_gpu=values.view(rows, k, 1),
                     b_tensor_gpu=weight_values.view(n, k, 1),
                     sfa_tensor_gpu=sfa,
@@ -861,11 +897,10 @@ class _FusedSwiGLUDownState:
                     c_tensor_gpu=output.view(rows, n, 1),
                     alpha_tensor_gpu=self.alpha_one,
                     stream_int=stream_int,
+                    residual_gpu=residual.view(rows, n, 1),
                 )
-                with stream_ctx:
-                    output.add_(residual)
                 return
-            self.dense_residual(
+            self.dense(
                 a_tensor_gpu=values.view(rows, k, 1),
                 b_tensor_gpu=weight_values.view(n, k, 1),
                 sfa_tensor_gpu=sfa,
@@ -873,18 +908,7 @@ class _FusedSwiGLUDownState:
                 c_tensor_gpu=output.view(rows, n, 1),
                 alpha_tensor_gpu=self.alpha_one,
                 stream_int=stream_int,
-                residual_gpu=residual.view(rows, n, 1),
             )
-            return
-        self.dense(
-            a_tensor_gpu=values.view(rows, k, 1),
-            b_tensor_gpu=weight_values.view(n, k, 1),
-            sfa_tensor_gpu=sfa,
-            sfb_tensor_gpu=sfb,
-            c_tensor_gpu=output.view(rows, n, 1),
-            alpha_tensor_gpu=self.alpha_one,
-            stream_int=stream_int,
-        )
 
 
 def compile_fused_swiglu_down(
@@ -1150,6 +1174,58 @@ def allocate_mxfp8_activation_bases(
     return values, scale_rows, scale_mma
 
 
+def _mxfp8_activation_bases_nbytes(
+    encoded_layout: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+) -> int:
+    """Return the 256-byte-aligned byte capacity needed for the three MXFP8 activation bases."""
+    return sum(
+        (math.prod(shape) * dtype.itemsize + 255) // 256 * 256
+        for shape, dtype in encoded_layout
+    )
+
+
+def mxfp8_bases_from_byte_buffer(
+    storage: torch.Tensor,
+    encoded_layout: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+    rows: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Slice 256-byte-aligned MXFP8 activation bases from a contiguous uint8 byte buffer."""
+    views = []
+    offset = 0
+    for shape, dtype in encoded_layout:
+        size = math.prod(shape) * dtype.itemsize
+        views.append(storage.narrow(0, offset, size).view(dtype).reshape(shape))
+        offset += (size + 255) // 256 * 256
+    values, scale_rows, scale_mma = views
+    if rows % 128 != 0 and storage.device.type != "meta":
+        scale_mma.fill_(127)
+    return values, scale_rows, scale_mma
+
+
+def _mxfp8_bases_from_workspace(
+    workspace,
+    encoded_layout: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+    rows: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Slice declaration or bound MXFP8 activation bases from preparation workspace when available."""
+    if isinstance(workspace, ScratchArena):
+        values, scale_rows, scale_mma = workspace.views(*encoded_layout)
+        if rows % 128 != 0 and device.type != "meta":
+            scale_mma.fill_(127)
+        return values, scale_rows, scale_mma
+    if (
+        isinstance(workspace, torch.Tensor)
+        and workspace.dtype == torch.uint8
+        and workspace.ndim == 1
+        and workspace.is_contiguous()
+        and workspace.device == device
+        and workspace.nbytes >= _mxfp8_activation_bases_nbytes(encoded_layout)
+    ):
+        return mxfp8_bases_from_byte_buffer(workspace, encoded_layout, rows)
+    return allocate_mxfp8_activation_bases(encoded_layout, rows, device)
+
+
 class PreparedFusedSwiGLUDown:
     """Fused SwiGLU -> BF16 round -> MXFP8 quantization -> DenseGemm down projection.
 
@@ -1169,6 +1245,7 @@ class PreparedFusedSwiGLUDown:
         *,
         session,
         name: str,
+        workspace: ScratchArena | torch.Tensor | None = None,
         limit: float = float("inf"),
         round_silu: bool = True,
         clamp_after_silu: bool = False,
@@ -1178,6 +1255,10 @@ class PreparedFusedSwiGLUDown:
         self.weight = weight
         self.output = output
         self.bias = None
+        self.workspace = workspace
+        self.preparation_arena = (
+            workspace if isinstance(workspace, ScratchArena) else None
+        )
         self.quantizer_plan = None
         self.encoded = None
         self.rows = int(gate_up.shape[0])
@@ -1200,10 +1281,10 @@ class PreparedFusedSwiGLUDown:
             (row_shape, torch.uint8),
             (mma_shape, torch.uint8),
         )
-        self.encoded_bases = (
-            torch.zeros(val_shape, dtype=torch.float8_e4m3fn, device=gate_up.device),
-            torch.full(row_shape, 127, dtype=torch.uint8, device=gate_up.device),
-            torch.full(mma_shape, 127, dtype=torch.uint8, device=gate_up.device),
+        device = gate_up.device
+        bases_nbytes = _mxfp8_activation_bases_nbytes(self.encoded_layout)
+        self.encoded_bases = _mxfp8_bases_from_workspace(
+            workspace, self.encoded_layout, self.rows, device
         )
         limit_finite = limit != float("inf")
         query = FusedSwiGLUDownQuery(
@@ -1219,13 +1300,12 @@ class PreparedFusedSwiGLUDown:
             swiglu_beta=float(swiglu_beta),
             residual_capable=self.supports_residual,
         )
-        device = gate_up.device
         payload = FUSED_SWIGLU_DOWN_CONTRACT.encode_query(query)
         self.plan = native_plan(
             contract=FUSED_SWIGLU_DOWN_CONTRACT,
             query=query,
             device=device,
-            scratch_bytes=lambda tactic: 0,
+            scratch_bytes=lambda tactic: bases_nbytes,
             materialize=lambda tactic: _materialize_fused_swiglu_down(query, device),
             compile_jobs=lambda tactic, detected: (
                 CompileJob.create(
@@ -1236,45 +1316,59 @@ class PreparedFusedSwiGLUDown:
                 ),
             ),
         )
-        parts = self.parts
         encoded_layout = self.encoded_layout
         rows = self.rows
-        self._decl_bases: list[
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
-        ] = [self.encoded_bases]
-        decl_bases = self._decl_bases
+        self._decl_refs: list[object] = [gate_up, output, workspace, self.parts]
+        decl_refs = self._decl_refs
 
         def _prepare_call(state):
-            active_bases = decl_bases[0]
-            if active_bases is None:
-                active_bases = allocate_mxfp8_activation_bases(
-                    encoded_layout, rows, device
+            ref_gate_up, ref_output, ref_workspace, ref_parts = decl_refs
+            if ref_gate_up is None:
+                raise RuntimeError(
+                    "fused SwiGLU down declaration examples were already released"
                 )
+            active_bases = _mxfp8_bases_from_workspace(
+                ref_workspace, encoded_layout, rows, device
+            )
             return PreparedCall(
                 run=lambda: state.run(
-                    gate_up,
+                    ref_gate_up,
                     active_bases[0],
                     active_bases[1],
                     active_bases[2],
-                    parts[0],
-                    parts[1],
-                    output,
+                    ref_parts[0],
+                    ref_parts[1],
+                    ref_output,
                 ),
-                owners=(gate_up, output, *active_bases, parts[0], parts[1]),
+                owners=prime_owners(
+                    ref_workspace,
+                    ref_gate_up,
+                    ref_output,
+                    *active_bases,
+                    ref_parts[0],
+                    ref_parts[1],
+                ),
             )
 
         declare(session, (self.plan.request(name=name, prepare_call=_prepare_call),))
         self.output_layout = None
 
-        def _release_decl_bases() -> None:
-            decl_bases[0] = None
+        def _finalize_preparation() -> None:
+            decl_refs[:] = [None, None, None, None]
             if self.output is None:
                 self.encoded_bases = None
+                self.workspace = None
+                self.preparation_arena = None
+            elif isinstance(self.workspace, ScratchArena):
+                self.encoded_bases = _mxfp8_bases_from_workspace(
+                    self.workspace, self.encoded_layout, self.rows, device
+                )
 
-        register_finalizer(session, _release_decl_bases)
+        register_finalizer(
+            session, _finalize_preparation, workspace=self.preparation_arena
+        )
 
     def functional(self, *, session):
-        del session
         if self.output is not None:
             self.output_layout = (
                 tuple(self.output.shape),
@@ -1283,8 +1377,17 @@ class PreparedFusedSwiGLUDown:
             )
             self.output = None
             self.encoded_bases = None
-            self._decl_bases[0] = None
+            self.workspace = None
+            register_finalizer(
+                session, self._finalize_functional, workspace=self.preparation_arena
+            )
         return self
+
+    def _finalize_functional(self) -> None:
+        self._decl_refs[:] = [None, None, None, None]
+        self.encoded_bases = None
+        self.workspace = None
+        self.preparation_arena = None
 
     def __call__(
         self, gate_up: torch.Tensor, *, residual: torch.Tensor | None = None

@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -99,6 +98,35 @@ def _reference_dequantize_mxfp8_cpu(
     return (values_fp8.float().view(rows, k // 32, 32) * scale_f32.unsqueeze(-1)).view(
         rows, k
     )
+
+
+def _pack_mxfp8_scale_mma_cpu(scale_u8: torch.Tensor) -> torch.Tensor:
+    """Pack [rows, k // 32] uint8 UE8M0 scales into physical [1, m_tiles, k_tiles, 32, 4, 4] MMA layout."""
+    rows, k_blocks = scale_u8.shape
+    padded_rows = ((rows + 127) // 128) * 128
+    padded_k_blocks = ((k_blocks + 3) // 4) * 4
+    padded = torch.full((padded_rows, padded_k_blocks), 127, dtype=torch.uint8)
+    padded[:rows, :k_blocks].copy_(scale_u8)
+    m_tiles = padded_rows // 128
+    k_tiles = padded_k_blocks // 4
+    return (
+        padded.view(m_tiles, 4, 32, k_tiles, 4)
+        .permute(0, 3, 2, 1, 4)
+        .contiguous()
+        .view(1, m_tiles, k_tiles, 32, 4, 4)
+    )
+
+
+def _unpack_mxfp8_scale_mma_cpu(
+    scale_mma_6d: torch.Tensor, rows: int, k_blocks: int
+) -> torch.Tensor:
+    """Decode canonical 6D UE8M0 MMA scale view [32, 4, m_tiles, 4, k_tiles, 1] back to [rows, k_blocks]."""
+    u8 = scale_mma_6d.view(torch.uint8)
+    m_tiles, k_tiles = int(u8.shape[2]), int(u8.shape[4])
+    unswizzled = (
+        u8.permute(5, 2, 1, 0, 4, 3).contiguous().view(m_tiles * 128, k_tiles * 4)
+    )
+    return unswizzled[:rows, :k_blocks]
 
 
 def _reference_rotate_tail_split(
@@ -472,10 +500,17 @@ def test_encoded_dense_rope_skips_standalone_rotary_and_matches_zero_ulp(monkeyp
     rows, k, head_dim, heads, rope_dim = 32, 128, 512, 2, 64
     n = heads * head_dim
     gen = torch.Generator().manual_seed(2026)
-    a_bf16 = torch.randn((rows, k), dtype=torch.bfloat16, generator=gen)
-    w_bf16 = torch.randn((n, k), dtype=torch.bfloat16, generator=gen) * 0.25
+    row_gain = torch.exp2(torch.linspace(-2.0, 3.0, rows)).unsqueeze(1)
+    col_gain = torch.exp2(torch.linspace(-3.0, 2.0, n)).unsqueeze(1)
+    a_bf16 = (
+        torch.randn((rows, k), dtype=torch.float32, generator=gen) * row_gain
+    ).to(torch.bfloat16)
+    w_bf16 = (
+        torch.randn((n, k), dtype=torch.float32, generator=gen) * col_gain * 0.25
+    ).to(torch.bfloat16)
     a_fp8, a_scale = _reference_quantize_mxfp8_cpu(a_bf16, k)
     w_fp8, w_scale = _reference_quantize_mxfp8_cpu(w_bf16, k)
+    assert len(a_scale.unique()) > 2 and len(w_scale.unique()) > 2
     theta = torch.randn((rows, rope_dim // 2), dtype=torch.float32, generator=gen)
     angles = torch.cat((torch.cos(theta), torch.sin(theta)), dim=-1).contiguous()
 
@@ -486,16 +521,20 @@ def test_encoded_dense_rope_skips_standalone_rotary_and_matches_zero_ulp(monkeyp
         unfused_gemm, angles, head_dim=head_dim, rope_dim=rope_dim
     )
 
-    row_tiles_a = (rows + 127) // 128
-    row_tiles_w = (n + 127) // 128
-    k_tiles = (k + 127) // 128
-    mma_a = torch.full((1, row_tiles_a, k_tiles, 32, 4, 4), 127, dtype=torch.uint8)
-    mma_w = torch.full((1, row_tiles_w, k_tiles, 32, 4, 4), 127, dtype=torch.uint8)
+    mma_a = _pack_mxfp8_scale_mma_cpu(a_scale)
+    mma_w = _pack_mxfp8_scale_mma_cpu(w_scale)
 
     fused_calls = []
 
     def fake_runner(
-        *, a_tensor_gpu, b_tensor_gpu, c_tensor_gpu, rope_cos_sin_gpu, **_kwargs
+        *,
+        a_tensor_gpu,
+        b_tensor_gpu,
+        sfa_tensor_gpu,
+        sfb_tensor_gpu,
+        c_tensor_gpu,
+        rope_cos_sin_gpu,
+        **_kwargs,
     ):
         fused_calls.append(
             (
@@ -504,10 +543,18 @@ def test_encoded_dense_rope_skips_standalone_rotary_and_matches_zero_ulp(monkeyp
                 tuple(rope_cos_sin_gpu.shape),
             )
         )
+        a_2d = a_tensor_gpu.squeeze(-1)
+        b_2d = b_tensor_gpu.squeeze(-1)
+        sfa_decoded = _unpack_mxfp8_scale_mma_cpu(
+            sfa_tensor_gpu, a_2d.shape[0], a_2d.shape[1] // 32
+        )
+        sfb_decoded = _unpack_mxfp8_scale_mma_cpu(
+            sfb_tensor_gpu, b_2d.shape[0], b_2d.shape[1] // 32
+        )
         out = _reference_rotate_tail_split(
             (
-                _reference_dequantize_mxfp8_cpu(a_tensor_gpu.squeeze(-1), a_scale)
-                @ _reference_dequantize_mxfp8_cpu(b_tensor_gpu.squeeze(-1), w_scale).T
+                _reference_dequantize_mxfp8_cpu(a_2d, sfa_decoded)
+                @ _reference_dequantize_mxfp8_cpu(b_2d, sfb_decoded).T
             ).to(torch.bfloat16),
             rope_cos_sin_gpu,
             head_dim=head_dim,
@@ -602,7 +649,7 @@ def test_encoded_dense_rope_skips_standalone_rotary_and_matches_zero_ulp(monkeyp
         out_traced.view(rows, n).view(torch.int16), expected.view(torch.int16)
     )
 
-    # Negative sensitivity check: corrupting angles must break bit-exact parity.
+    # Negative sensitivity checks: corrupting angles or MMA scales must break bit-exact parity.
     bad_angles = angles.clone()
     bad_angles[0, 0] += 0.25
     out_bad = traced(
@@ -614,6 +661,17 @@ def test_encoded_dense_rope_skips_standalone_rotary_and_matches_zero_ulp(monkeyp
     )
     assert not torch.equal(
         out_bad.view(rows, n).view(torch.int16), expected.view(torch.int16)
+    )
+    bad_mma_a = torch.full_like(mma_a, 127)
+    out_bad_scale = traced(
+        a_bf16,
+        a_fp8,
+        torch.zeros((1, rows, k // 32), dtype=torch.uint8),
+        bad_mma_a,
+        angles,
+    )
+    assert not torch.equal(
+        out_bad_scale.view(rows, n).view(torch.int16), expected.view(torch.int16)
     )
 
 
@@ -833,16 +891,30 @@ def test_prepared_mlp_fused_swiglu_down_zero_ulp_residual_and_make_fx(monkeypatc
     """PreparedMLP wires PreparedFusedSwiGLUDown at M>=29, matches 0-ULP with/without residual, and traces in make_fx."""
     rows, hidden, width = 32, 64, 576
     gen = torch.Generator().manual_seed(42)
-    source = torch.randn((rows, hidden), dtype=torch.bfloat16, generator=gen) * 0.5
+    source_gain = torch.exp2(torch.linspace(-1.5, 2.5, rows)).unsqueeze(1)
+    source = (
+        torch.randn((rows, hidden), dtype=torch.float32, generator=gen)
+        * source_gain
+        * 0.5
+    ).to(torch.bfloat16)
     up_weight = (
         torch.randn((2 * width, hidden), dtype=torch.bfloat16, generator=gen) * 0.25
     )
+    weight_gain = torch.exp2(torch.linspace(-2.0, 2.0, hidden)).unsqueeze(1)
     down_dense = (
-        torch.randn((hidden, width), dtype=torch.bfloat16, generator=gen) * 0.25
-    )
+        torch.randn((hidden, width), dtype=torch.float32, generator=gen)
+        * weight_gain
+        * 0.25
+    ).to(torch.bfloat16)
     w_fp8, w_scale = _reference_quantize_mxfp8_cpu(down_dense, width)
     down_weight = _fake_mxfp8_linear_weight(hidden, width, padded_in_features=width)
     down_weight.weight.values.copy_(w_fp8)
+    down_weight.weight.scale_rows.view(torch.uint8).copy_(w_scale.unsqueeze(0))
+    down_weight.weight.scale_mma.view(torch.uint8).copy_(
+        dense_epilogues._scale_mma_view_from_physical(
+            _pack_mxfp8_scale_mma_cpu(w_scale)
+        ).view(torch.uint8)
+    )
     residual = torch.randn((rows, hidden), dtype=torch.bfloat16, generator=gen) * 0.5
 
     # Compute exact unfused reference
@@ -867,48 +939,59 @@ def test_prepared_mlp_fused_swiglu_down_zero_ulp_residual_and_make_fx(monkeypatc
             q, s = _reference_quantize_mxfp8_cpu(mid, query.padded_k)
             values.copy_(q)
             scale_rows.copy_(s)
+            scale_mma.copy_(_pack_mxfp8_scale_mma_cpu(s).view(-1))
 
-        def dense(*, a_tensor_gpu, b_tensor_gpu, c_tensor_gpu, **_kw):
-            # Re-derive activation scale from scale_rows is unneeded; store scale via closure? Better: read a_fp8 directly!
-            pass
+        def _gemm(a_tensor_gpu, b_tensor_gpu, sfa_tensor_gpu, sfb_tensor_gpu):
+            a_2d = a_tensor_gpu.squeeze(-1)
+            b_2d = b_tensor_gpu.squeeze(-1)
+            sfa_u8 = _unpack_mxfp8_scale_mma_cpu(
+                sfa_tensor_gpu, a_2d.shape[0], a_2d.shape[1] // 32
+            )
+            sfb_u8 = _unpack_mxfp8_scale_mma_cpu(
+                sfb_tensor_gpu, b_2d.shape[0], b_2d.shape[1] // 32
+            )
+            return (
+                _reference_dequantize_mxfp8_cpu(a_2d, sfa_u8)
+                @ _reference_dequantize_mxfp8_cpu(b_2d, sfb_u8).T
+            ).to(torch.bfloat16)
 
-        # Bind scale_rows cleanly via a custom state matching _FusedSwiGLUDownState.run
-        @dataclass(frozen=True)
-        class _CpuState:
-            query: object
-            device: torch.device
+        def dense(
+            *,
+            a_tensor_gpu,
+            b_tensor_gpu,
+            sfa_tensor_gpu,
+            sfb_tensor_gpu,
+            c_tensor_gpu,
+            **_kw,
+        ):
+            c_tensor_gpu.squeeze(-1).copy_(
+                _gemm(a_tensor_gpu, b_tensor_gpu, sfa_tensor_gpu, sfb_tensor_gpu)
+            )
 
-            def run(
-                self,
-                gate_up,
-                values,
-                scale_rows,
-                scale_mma,
-                weight_values,
-                weight_mma_base,
-                output,
-                *,
-                residual=None,
-                stream=None,
-            ):
-                swiglu_quant(
-                    gate_up,
-                    values,
-                    scale_rows.view(gate_up.shape[0], -1),
-                    scale_mma.view(-1),
-                )
-                out = (
-                    _reference_dequantize_mxfp8_cpu(
-                        values, scale_rows.view(gate_up.shape[0], -1)
-                    )
-                    @ _reference_dequantize_mxfp8_cpu(weight_values, w_scale).T
-                ).to(torch.bfloat16)
-                if residual is not None:
-                    residual_kernel_calls.append(tuple(residual.shape))
-                    out = (out.float() + residual.float()).to(torch.bfloat16)
-                output.copy_(out)
+        def dense_residual(
+            *,
+            a_tensor_gpu,
+            b_tensor_gpu,
+            sfa_tensor_gpu,
+            sfb_tensor_gpu,
+            c_tensor_gpu,
+            residual_gpu,
+            **_kw,
+        ):
+            residual_kernel_calls.append(tuple(residual_gpu.shape))
+            out = _gemm(a_tensor_gpu, b_tensor_gpu, sfa_tensor_gpu, sfb_tensor_gpu)
+            c_tensor_gpu.squeeze(-1).copy_(
+                (out.float() + residual_gpu.squeeze(-1).float()).to(torch.bfloat16)
+            )
 
-        return _CpuState(query=query, device=device)
+        return dense_epilogues._FusedSwiGLUDownState(
+            query=query,
+            device=device,
+            swiglu_quant=swiglu_quant,
+            dense=dense,
+            dense_residual=dense_residual,
+            alpha_one=torch.ones((1,), dtype=torch.float32),
+        )
 
     from b12x.gemm import bf16_gemv
 
@@ -1365,16 +1448,86 @@ def test_dense_rope_cache_refreshes_on_lowering_change_and_evicts_on_plan_gc(
     assert dense_epilogues.register_dense_gemm_rope(plan, head_dim=512) is True
     assert len(compiles) == 2
 
+    # When the plan resolves to an ineligible lowering or loses its target, stale entries are evicted.
+    active_plan = [plan]
+    monkeypatch.setattr(
+        dense_epilogues,
+        "plan_from_handle",
+        lambda handle: active_plan[0] if handle == 4242 else None,
+    )
+    low_ineligible = _mock_lowering(32, 8192, 1280, split_k_slices=2)
+    plan._prepared.state.core.lowering = low_ineligible
+    assert (
+        dense_epilogues._resolve_dense_rope_runner(
+            4242, head_dim=512, rope_dim=64, rope_split=True
+        )
+        is None
+    )
+    assert dense_epilogues.has_dense_gemm_rope(4242, head_dim=512) is False
+
+    plan._prepared.state.core.lowering = low2
+    assert dense_epilogues.register_dense_gemm_rope(plan, head_dim=512) is True
+    plan._prepared = None
+    assert (
+        dense_epilogues._resolve_dense_rope_runner(
+            4242, head_dim=512, rope_dim=64, rope_split=True
+        )
+        is None
+    )
+    assert dense_epilogues.has_dense_gemm_rope(4242, head_dim=512) is False
+
+    # Restore valid plan and verify GC eviction when plan is released.
+    active_plan[0] = None
+    plan = _WeakPlan(4242, low2)
+    assert dense_epilogues.register_dense_gemm_rope(plan, head_dim=512) is True
     assert dense_epilogues.has_dense_gemm_rope(4242, head_dim=512) is True
+    monkeypatch.setattr(dense_epilogues, "plan_from_handle", lambda handle: None)
     del plan
     gc.collect()
     assert dense_epilogues.has_dense_gemm_rope(4242, head_dim=512) is False
 
 
 def test_fused_swiglu_down_noncontiguous_residual_and_has_residual_kwarg(monkeypatch):
-    """Non-contiguous residual falls back to output.add_ instead of dense_residual; has_residual=False is omitted."""
+    """Non-contiguous residual falls back to output.add_ inside a single requested stream context; has_residual=False is omitted."""
+    import contextlib
+
     dense_calls = []
     residual_calls = []
+    events = []
+    in_stream = [False]
+
+    class _FakeStream:
+        @property
+        def cuda_stream(self):
+            return 0xCAFE
+
+    fake_stream = _FakeStream()
+    enter_count = [0]
+
+    @contextlib.contextmanager
+    def _single_use_stream_ctx(s):
+        assert s is fake_stream
+        enter_count[0] += 1
+        assert enter_count[0] == 1, "stream context must only be entered once"
+        in_stream[0] = True
+        try:
+            yield
+        finally:
+            in_stream[0] = False
+
+    monkeypatch.setattr(torch.cuda, "Stream", _FakeStream)
+    monkeypatch.setattr(torch.cuda, "stream", _single_use_stream_ctx)
+
+    def _quant(*_a):
+        assert in_stream[0] is True
+        events.append("quant")
+
+    def _dense(**kw):
+        assert in_stream[0] is True
+        assert kw["stream_int"] == 0xCAFE
+        events.append("dense")
+        dense_calls.append(kw)
+        kw["c_tensor_gpu"].fill_(2.0)
 
     state = dense_epilogues._FusedSwiGLUDownState(
         query=dense_epilogues.FusedSwiGLUDownQuery(
@@ -1391,8 +1544,8 @@ def test_fused_swiglu_down_noncontiguous_residual_and_has_residual_kwarg(monkeyp
             residual_capable=True,
         ),
         device=torch.device("cpu"),
-        swiglu_quant=lambda *a: None,
-        dense=lambda **kw: (dense_calls.append(kw), kw["c_tensor_gpu"].fill_(2.0)),
+        swiglu_quant=_quant,
+        dense=_dense,
         dense_residual=lambda **kw: residual_calls.append(kw),
         alpha_one=torch.ones((1,), dtype=torch.float32),
     )
@@ -1406,7 +1559,20 @@ def test_fused_swiglu_down_noncontiguous_residual_and_has_residual_kwarg(monkeyp
 
     non_contig = torch.ones((4, 32), dtype=torch.bfloat16)[:, :16]
     assert not non_contig.is_contiguous()
-    state.run(gate_up, vals, srows, smma, wvals, wmma, out, residual=non_contig)
+    state.run(
+        gate_up,
+        vals,
+        srows,
+        smma,
+        wvals,
+        wmma,
+        out,
+        residual=non_contig,
+        stream=fake_stream,
+    )
+    assert enter_count[0] == 1
+    assert in_stream[0] is False
+    assert events == ["quant", "dense"]
     assert len(residual_calls) == 0
     assert len(dense_calls) == 1
     assert torch.equal(out, torch.full((4, 16), 3.0, dtype=torch.bfloat16))
@@ -1433,3 +1599,76 @@ def test_fused_swiglu_down_noncontiguous_residual_and_has_residual_kwarg(monkeyp
         _mock_lowering(32, 64, 128), 0, has_residual=True
     )
     assert seen_kwargs[-1]["has_residual"] is True
+
+
+def test_prepared_fused_swiglu_down_uses_scratch_arena_and_releases_decl_refs(
+    monkeypatch,
+):
+    """PreparedFusedSwiGLUDown backs declaration bases with ScratchArena, counts scratch, and releases closure refs in finalizer."""
+    from ignition.preparation.scratch import ScratchArena
+
+    rows, width, out_features = 32, 576, 64
+    arena = ScratchArena(torch.device("cpu"), overlap=False)
+    recorded_requests = []
+
+    monkeypatch.setattr(
+        dense_epilogues, "declare", lambda session, reqs: recorded_requests.extend(reqs)
+    )
+    monkeypatch.setattr(
+        dense_epilogues,
+        "register_finalizer",
+        lambda session, cb, *, workspace=None: (
+            workspace.register_finalizer(cb)
+            if isinstance(workspace, ScratchArena)
+            else None
+        ),
+    )
+
+    gate_up = torch.zeros((rows, 2 * width), dtype=torch.bfloat16)
+    output = torch.zeros((rows, out_features), dtype=torch.bfloat16)
+    down_w = _fake_mxfp8_linear_weight(out_features, width, padded_in_features=width)
+
+    fused = dense_epilogues.PreparedFusedSwiGLUDown(
+        gate_up,
+        down_w,
+        output,
+        session=object(),
+        name="shared.down",
+        workspace=arena,
+    )
+    expected_nbytes = dense_epilogues._mxfp8_activation_bases_nbytes(
+        fused.encoded_layout
+    )
+    assert expected_nbytes > 0
+    assert arena.nbytes >= expected_nbytes
+    # Declaration bases share ScratchArena backing storage instead of standalone allocations.
+    arena_storage = arena.tensor.untyped_storage().data_ptr()
+    assert all(
+        base.untyped_storage().data_ptr() == arena_storage
+        for base in fused.encoded_bases
+    )
+    assert (
+        fused.plan._memory_requirements(
+            SimpleNamespace(tactic="cutedsl"), SimpleNamespace(ordinal=0)
+        ).scratch_nbytes
+        == expected_nbytes
+    )
+
+    # Entering functional() clears instance buffers before tuning, while prepare_call stays usable until finalization.
+    fused.functional(session=object())
+    assert fused.output is None
+    assert fused.encoded_bases is None
+    assert fused.workspace is None
+
+    call = recorded_requests[0].prepare_call(SimpleNamespace(run=lambda *a, **kw: None))
+    assert call.owners == (arena,)
+
+    # Finalizing the arena releases declaration closure refs and preparation_arena before compilation.
+    arena.finalize()
+    arena.freeze()
+    assert fused.preparation_arena is None
+    assert all(ref is None for ref in fused._decl_refs)
+    with pytest.raises(RuntimeError, match="already released"):
+        recorded_requests[0].prepare_call(SimpleNamespace(run=lambda *a, **kw: None))
+    arena.release_preparation()
+    assert arena.nbytes == 0
