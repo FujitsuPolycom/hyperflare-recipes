@@ -206,7 +206,7 @@ RECIPE = Recipe(
             1: _costs(142_821_120, 69_632, _GRAPH_BYTES[1] + (1 << 30), speculating=False),
             2: _costs(71_632_640, 36_864, _GRAPH_BYTES[2] + (1 << 30), speculating=False),
             4: _costs(36_235_008, 36_864, _GRAPH_BYTES[4] + (1 << 30), speculating=False),
-        }), draft_bytes=WEIGHT_BYTES),
+        }), draft_bytes=WEIGHT_BYTES, label="DFlash2", mixed_prefill=False),
     }),
     max_images=4,
     image_bytes=32 << 20,

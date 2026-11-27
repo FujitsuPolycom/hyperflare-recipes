@@ -143,7 +143,7 @@ RECIPE = Recipe(
         "dflash2": SpeculativeMethod(MappingProxyType({
             8: RankCosts(state_row_bytes=68_710_400, page_bytes=2_174_976, graph_bytes=3 << 29, page_tokens=128 * 8),
             16: RankCosts(state_row_bytes=35_450_112, page_bytes=2_174_976, graph_bytes=9 << 29, page_tokens=128 * 16),
-        }), draft_bytes=5_569_622_016),
+        }), draft_bytes=5_569_622_016, label="DFlash2", mixed_prefill=False),
         "dspark": SpeculativeMethod(MappingProxyType({
             8: RankCosts(state_row_bytes=68_055_296, page_bytes=2_174_976, graph_bytes=3 << 29, page_tokens=128 * 8),
             16: RankCosts(state_row_bytes=35_122_432, page_bytes=2_174_976, graph_bytes=9 << 29, page_tokens=128 * 16),

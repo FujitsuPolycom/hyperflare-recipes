@@ -241,7 +241,7 @@ RECIPE = Recipe(
         }), draft_bytes=7_932_874_632),
         "dfly2": SpeculativeMethod(MappingProxyType({
             world: RankCosts(2_847_232, 113_920, 8 << 30) for world in (3, 4, 6)
-        }), draft_bytes=8_847_248_264),
+        }), draft_bytes=8_847_248_264, label="DFly2", mixed_prefill=False),
     }),
     # Recommended sampling, including top-p 1.0: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference.
     # Repetition-penalty bounds enable measured use over prompt + output, matching vLLM/HF semantics.
