@@ -28,7 +28,11 @@ class SharedBuffers:
         name = self.prefix + name
         value = self.values.get(name)
         if value is None or value.shape[0] < shape[0]:
-            value = torch.zeros(shape, dtype=dtype, device=self.device)
+            arena = self.values.get("__arena__")
+            allocated = None
+            if arena is not None and arena.device == torch.device(self.device):
+                allocated = arena.allocate("dsa", shape, dtype)
+            value = torch.zeros(shape, dtype=dtype, device=self.device) if allocated is None else allocated
             self.values[name] = value
         if value.shape[1:] != shape[1:] or value.dtype != dtype:
             raise ValueError("Kimi declaration tensors require matching non-row dimensions and dtype")
@@ -182,12 +186,13 @@ class PreparedDSAIndexer:
                 ("indexer.wq_b", query_latent, self.query), ("indexer.wk", source, self.key),
                 ("indexer.weights_proj", source, self.head_weights)))
         self.query_latent = query_latent
-        step = PREFILL_ROWS if mode == "prefill" else rows
+        prefill_rows = PREFILL_ROWS if context is None else getattr(context, "prefill_rows", PREFILL_ROWS)
+        step = prefill_rows if mode == "prefill" else rows
         self.bounds = tuple((start, min(start + step, rows)) for start in range(0, rows, step))
         selection_buffers = buffers.setdefault("selection", {})
         cache_pages = cache.view(-1, 64 * 132)
         self.cache, self.sharded = cache_pages, None
-        if mode == "prefill" and rows >= 4096:
+        if mode == "prefill" and rows >= 2560:
             from .query_selection import PreparedQuerySelection
 
             self.sharded = PreparedQuerySelection(self.query, self.head_weights, cache_pages,
