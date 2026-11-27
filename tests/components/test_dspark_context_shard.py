@@ -4,6 +4,7 @@
 
 """Output-sharded mtp.0.main_proj loading, collective sizing, and 0-ULP PreparedContext parity."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from hyperflare_recipes.recipes.deepseek41.config import ModelConfig, QUALIFIED_
 from hyperflare_recipes.recipes.deepseek41.pool import ContinuationPool
 from hyperflare_recipes.recipes.deepseek41.weights import DSparkWeights, main_projection_partition
 from ignition.components import collectives
+from ignition.parameters import SpeculationParameters
 
 
 def _deepseek41_config(*, hidden_size=5120):
@@ -341,21 +343,27 @@ def test_context_gather_runtime_and_roce_sizing(monkeypatch):
     local_coord = SimpleNamespace(spans_hosts=False)
     roce_coord = SimpleNamespace(spans_hosts=True)
 
+    base_params = bootstrap._default_parameters()
+
     # TP3 and TP6 keep main_proj replicated because 5120 is not divisible by 3*64 or 6*64.
     for devices in ((0, 1, 2), (0, 1, 2, 3, 4, 5)):
-        cfg = bootstrap.PreparationConfig(devices=devices, dspark=True)
+        cfg = bootstrap.PreparationConfig(devices=devices, parameters=base_params)
         assert bootstrap._context_gather_runtime(
             cfg, None, "cpu", coordinator=local_coord, core_storage=storage, collective="shared"
         ) is None
 
     # dspark=False disables context gather even on TP4.
-    cfg_no_dspark = bootstrap.PreparationConfig(devices=(0, 1, 2, 3), dspark=False)
+    cfg_no_dspark = bootstrap.PreparationConfig(
+        devices=(0, 1, 2, 3), parameters=replace(base_params, speculation=None)
+    )
     assert bootstrap._context_gather_runtime(
         cfg_no_dspark, None, "cpu", coordinator=local_coord, core_storage=storage, collective="shared"
     ) is None
 
     # TP4 single-host allocates a 5120-column BF16 gather channel sized to max(128, decode_tokens).
-    cfg_tp4 = bootstrap.PreparationConfig(devices=(0, 1, 2, 3), max_active=32, dspark=True)
+    cfg_tp4 = bootstrap.PreparationConfig(
+        devices=(0, 1, 2, 3), parameters=replace(base_params, max_concurrency=32)
+    )
     ctx_rt = bootstrap._context_gather_runtime(
         cfg_tp4, None, "cpu", coordinator=local_coord, core_storage=storage, collective="shared"
     )
@@ -366,8 +374,14 @@ def test_context_gather_runtime_and_roce_sizing(monkeypatch):
 
     # TP4 multi-host reuses the shared RoCE runtime and sizes gather_bytes to cover context gather
     # even for the minimal max_active=1, speculative_widths=(1,) configuration.
+    spec_width_1 = SpeculationParameters(
+        draft_tokens=0, max_draft_tokens=7, token_capacity=128,
+        packed_verification=False, draft_prefix_selection="cpu", graph_budget=None,
+    )
     cfg_small_roce = bootstrap.PreparationConfig(
-        devices=(0, 1, 2, 3), hosts=("h0", "h1", "h2", "h3"), max_active=1, speculative_widths=(1,), dspark=True
+        devices=(0, 1, 2, 3),
+        hosts=("h0", "h1", "h2", "h3"),
+        parameters=replace(base_params, max_concurrency=1, speculation=spec_width_1),
     )
     roce_rt, *_ = bootstrap._collective_runtimes(
         cfg_small_roce, None, "cpu", coordinator=roce_coord, core_storage=storage, verification_samples=1
