@@ -392,36 +392,53 @@ def _make_copy_only_round(
 
 
 def test_copy_verify_shapes_config_and_catalog_registration(monkeypatch):
+    from dataclasses import replace
+    from ignition.parameters import SpeculationParameters
+
+    base = PreparationConfig()
+
+    def _make_cfg(*, max_active=32, dspark=True, draft_tokens=7, token_capacity=128,
+                  graph_budget=64, copy_verify_shapes=()):
+        spec = (
+            SpeculationParameters(
+                draft_tokens=draft_tokens, max_draft_tokens=7, token_capacity=token_capacity,
+                packed_verification=True, draft_prefix_selection="gpu", graph_budget=graph_budget,
+            )
+            if dspark else None
+        )
+        return replace(
+            base,
+            parameters=replace(base.parameters, max_concurrency=max_active, speculation=spec),
+            copy_verify_shapes=copy_verify_shapes,
+        )
+
     # Default config stays 100% identical to baseline when copy_verify_shapes=().
-    default_cfg = PreparationConfig(speculative_widths=(1, 8))
+    default_cfg = _make_cfg()
     assert default_cfg.copy_verify_shapes == ()
     assert default_cfg.max_copy_drafts == 0
-    assert default_cfg.all_speculative_widths == (1, 8)
+    assert default_cfg.all_speculative_widths == default_cfg.speculative_widths
     assert default_cfg.completion_token_capacity == 8
     assert default_cfg.decode_tokens == 128
 
     # Opt-in wide copy-verify shapes resize copy_ids and completion capacity with 0 B extra decode_tokens.
     wide_shapes = ((1, 16), (1, 24), (2, 16), (4, 16))
-    wide_cfg = PreparationConfig(max_active=4, speculative_widths=(1, 8),
-                                 speculative_token_capacity=64, speculative_graph_budget=32,
-                                 copy_verify_shapes=wide_shapes)
+    wide_cfg = _make_cfg(max_active=4, token_capacity=64, graph_budget=32, copy_verify_shapes=wide_shapes)
     assert wide_cfg.max_copy_drafts == 23
-    assert wide_cfg.all_speculative_widths == (1, 8, 16, 24)
+    assert wide_cfg.all_speculative_widths == (*wide_cfg.speculative_widths, 16, 24)
     assert wide_cfg.completion_token_capacity == 24
     assert wide_cfg.decode_tokens == 64
 
     # Invalid configurations are rejected explicitly.
     with pytest.raises(ValueError, match="exceed base MTP width"):
-        PreparationConfig(max_active=4, speculative_widths=(1, 8), copy_verify_shapes=((1, 8),))
+        _make_cfg(max_active=4, copy_verify_shapes=((1, 8),))
     with pytest.raises(ValueError, match="within 64"):
-        PreparationConfig(max_active=4, speculative_widths=(1, 8), copy_verify_shapes=((1, 65),))
+        _make_cfg(max_active=4, copy_verify_shapes=((1, 65),))
     with pytest.raises(ValueError, match="speculative_token_capacity"):
-        PreparationConfig(max_active=4, speculative_widths=(1, 8), speculative_token_capacity=32,
-                          speculative_graph_budget=16, copy_verify_shapes=((4, 16),))
+        _make_cfg(max_active=4, token_capacity=32, graph_budget=16, copy_verify_shapes=((4, 16),))
     with pytest.raises(ValueError, match="enabled DSpark"):
-        PreparationConfig(max_active=4, speculative_widths=(1, 8), dspark=False, copy_verify_shapes=((1, 16),))
+        _make_cfg(max_active=4, dspark=False, copy_verify_shapes=((1, 16),))
     with pytest.raises(ValueError, match="distinct"):
-        PreparationConfig(max_active=4, speculative_widths=(1, 8), copy_verify_shapes=((1, 16), (1, 16)))
+        _make_cfg(max_active=4, copy_verify_shapes=((1, 16), (1, 16)))
 
     # Verify SpeculativePreparation buffer sizing and _prepare_speculation_catalog wiring.
     device = torch.device("cpu")

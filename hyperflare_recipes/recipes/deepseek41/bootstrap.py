@@ -7,7 +7,7 @@
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 
@@ -25,11 +25,18 @@ from ignition.components.capacity import (
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
+from ignition.parameters import (
+    ParameterContext,
+    PromptLogprobsParameters,
+    SpeculationParameters,
+    VisionParameters,
+)
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.rebuild_manifest import declare_weights
 from .contract import prepare as prepare_contract, PATCH_CAPACITIES, INPUT_VOCABULARY
 from hyperflare_recipes.components.deepseek_vision import (PreparedVision, VisionInputs, VisionScratch,
     PrefillVisionInputs, PreparedVisionGeneration, VisionState)
+from hyperflare_recipes.parameters import ExpertScaleCompressionParameters
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
     create_all_reduce_runtime, create_dma_all_reduce_runtime, create_result_broadcast_runtime, create_roce_runtime)
@@ -44,7 +51,7 @@ from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
 from hyperflare_recipes.components.paged_batch import BatchInputs, Metadata, PreparedBatch
-from .recipe import RECIPE
+from .recipe import DeepSeek41Parameters, RECIPE
 from .attention import INDEXER_QUERY_ROWS
 from .decoder import PreparedDecoder, Scratch, DraftScratch
 from hyperflare_recipes.components.dspark import PreparedContext, PreparedMarkov
@@ -59,6 +66,38 @@ from ignition.preparation.bootstrap import BasePreparationConfig
 
 
 _CONTEXT = partial(PreparedContext, compact_prefill=True)
+
+
+def _default_parameters() -> DeepSeek41Parameters:
+    return DeepSeek41Parameters(
+        max_concurrency=32,
+        max_concurrency_limit=64,
+        prefill_chunk=4096,
+        mla_compute_mode="auto",
+        expert_scale_compression=ExpertScaleCompressionParameters(encoding=None),
+        speculation=SpeculationParameters(
+            draft_tokens=5,
+            max_draft_tokens=7,
+            token_capacity=128,
+            packed_verification=True,
+            draft_prefix_selection="gpu",
+            graph_budget=64,
+        ),
+        vision=VisionParameters(),
+        prompt_logprobs=PromptLogprobsParameters(),
+    )
+
+
+def _context_gather_runtime(config, group, device, *, coordinator, core_storage, collective=None):
+    """Allocate a BF16 column-gather channel for output-sharded ``mtp.0.main_proj``."""
+    world = len(config.devices)
+    if not config.dspark or world < 2 or 5120 % (world * 64) != 0:
+        return None
+    if coordinator.spans_hosts:
+        return collective
+    return create_all_gather_runtime(
+        group, device, max_rows=max(128, config.decode_tokens), columns=5120,
+        ipc=core_storage.peer_storage)
 
 
 def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **kwargs):
@@ -80,62 +119,84 @@ def _forward_factories(mla_compute_mode, *, vision,
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    image_concurrency: int | None = None
+    parameters: DeepSeek41Parameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own Spark.
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
     context: int = 1048576
-    max_active: int = 32
     minimum_pages: int = 8
     # An explicit cache capacity makes memory comparisons independent of automatic sizing.
     kv_pages: int | None = None
-    dspark: bool = True
-    draft_head_quantization: str | None = None
-    markov_head_quantization: str | None = None
-    vocabulary_parallel_sampling: bool = False
-    speculative_token_capacity: int | None = 128
-    speculative_graph_budget: int = 64
-    # Overlap shared and routed experts within each eligible text graph.
-    stream_overlap: bool = True
-    expert_scale_compression: str | None = None
-    mla_compute_mode: str = "auto"
-    row_shard_prefill: bool = False
-    row_shard_attention: bool = False
-    packed_verification: bool | None = None
-    draft_prefix_selection: str | None = None
     speculation_reference_graphs: bool = False
     copy_verify_shapes: tuple[tuple[int, int], ...] = ()
 
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def dspark(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def draft_head_quantization(self) -> str | None:
+        return self.parameters.draft_quantization.draft_head_quantization
+
+    @property
+    def markov_head_quantization(self) -> str | None:
+        return self.parameters.draft_quantization.markov_head_quantization
+
+    @property
+    def vocabulary_parallel_sampling(self) -> bool:
+        return self.parameters.vocabulary_parallel_sampling
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
+
+    @property
+    def expert_scale_compression(self) -> str | None:
+        return self.parameters.expert_scale_compression.encoding
+
+    @property
+    def mla_compute_mode(self) -> str:
+        return self.parameters.mla_compute_mode
+
+    @property
+    def row_shard_prefill(self) -> bool:
+        return self.parameters.row_shard_prefill
+
+    @property
+    def row_shard_attention(self) -> bool:
+        return self.parameters.row_shard_attention
+
+    @property
+    def packed_verification(self) -> bool:
+        return bool(self.parameters.speculation and self.parameters.speculation.packed_verification)
+
+    @property
+    def draft_prefix_selection(self) -> str:
+        if self.parameters.speculation is None:
+            return "cpu"
+        return self.parameters.speculation.draft_prefix_selection
+
     def __post_init__(self):
+        if not isinstance(self.parameters, DeepSeek41Parameters):
+            raise TypeError("DeepSeek V4.1 PreparationConfig requires DeepSeek41Parameters")
         if self.mtp_only and (not self.dspark
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
+        if (self.draft_head_quantization is not None or self.markov_head_quantization is not None) and (
+                not self.dspark or self.draft_tokens < 1):
+            raise ValueError("draft precision overrides require positive learned draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("DeepSeek V4.1 draft model supports at most seven draft tokens")
-        from ignition.components.capacity import image_capacity
         from hyperflare_recipes.components.compressed_mla import validate_mla_compute_mode
 
         validate_mla_compute_mode(self.mla_compute_mode)
-        from ignition.declaration import Speculation
-        Speculation(self.draft_tokens, draft_head_quantization=self.draft_head_quantization,
-                    markov_head_quantization=self.markov_head_quantization,
-                    vocabulary_parallel_sampling=self.vocabulary_parallel_sampling)
         self.speculative_shapes
         self.packed_speculative_shapes
         drafting = self.dspark and self.draft_tokens > 0
-        for name in ("packed_verification",):
-            value = getattr(self, name)
-            if value is None:
-                object.__setattr__(self, name, drafting)
-            elif type(value) is not bool:
-                raise TypeError(f"{name} must be a boolean")
-        if self.draft_prefix_selection is None:
-            object.__setattr__(self, "draft_prefix_selection", "gpu" if drafting else "cpu")
-        if self.draft_prefix_selection not in ("cpu", "gpu"):
-            raise ValueError("draft prefix selection must be cpu or gpu")
         if drafting:
             if not self.packed_verification or self.draft_prefix_selection != "gpu":
                 raise ValueError("DeepSeek V4.1 DSpark requires packed GPU draft prefix selection")
@@ -143,15 +204,10 @@ class PreparationConfig(BasePreparationConfig):
                 raise ValueError("DeepSeek V4.1 DSpark requires adaptive packed GPU rounds")
         elif self.packed_verification or self.draft_prefix_selection != "cpu" or self.speculation_reference_graphs:
             raise ValueError("packed GPU speculation requires positive DSpark draft depth")
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
         if self.expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         if type(self.stream_overlap) is not bool:
             raise TypeError("stream_overlap must be a boolean")
-        if type(self.row_shard_prefill) is not bool:
-            raise TypeError("row_shard_prefill must be a boolean")
-        if type(self.row_shard_attention) is not bool:
-            raise TypeError("row_shard_attention must be a boolean")
         if self.row_shard_attention and not self.row_shard_prefill:
             raise ValueError("row_shard_attention requires row_shard_prefill")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
@@ -170,7 +226,6 @@ class PreparationConfig(BasePreparationConfig):
         if not 64 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 64:
             raise ValueError("prefill chunk size must be 64-aligned in [64,context]")
         request_capacity(self.max_active)
-        self.speculative_shapes
         if self.speculative_fixed_width is not None and self.speculative_fixed_width not in self.speculative_widths:
             raise ValueError("fixed verification width must belong to the prepared widths")
         if (not isinstance(self.copy_verify_shapes, tuple)
@@ -279,8 +334,16 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
         buffers["proposal_confidence"] = confidence.device_view
         prefix_limits = torch.zeros(slots, dtype=torch.int32, device=device)
         buffers["speculative_prefix_limits"] = prefix_limits
+        if hasattr(speculation, "buffers"):
+            buffers.update(speculation.buffers())
         packed_inputs = tuple(field for field in forward_inputs if field != "query_lengths")
-        packed_inputs += ("speculative_prefix_limits",)
+        packed_inputs += (
+            "speculative_prefix_limits",
+            "copy_token_ids",
+            "copy_token_count",
+            "copy_expected_consumed",
+            "copy_generation",
+        )
         packed_batches = {batch for batch, _ in config.packed_speculative_shapes}
         proposals = {}
         for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):
@@ -359,7 +422,12 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
         # Vocabulary partitions and packed sampling results use the same serial gather channel.
         result_bytes = max((packed_broadcast_layout(layout.values())[1] for layout in layouts), default=0)
         _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
+        context_gather_bytes = (
+            max(128, config.decode_tokens) * (5120 // len(config.devices)) * 2
+            if config.dspark and 5120 % (len(config.devices) * 64) == 0 else 0
+        )
         gather_bytes = max(sample_rows * local_vocab * 4,
+                           context_gather_bytes,
                            (result_bytes + 15) // 16 * 16)
         decode_tokens = config.all_reduce_tokens
         runtime = create_roce_runtime(group, device, max_tokens=decode_tokens, pipe_tokens=tokens,
@@ -476,6 +544,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             verification_samples=verification_samples)
         kv_collective = _kv_gather_runtime(
             config, group, device, coordinator=coordinator, core_storage=core_storage)
+        context_collective = _context_gather_runtime(
+            config, group, device, coordinator=coordinator, core_storage=core_storage,
+            collective=collective)
         sampling_collective = logprob_collective = None
         if config.vocabulary_parallel_sampling and shard.world_size > 1:
             sampling_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
@@ -534,6 +605,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             submission_sequence=sequence, **completion.buffers())
         if vision_state is not None:
             buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
+        context_factory = (
+            partial(_CONTEXT, runtime=context_collective, coordinator=coordinator)
+            if context_collective is not None else _CONTEXT
+        )
+        scored_context_factory = (
+            partial(PreparedContext, runtime=context_collective, coordinator=coordinator)
+            if context_collective is not None else PreparedContext
+        )
         forwards, signatures, metadata, scratch = {}, {}, {}, {}
         speculation = None
         if config.dspark:
@@ -548,7 +627,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 block_proposal_broadcast=True,
                 vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
                 sampling_runtime=sampling_collective, logprob_runtime=logprob_collective,
-                forwards=DSparkForwards(decoder_factory, DraftScratch, _CONTEXT,
+                forwards=DSparkForwards(decoder_factory, DraftScratch, context_factory,
                     draft_factory, PreparedMarkov))
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
@@ -620,7 +699,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                             )
                         forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
                             coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
-                            context_factory=PreparedContext if graph_kind == "scored_prefill" else _CONTEXT,
+                            context_factory=scored_context_factory if graph_kind == "scored_prefill" else context_factory,
                             sample=sample)
                         fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
                         add(name, forward, graph_kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
@@ -770,10 +849,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         core_data=tables if rank == 0 else None,
         resources=(scoring, weights, tables, pool, requests, inputs, admission, commands, forwards,
             compiled, stream, graph_pool, session,
-            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, kv_collective, coordinator, speculation, confidence,
+            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, kv_collective, context_collective, coordinator, speculation, confidence,
             vision_state, vision_inputs, vision_prefill, feature_pool),
         close_resources=tuple(dict.fromkeys(c for c in
-            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, kv_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
+            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, kv_collective, context_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
     return model
