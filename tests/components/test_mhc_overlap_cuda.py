@@ -5,18 +5,15 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from b12x._lib.compile_plan import load_programs
 from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
 from b12x.gemm import blockscaled
 from b12x.norm import mhc
 from b12x.norm.mhc import _impl as mhc_impl
-from b12x.norm.mhc._split_lagged import (
-    compile_cluster_post_y_norm,
-    split_lagged_cluster_size,
-)
 from b12x.preparation import PreparationSession, PreparedCall
 
 from hyperflare_recipes.components.mhc import MHCScratch, MHCWeights
@@ -166,8 +163,16 @@ def test_register_tc_gemv_rope_matches_unfused(head_dim: int, tokens: int, split
 
 
 @pytest.mark.parametrize("tokens", [1, 8, 13, 16, 32, 64, 127, 128])
-def test_split_lagged_mhc_eager_and_compiled_match_reference(tokens: int):
+def test_split_lagged_mhc_eager_and_compiled_match_reference(monkeypatch, tokens: int):
     _require_sm120()
+    from b12x.moe.fused_moe import _binding_ops
+    from b12x.norm.mhc import _split_lagged
+
+    max_tokens = int(getattr(_split_lagged, "SPLIT_LAGGED_MAX_TOKENS", 8))
+    if tokens > max_tokens:
+        pytest.skip(
+            f"installed b12x supports SPLIT_LAGGED_MAX_TOKENS={max_tokens} (< {tokens})"
+        )
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(202 + tokens)
     hidden = 5120
@@ -261,6 +266,12 @@ def test_split_lagged_mhc_eager_and_compiled_match_reference(tokens: int):
         _state=state,
     )
 
+    sentinel_plan = object()
+    monkeypatch.setattr(
+        _binding_ops,
+        "supports_prequant_mxfp8",
+        lambda plan, m: plan is sentinel_plan and int(m) == tokens,
+    )
     arena = ScratchArena(device, overlap=True)
     sl = SplitLaggedMHC(
         (x, residual, prev_post, prev_comb),
@@ -271,20 +282,10 @@ def test_split_lagged_mhc_eager_and_compiled_match_reference(tokens: int):
         hc_eps=1e-6,
         sinkhorn_iters=20,
         norm_eps=1e-20,
+        experts=SimpleNamespace(plan=sentinel_plan, integrated_routing=False),
     )
-    sl._finalize()
-    sl.emit_mxfp8 = True
-    load_programs(
-        compile_cluster_post_y_norm(
-            int(device.index or 0),
-            hidden,
-            False,
-            1e-20,
-            torch.bfloat16,
-            cluster_size=split_lagged_cluster_size(tokens),
-            emit_mxfp8=True,
-        )
-    )
+    assert sl.emit_mxfp8 is True
+    assert sl.experts is None
 
     def step(x_, r_, pp_, pc_, pm_):
         out_, y_, av_, as_ = sl.post_y_norm(x_, r_, pp_, pc_, pre_mix=pm_)

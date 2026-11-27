@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 import itertools
 import weakref
 
@@ -702,6 +703,37 @@ class SplitLaggedMHC:
         return pending.post_out, pending.comb_out, pending.pre_out
 
 
+def _check_fused_mhc_operand(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    shape: tuple[int, ...],
+    dtypes: tuple[torch.dtype, ...],
+    device: torch.device,
+    align: int,
+) -> None:
+    if tensor.device != device:
+        raise ValueError(
+            f"PreparedFusedMhcAllReducePostYNorm {name} must be on {device}, got {tensor.device}"
+        )
+    if tensor.dtype not in dtypes:
+        raise ValueError(
+            f"PreparedFusedMhcAllReducePostYNorm {name} requires dtype in {dtypes}, got {tensor.dtype}"
+        )
+    if tuple(tensor.shape) != shape:
+        raise ValueError(
+            f"PreparedFusedMhcAllReducePostYNorm {name} requires shape {shape}, got {tuple(tensor.shape)}"
+        )
+    if not tensor.is_contiguous():
+        raise ValueError(
+            f"PreparedFusedMhcAllReducePostYNorm {name} must be row-major contiguous"
+        )
+    if tensor.numel() > 0 and tensor.data_ptr() % align != 0:
+        raise ValueError(
+            f"PreparedFusedMhcAllReducePostYNorm {name} must be {align}-byte aligned"
+        )
+
+
 class PreparedFusedMhcAllReducePostYNorm:
     """Fused Lamport-sentinel PCIe AllReduce + ``ClusterMhcPostYNorm`` for lagged mHC.
 
@@ -814,12 +846,25 @@ class PreparedFusedMhcAllReducePostYNorm:
     def functional(self, *, session=None):
         return self
 
+    def _transport(self) -> str:
+        from b12x.norm.mhc import _split_lagged
+
+        selector = getattr(_split_lagged, "cluster_allreduce_transport", None)
+        return "auto" if selector is None else str(selector(self.tokens, self.world_size))
+
     def _compile_variant(self, device_slot_selection: bool, slot_bias: int):
         from b12x.norm.mhc._split_lagged import compile_cluster_allreduce_post_y_norm
 
         ordinal = int(self.device.index or 0)
         cluster_size = _cluster_size_for_tokens(self.tokens)
         bias = int(slot_bias) & 1 if device_slot_selection else 0
+        extra_kwargs: dict[str, object] = {}
+        try:
+            params = inspect.signature(compile_cluster_allreduce_post_y_norm).parameters
+        except (TypeError, ValueError):
+            params = ()
+        if "transport" in params:
+            extra_kwargs["transport"] = self._transport()
         return compile_cluster_allreduce_post_y_norm(
             ordinal,
             self.hidden,
@@ -833,6 +878,7 @@ class PreparedFusedMhcAllReducePostYNorm:
             device_slot_selection=device_slot_selection,
             slot_bias=bias,
             release_dependents=self.release_dependents,
+            **extra_kwargs,
         )
 
     def _finalize(self):
@@ -849,6 +895,7 @@ class PreparedFusedMhcAllReducePostYNorm:
         self.experts = None
         ordinal = int(self.device.index or 0)
         cluster_size = _cluster_size_for_tokens(self.tokens)
+        transport = self._transport()
         for dev_sel, bias in ((False, 0), (True, 0), (True, 1)):
             runner = self._compile_variant(dev_sel, bias)
             load_programs(runner)
@@ -868,8 +915,160 @@ class PreparedFusedMhcAllReducePostYNorm:
                     dev_sel,
                     bias,
                     self.release_dependents,
+                    transport,
                 )
             ] = runner
+
+    def _validate_runtime_launch(
+        self,
+        channel,
+        x: torch.Tensor,
+        input_addend: torch.Tensor | None,
+        residual: torch.Tensor,
+        prev_post: torch.Tensor,
+        prev_comb: torch.Tensor,
+        pre_mix: torch.Tensor,
+        norm_weight: torch.Tensor,
+        out: torch.Tensor,
+        y: torch.Tensor,
+        a_values: torch.Tensor | None,
+        a_scales: torch.Tensor | None,
+    ) -> None:
+        from b12x.norm.mhc import _split_lagged
+
+        if residual.ndim != 3 or residual.shape[1] != 4 or residual.shape[2] != self.hidden:
+            raise ValueError(
+                f"PreparedFusedMhcAllReducePostYNorm residual requires shape [tokens, 4, {self.hidden}], "
+                f"got {tuple(residual.shape)}"
+            )
+        tokens = int(residual.shape[0])
+        max_tokens = int(getattr(_split_lagged, "CLUSTER_AR_MHC_MAX_TOKENS", 32))
+        if tokens <= 0 or tokens > self.tokens or tokens > max_tokens:
+            raise ValueError(
+                f"PreparedFusedMhcAllReducePostYNorm requires 1 <= tokens <= "
+                f"{min(self.tokens, max_tokens)}, got {tokens}"
+            )
+        hidden = self.hidden
+        device = self.device
+        _check_fused_mhc_operand(
+            "x", x, shape=(tokens, hidden), dtypes=(torch.bfloat16,), device=device, align=16
+        )
+        if self.has_addend:
+            if input_addend is None:
+                raise ValueError(
+                    "PreparedFusedMhcAllReducePostYNorm with has_addend=True requires input_addend"
+                )
+            _check_fused_mhc_operand(
+                "input_addend",
+                input_addend,
+                shape=(tokens, hidden),
+                dtypes=(torch.bfloat16,),
+                device=device,
+                align=16,
+            )
+        elif input_addend is not None:
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm with has_addend=False does not accept input_addend"
+            )
+        _check_fused_mhc_operand(
+            "residual",
+            residual,
+            shape=(tokens, 4, hidden),
+            dtypes=(torch.bfloat16,),
+            device=device,
+            align=16,
+        )
+        _check_fused_mhc_operand(
+            "prev_post",
+            prev_post,
+            shape=(tokens, 4),
+            dtypes=(torch.float32,),
+            device=device,
+            align=4,
+        )
+        _check_fused_mhc_operand(
+            "prev_comb",
+            prev_comb,
+            shape=(tokens, 4, 4),
+            dtypes=(torch.float32,),
+            device=device,
+            align=4,
+        )
+        _check_fused_mhc_operand(
+            "pre_mix",
+            pre_mix,
+            shape=(tokens, 4),
+            dtypes=(torch.float32,),
+            device=device,
+            align=4,
+        )
+        _check_fused_mhc_operand(
+            "norm_weight",
+            norm_weight,
+            shape=(hidden,),
+            dtypes=(self.weights.norm.dtype,),
+            device=device,
+            align=4,
+        )
+        _check_fused_mhc_operand(
+            "out",
+            out,
+            shape=(tokens, 4, hidden),
+            dtypes=(torch.bfloat16,),
+            device=device,
+            align=16,
+        )
+        _check_fused_mhc_operand(
+            "y",
+            y,
+            shape=(tokens, hidden),
+            dtypes=(torch.bfloat16,),
+            device=device,
+            align=16,
+        )
+        if self.emit_mxfp8:
+            if a_values is None or a_scales is None:
+                raise ValueError(
+                    "PreparedFusedMhcAllReducePostYNorm with emit_mxfp8=True requires a_values and a_scales"
+                )
+            _check_fused_mhc_operand(
+                "a_values",
+                a_values,
+                shape=(tokens, hidden),
+                dtypes=(torch.uint8, torch.float8_e4m3fn),
+                device=device,
+                align=16,
+            )
+            _check_fused_mhc_operand(
+                "a_scales",
+                a_scales,
+                shape=(tokens, hidden // 32),
+                dtypes=(torch.uint8, torch.float8_e8m0fnu),
+                device=device,
+                align=16,
+            )
+        elif a_values is not None or a_scales is not None:
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm with emit_mxfp8=False does not accept a_values or a_scales"
+            )
+
+        payload_bytes = tokens * hidden * 2
+        runtime_max = getattr(self.runtime, "max_size", None)
+        if runtime_max is not None and payload_bytes > int(runtime_max):
+            raise ValueError(
+                f"PreparedFusedMhcAllReducePostYNorm payload ({payload_bytes} bytes) "
+                f"exceeds runtime max_size ({int(runtime_max)} bytes)"
+            )
+        sentinel_cap = _channel_sentinel_capacity_bytes(channel)
+        if sentinel_cap is None:
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm requires live Lamport sentinel storage"
+            )
+        if payload_bytes > sentinel_cap:
+            raise ValueError(
+                f"PreparedFusedMhcAllReducePostYNorm payload ({payload_bytes} bytes) "
+                f"exceeds live sentinel shard capacity ({sentinel_cap} bytes)"
+            )
 
     def _launch(
         self,
@@ -888,6 +1087,20 @@ class PreparedFusedMhcAllReducePostYNorm:
         from b12x.norm.mhc._split_lagged import oneshot_channel_sentinel_params
 
         channel = self._channel()
+        self._validate_runtime_launch(
+            channel,
+            x,
+            input_addend,
+            residual,
+            prev_post,
+            prev_comb,
+            pre_mix,
+            norm_weight,
+            out,
+            y,
+            a_values,
+            a_scales,
+        )
         (
             peer_table_address,
             signal_table_address,
@@ -943,6 +1156,10 @@ class PreparedFusedMhcAllReducePostYNorm:
         if not self.has_addend and input_addend is not None:
             raise ValueError(
                 "PreparedFusedMhcAllReducePostYNorm with has_addend=False does not accept input_addend"
+            )
+        if residual.ndim != 3 or residual.shape[1] != 4:
+            raise ValueError(
+                "PreparedFusedMhcAllReducePostYNorm residual requires [tokens, 4, hidden]"
             )
         tokens, _, hidden = residual.shape
         device = residual.device

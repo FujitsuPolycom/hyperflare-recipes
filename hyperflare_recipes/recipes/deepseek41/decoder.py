@@ -23,6 +23,7 @@ from hyperflare_recipes.components.mhc_overlap import (
     PreparedFusedMhcAllReducePostYNorm,
     SplitLaggedMHC,
     link_fused_mhc_layers as _link_fused_mhc_layers,
+    pack_mxfp8_scale_mma,
 )
 from hyperflare_recipes.components.mlp import MLPScratch, PreparedMLP
 from hyperflare_recipes.components.moe import RouteRecord, RouterScratch, PreparedRouter, PreparedRoutedExperts
@@ -133,17 +134,6 @@ def _mhc_weights(weights, kind, norm):
     residual = weights.residual
     return MHCWeights(residual[f"hc_{kind}_fn"], residual[f"hc_{kind}_scale"],
                       residual[f"hc_{kind}_base"], residual[norm + ".weight"])
-
-
-def _mxfp8_scale_mma(scale_rows_2d: torch.Tensor, hidden: int) -> torch.Tensor:
-    """Swizzle contiguous [rows, hidden // 32] UE8M0 scale rows into b12x MMA tile layout."""
-    m_tiles, k_tiles = scale_rows_2d.shape[0] // 128, hidden // 128
-    return (
-        scale_rows_2d.view(m_tiles, 4, 32, k_tiles, 4)
-        .permute(0, 3, 2, 1, 4)
-        .contiguous()
-        .view(1, m_tiles, k_tiles, 32, 4, 4)
-    )
 
 
 class PreparedDecoderBoundary:
@@ -966,7 +956,7 @@ class PreparedLayer:
         hidden = full_vals.shape[1]
         full_srows_2d = packed_full[:, self.attn_vals_bf16_cols:].contiguous().view(torch.uint8)
         full_srows = full_srows_2d.view(1, full_rows, hidden // 32)
-        full_smma = _mxfp8_scale_mma(full_srows_2d, hidden)
+        full_smma = pack_mxfp8_scale_mma(full_srows_2d, hidden)
         return full_vals, (full_vals, full_srows, full_smma)
 
     def _prepare_ffn_shard(self, normalized, mask, num_valid_tokens):
@@ -1002,7 +992,7 @@ class PreparedLayer:
             hidden = full_vals.shape[1]
             full_srows_2d = meta_full[:, :self.ffn_meta_scale_cols].contiguous().view(torch.uint8)
             full_srows = full_srows_2d.view(1, full_rows, hidden // 32)
-            full_smma = _mxfp8_scale_mma(full_srows_2d, hidden)
+            full_smma = pack_mxfp8_scale_mma(full_srows_2d, hidden)
             ffn_encoded_bases = (full_vals, full_srows, full_smma)
             route_words = meta_full[:, self.ffn_meta_scale_cols:].contiguous().view(torch.int32)
             top_k = route_words.shape[1] // 2

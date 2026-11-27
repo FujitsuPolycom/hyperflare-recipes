@@ -1204,3 +1204,257 @@ def test_multilayer_deepseek41_fused_vs_unfused_zero_ulp_parity_and_fx(monkeypat
     fx_out = gm(init_res, init_mix)
     assert torch.equal(fx_out[0].view(torch.uint16), out_unfused[0].view(torch.uint16))
     assert torch.equal(fx_out[1], out_unfused[1])
+
+
+# ---------------------------------------------------------------------------
+# 5. Pre-Slot Geometry/Capacity Validation, Operand Checks, and Transport Key
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_launch_rejected_before_advancing_eager_slot(monkeypatch):
+    """An oversized call must raise before oneshot_channel_sentinel_params advances eager_slot."""
+    tokens, hidden, world = 8, 5120, 4
+    shard_bytes = tokens * hidden * 2  # 81,920 bytes: fits exactly 8 rows
+    g = torch.Generator().manual_seed(55)
+    peer_xs = [
+        (torch.randn((tokens, hidden), dtype=torch.bfloat16, generator=g) * 0.25).contiguous()
+        for _ in range(world)
+    ]
+    peer_state = {"xs": peer_xs, "addends": []}
+    _install_mock_b12x_fused(monkeypatch, peer_state=peer_state)
+    monkeypatch.setattr(
+        "hyperflare_recipes.components.mhc_overlap.register_finalizer",
+        lambda session, fn: None,
+    )
+
+    runtime = _MockPCIeAllReduceRuntime(
+        world_size=world,
+        rank=0,
+        max_size=shard_bytes,
+        eager_buffer_bytes=shard_bytes,
+    )
+    weights = _make_mhc_weights(hidden, torch.bfloat16, seed=55)
+    res = torch.randn((tokens, 4, hidden), dtype=torch.bfloat16, generator=g).contiguous()
+    pp = torch.rand((tokens, 4), dtype=torch.float32, generator=g).contiguous()
+    pc = torch.softmax(torch.randn((tokens, 4, 4), dtype=torch.float32, generator=g), dim=-1).contiguous()
+    pm = torch.softmax(torch.randn((tokens, 4), dtype=torch.float32, generator=g), dim=-1).contiguous()
+
+    fused = PreparedFusedMhcAllReducePostYNorm(
+        (peer_xs[0], res, pp, pc),
+        weights,
+        runtime=runtime,
+        session=object(),
+        norm_eps=1e-6,
+        has_addend=False,
+        emit_mxfp8=False,
+    ).functional()
+    fused._finalize()
+
+    # Valid call advances eager_slot 0 -> 1 using slot 0 (0x100000).
+    fused(peer_xs[0], res, pp, pc, pre_mix=pm)
+    assert runtime.channel._state.eager_slot == 1
+    assert peer_state["calls"][-1]["peer_table_address"] == 0x100000
+
+    # 9-row call exceeds prepared capacity and 81,920-byte sentinel shard; eager_slot must stay 1.
+    x9 = torch.zeros((9, hidden), dtype=torch.bfloat16)
+    res9 = torch.zeros((9, 4, hidden), dtype=torch.bfloat16)
+    pp9 = torch.ones((9, 4), dtype=torch.float32)
+    pc9 = torch.ones((9, 4, 4), dtype=torch.float32)
+    pm9 = torch.ones((9, 4), dtype=torch.float32)
+    with pytest.raises(ValueError, match="requires 1 <= tokens <="):
+        fused(x9, res9, pp9, pc9, pre_mix=pm9)
+    assert runtime.channel._state.eager_slot == 1
+
+    # Shrinking live sentinel shard capacity below payload_bytes must also reject without touching eager_slot.
+    runtime.channel._state.eager_buffer_bytes = 4 * hidden * 2
+    with pytest.raises(ValueError, match="exceeds live sentinel shard capacity"):
+        fused(peer_xs[0], res, pp, pc, pre_mix=pm)
+    assert runtime.channel._state.eager_slot == 1
+
+    # Restoring capacity allows the next valid call to consume slot 1 (0x200000), aligned with peers.
+    runtime.channel._state.eager_buffer_bytes = shard_bytes
+    fused(peer_xs[0], res, pp, pc, pre_mix=pm)
+    assert runtime.channel._state.eager_slot == 2
+    assert peer_state["calls"][-1]["peer_table_address"] == 0x200000
+
+
+def test_runtime_operand_validation_rejects_bad_layout_dtype_and_alignment(monkeypatch):
+    """_cluster_mhc_allreduce_post_y_norm rejects non-contiguous, mistyped, or misaligned operands before slot consumption."""
+    tokens, hidden, world = 8, 5120, 4
+    g = torch.Generator().manual_seed(77)
+    peer_xs = [
+        (torch.randn((tokens, hidden), dtype=torch.bfloat16, generator=g) * 0.25).contiguous()
+        for _ in range(world)
+    ]
+    peer_adds = [
+        (torch.randn((tokens, hidden), dtype=torch.bfloat16, generator=g) * 0.25).contiguous()
+        for _ in range(world)
+    ]
+    peer_state = {"xs": peer_xs, "addends": peer_adds}
+    _install_mock_b12x_fused(monkeypatch, peer_state=peer_state)
+    monkeypatch.setattr(
+        "hyperflare_recipes.components.mhc_overlap.register_finalizer",
+        lambda session, fn: None,
+    )
+
+    runtime = _MockPCIeAllReduceRuntime(world_size=world, rank=0)
+    weights = _make_mhc_weights(hidden, torch.bfloat16, seed=77)
+    res = torch.randn((tokens, 4, hidden), dtype=torch.bfloat16, generator=g).contiguous()
+    pp = torch.rand((tokens, 4), dtype=torch.float32, generator=g).contiguous()
+    pc = torch.softmax(torch.randn((tokens, 4, 4), dtype=torch.float32, generator=g), dim=-1).contiguous()
+    pm = torch.softmax(torch.randn((tokens, 4), dtype=torch.float32, generator=g), dim=-1).contiguous()
+
+    fused = PreparedFusedMhcAllReducePostYNorm(
+        (peer_xs[0], res, pp, pc),
+        weights,
+        runtime=runtime,
+        session=object(),
+        norm_eps=1e-6,
+        has_addend=True,
+        emit_mxfp8=True,
+    ).functional()
+    fused._finalize()
+
+    # 1. Transposed BF16 x with matching [tokens, hidden] shape is non-contiguous.
+    x_transposed = torch.randn((hidden, tokens), dtype=torch.bfloat16).T
+    assert x_transposed.shape == (tokens, hidden) and not x_transposed.is_contiguous()
+    with pytest.raises(ValueError, match="row-major contiguous"):
+        fused(x_transposed, res, pp, pc, pre_mix=pm, input_addend=peer_adds[0])
+    assert runtime.channel._state.eager_slot == 0
+
+    # 2. FP32 input_addend is rejected instead of being misread as BF16.
+    add_fp32 = torch.zeros((tokens, hidden), dtype=torch.float32)
+    with pytest.raises(ValueError, match="input_addend requires dtype"):
+        fused(peer_xs[0], res, pp, pc, pre_mix=pm, input_addend=add_fp32)
+    assert runtime.channel._state.eager_slot == 0
+
+    # 3. Contiguous but non-16-byte-aligned x is rejected.
+    flat_x = torch.zeros(tokens * hidden + 1, dtype=torch.bfloat16)
+    x_unaligned = flat_x[1:].view(tokens, hidden)
+    assert x_unaligned.is_contiguous() and x_unaligned.data_ptr() % 16 != 0
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        fused(x_unaligned, res, pp, pc, pre_mix=pm, input_addend=peer_adds[0])
+    assert runtime.channel._state.eager_slot == 0
+
+    # 4. Contiguous but non-16-byte-aligned input_addend is rejected.
+    add_unaligned = flat_x[1:].view(tokens, hidden)
+    with pytest.raises(ValueError, match="input_addend must be 16-byte aligned"):
+        fused(peer_xs[0], res, pp, pc, pre_mix=pm, input_addend=add_unaligned)
+    assert runtime.channel._state.eager_slot == 0
+
+    # 5. Direct custom-op call with wrong output dtype or misaligned output is rejected.
+    out_ok = torch.empty((tokens, 4, hidden), dtype=torch.bfloat16)
+    y_ok = torch.empty((tokens, hidden), dtype=torch.bfloat16)
+    av_ok = torch.empty((tokens, hidden), dtype=torch.uint8)
+    as_ok = torch.empty((tokens, hidden // 32), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="norm_weight requires dtype"):
+        torch.ops.flare.cluster_mhc_allreduce_post_y_norm(
+            peer_xs[0],
+            peer_adds[0],
+            res,
+            pp,
+            pc,
+            pm,
+            weights.norm.float(),
+            out_ok,
+            y_ok,
+            av_ok,
+            as_ok,
+            [],
+            fused.handle,
+        )
+    assert runtime.channel._state.eager_slot == 0
+
+    with pytest.raises(ValueError, match="prev_post requires dtype"):
+        fused(peer_xs[0], res, pp.bfloat16(), pc, pre_mix=pm, input_addend=peer_adds[0])
+    assert runtime.channel._state.eager_slot == 0
+
+    assert len(peer_state.get("calls", [])) == 0
+
+
+def test_transport_selection_forwarding_and_runner_cache_key_isolation(monkeypatch):
+    """_transport forwards transport when supported and keeps (cs=8, oneshot) distinct from (cs=8, rsag)."""
+    from b12x._lib import compile_plan
+    from b12x.norm.mhc import _split_lagged
+    from hyperflare_recipes.components import mhc_overlap
+
+    before_runners = dict(mhc_overlap._SPLIT_MHC_RUNNERS)
+    try:
+        mhc_overlap._SPLIT_MHC_RUNNERS.clear()
+        seen_transports = []
+
+        def fake_supports(device, max_tokens, hidden_size, norm_dtype, world_size):
+            return True
+
+        def fake_compile_with_transport(
+            ordinal,
+            hidden,
+            world_size,
+            rank,
+            norm_eps,
+            norm_dtype,
+            *,
+            cluster_size=None,
+            emit_mxfp8=False,
+            has_addend=False,
+            device_slot_selection=True,
+            slot_bias=0,
+            release_dependents=False,
+            transport="auto",
+        ):
+            seen_transports.append((cluster_size, transport, device_slot_selection, slot_bias))
+            return SimpleNamespace(tag=(cluster_size, transport, device_slot_selection, slot_bias))
+
+        monkeypatch.setattr(_split_lagged, "supports_cluster_allreduce_post_y_norm", fake_supports, raising=False)
+        monkeypatch.setattr(
+            _split_lagged, "compile_cluster_allreduce_post_y_norm", fake_compile_with_transport, raising=False
+        )
+        monkeypatch.setattr(_split_lagged, "oneshot_channel_sentinel_params", _mock_sentinel_params, raising=False)
+        monkeypatch.setattr(_split_lagged, "split_lagged_cluster_size", lambda m: 8 if m <= 16 else 4, raising=False)
+        monkeypatch.setattr(
+            _split_lagged,
+            "cluster_allreduce_transport",
+            lambda m, w: "oneshot" if (w <= 2 or m <= 4) else "rsag",
+            raising=False,
+        )
+        monkeypatch.setattr(compile_plan, "load_programs", lambda r: None)
+        monkeypatch.setattr(
+            "hyperflare_recipes.components.mhc_overlap.register_finalizer",
+            lambda session, fn: None,
+        )
+
+        hidden, world = 5120, 4
+        runtime = _MockPCIeAllReduceRuntime(world_size=world, rank=0)
+        weights = _make_mhc_weights(hidden, torch.bfloat16, seed=88)
+
+        def make_fused(tokens):
+            x = torch.zeros((tokens, hidden), dtype=torch.bfloat16)
+            res = torch.zeros((tokens, 4, hidden), dtype=torch.bfloat16)
+            pp = torch.ones((tokens, 4), dtype=torch.float32)
+            pc = torch.ones((tokens, 4, 4), dtype=torch.float32)
+            f = PreparedFusedMhcAllReducePostYNorm(
+                (x, res, pp, pc),
+                weights,
+                runtime=runtime,
+                session=object(),
+                norm_eps=1e-6,
+                has_addend=False,
+                emit_mxfp8=False,
+            )
+            f._finalize()
+            return f
+
+        f4 = make_fused(4)
+        f8 = make_fused(8)
+        assert f4._transport() == "oneshot"
+        assert f8._transport() == "rsag"
+        assert [t for _, t, _, _ in seen_transports] == [
+            "oneshot", "oneshot", "oneshot", "rsag", "rsag", "rsag",
+        ]
+        # Both (cs=8, "oneshot") and (cs=8, "rsag") coexist in _SPLIT_MHC_RUNNERS (3 phases each = 6 entries).
+        assert len(mhc_overlap._SPLIT_MHC_RUNNERS) == 6
+        tags = {runner.tag[:2] for runner in mhc_overlap._SPLIT_MHC_RUNNERS.values()}
+        assert tags == {(8, "oneshot"), (8, "rsag")}
+    finally:
+        mhc_overlap._SPLIT_MHC_RUNNERS.clear()
+        mhc_overlap._SPLIT_MHC_RUNNERS.update(before_runners)
