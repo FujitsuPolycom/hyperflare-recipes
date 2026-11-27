@@ -96,6 +96,34 @@ def test_short_prefill_still_fits_the_oneshot_channel():
     assert config.all_reduce_tokens == 64
 
 
+@pytest.mark.parametrize("capacity,dspark,draft_width,spec_tokens,prefill,expected", [
+    (32, True, 8, 128, 4096, 640),
+    (32, True, 6, 64, 4096, 320),
+    (1, True, 6, 64, 4096, 256),
+    (1, False, 1, 64, 64, 64),
+])
+def test_pcie_all_reduce_capacity_covers_engram_decode_reductions(
+        capacity, dspark, draft_width, spec_tokens, prefill, expected):
+    from dataclasses import replace
+    from ignition.parameters import SpeculationParameters
+
+    base = PreparationConfig()
+    spec = (
+        SpeculationParameters(
+            draft_tokens=draft_width - 1, max_draft_tokens=7, token_capacity=spec_tokens,
+            packed_verification=True, draft_prefix_selection="gpu", graph_budget=64,
+        )
+        if dspark else None
+    )
+    config = replace(
+        base,
+        parameters=replace(base.parameters, max_concurrency=capacity, prefill_chunk=prefill, speculation=spec),
+    )
+    assert config.pcie_all_reduce_tokens == expected
+    assert config.pcie_all_reduce_tokens >= 5 * config.decode_tokens
+    assert config.pcie_all_reduce_tokens >= config.all_reduce_tokens
+
+
 def test_three_rank_scratch_preserves_grouped_attention_and_unpadded_experts():
     from dataclasses import replace
     from ignition.parameters import SpeculationParameters, VisionParameters

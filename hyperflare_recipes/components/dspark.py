@@ -7,10 +7,14 @@
 from dataclasses import dataclass
 
 import torch
+import triton
+import triton.language as tl
 
 from hyperflare_recipes.components.speculation import SpeculativeRngState
 
 from ignition.components.collectives import PreparedAllGather
+from ignition.preparation.persistent import persistent_copy
+from ignition.preparation.tensor_metadata import record_numeric_tensor
 from .compressed_mla import PreparedCompressedCacheWriter
 from .embedding import PreparedEmbedding
 from .linear import QuantizedProjection, UnquantizedProjection
@@ -55,6 +59,7 @@ class SpeculativePreparation:
         vocabulary_parallel_sampling=False,
         sampling_runtime=None,
         logprob_runtime=None,
+        copy_draft_tokens=None,
         block_size=None,
         logit_offset=0,
     ):
@@ -77,7 +82,7 @@ class SpeculativePreparation:
         self.rng = SpeculativeRngState.allocate(device, capacity=requests.capacity)
         self.generation = torch.zeros_like(requests.generation)
         self.offset = torch.zeros_like(requests.generation)
-        copy_width = max(7, draft_tokens)
+        copy_width = max(7, draft_tokens, copy_draft_tokens or 0)
         self.copy_ids = torch.full((requests.capacity, copy_width), -1, dtype=torch.int64, device=device)
         self.copy_count = torch.zeros(requests.capacity, dtype=torch.int32, device=device)
         self.copy_expected = torch.full((requests.capacity,), -1, dtype=torch.int64, device=device)
@@ -134,6 +139,36 @@ class PreparedFeedbackCapture:
         return state
 
 
+@triton.jit
+def _context_kv_norm_rope_kernel(
+    KV, Weights, Positions, Frequencies, Out,
+    kv_row_stride, out_stage_stride, out_row_stride,
+    EPS: tl.constexpr,
+):
+    """Fused multi-layer context KV RMSNorm (512) + RoPE (last 64), BF16-exact seam."""
+    row = tl.program_id(0).to(tl.int64)
+    stage = tl.program_id(1).to(tl.int64)
+    col = tl.arange(0, 512)
+    src = KV + row * kv_row_stride + stage * 512
+    dst = Out + stage * out_stage_stride + row * out_row_stride
+    x = tl.load(src + col).to(tl.float32)
+    w = tl.load(Weights + stage * 512 + col).to(tl.float32)
+    inv = tl.rsqrt(tl.sum(x * x, 0) / 512.0 + EPS)
+    tl.store(dst + col, (x * inv * w).to(tl.bfloat16), mask=col < 448)
+    pair = tl.arange(0, 32)
+    xa = tl.load(src + 448 + 2 * pair).to(tl.float32)
+    xb = tl.load(src + 448 + 2 * pair + 1).to(tl.float32)
+    wa = tl.load(Weights + stage * 512 + 448 + 2 * pair).to(tl.float32)
+    wb = tl.load(Weights + stage * 512 + 448 + 2 * pair + 1).to(tl.float32)
+    a = (xa * inv * wa).to(tl.bfloat16).to(tl.float32)
+    b = (xb * inv * wb).to(tl.bfloat16).to(tl.float32)
+    pos = tl.maximum(tl.load(Positions + row), 0).to(tl.float32)
+    angle = pos * tl.load(Frequencies + pair)
+    cos, sin = tl.cos(angle), tl.sin(angle)
+    tl.store(dst + 448 + 2 * pair, (a * cos - b * sin).to(tl.bfloat16))
+    tl.store(dst + 448 + 2 * pair + 1, (a * sin + b * cos).to(tl.bfloat16))
+
+
 class PreparedContext:
     """Project accepted target feedback into persistent draft context rings."""
 
@@ -175,11 +210,20 @@ class PreparedContext:
         self.context_projection = QuantizedProjection(main, weights.draft.context_kv, kv,
             session=session, name=name + ".kv", workspace=workspace, activation_mode="auto").functional(session=session)
         self.rotary = Rotary(weights.config, device)
+        self.eps = float(weights.config.text["rms_norm_eps"])
+        self.fused_stage_norm_rope = device.type == "cuda" and len(weights.draft.layers) > 0
+        self.kv_norm_weights = None
         self.stages = []
+        if self.fused_stage_norm_rope:
+            self.kv_norm_weights = persistent_copy(torch.stack([
+                layer.attention["kv_norm"] for layer in weights.draft.layers
+            ]))
+            record_numeric_tensor(self.kv_norm_weights)
         for index, layer in enumerate(weights.draft.layers):
-            norm = PreparedRMSNorm(kv[:, index * 512:(index + 1) * 512], layer.attention["kv_norm"],
-                normalized, eps=weights.config.text["rms_norm_eps"], session=session,
-                name=f"{name}.{index}.norm").functional()
+            norm = (None if self.fused_stage_norm_rope else PreparedRMSNorm(
+                kv[:, index * 512:(index + 1) * 512], layer.attention["kv_norm"],
+                normalized, eps=self.eps, session=session,
+                name=f"{name}.{index}.norm").functional())
             writer = PreparedCompressedCacheWriter(normalized, pool.window(index, draft=True), slots,
                 page_size=128, kind="swa", session=session, name=f"{name}.{index}.write", cache_format=cache_format)
             self.stages.append((norm, writer.functional(session=session)))
@@ -205,6 +249,14 @@ class PreparedContext:
             live = (positions >= 0) & (offset < count) & (offset >= (count - 128).clamp_min(0))
             slots = torch.where(live, m.state_rows[m.requests] * 128 + positions % 128, -1)
         kv = self.context_projection(self.norm(self.project(auxiliary)))
+        if self.fused_stage_norm_rope:
+            normalized_all = torch.empty((len(self.stages), kv.shape[0], 512), dtype=torch.bfloat16, device=kv.device)
+            torch.library.wrap_triton(_context_kv_norm_rope_kernel)[(kv.shape[0], len(self.stages))](
+                kv, self.kv_norm_weights, positions, self.rotary.frequencies[False], normalized_all,
+                kv.stride(0), normalized_all.stride(0), normalized_all.stride(1), self.eps, num_warps=4)
+            for index, (_, writer) in enumerate(self.stages):
+                writer(normalized_all[index], slots)
+            return
         for index, (norm, writer) in enumerate(self.stages):
             normalized = norm(kv[:, index * 512:(index + 1) * 512])
             self.rotary.apply(normalized, positions.clamp_min(0), compressed=False)

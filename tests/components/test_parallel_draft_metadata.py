@@ -5,6 +5,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from hyperflare_recipes.components.parallel_draft import PreparedParallelDraftRound
@@ -256,3 +257,141 @@ def test_draft_round_builds_its_batch_from_the_layout_declaration(monkeypatch):
         rotary_region="rotary_offset"))
     assert type(declared.validator) is RotaryBatch
     assert declared.metadata.rotary_positions is None
+
+
+@pytest.mark.parametrize("batch,expected_kernel,expected_grid,expected_chunk,expected_warps", [
+    (1, "_markov_step", (8, 1, 1), 64, 4),
+    (2, "_markov_step_batched", (8, 1, 1), 128, 4),
+    (4, "_markov_step_batched4", (8, 1, 1), 128, 2),
+    (8, "_markov_step_batched8", (8, 1, 1), 128, 2),
+    (16, "_markov_step_batched8", (8, 2, 1), 128, 2),
+    (32, "_markov_step_batched8", (8, 4, 1), 128, 2),
+])
+def test_markov_proposals_selects_batched8_through_32_and_pre_resolves_batch_one(
+        monkeypatch, batch, expected_kernel, expected_grid, expected_chunk, expected_warps):
+    import hyperflare_recipes.components.markov_sampling as ms
+    from ignition.components.sampling import DeviceRequestState
+
+    recorded = []
+
+    class FakePrepared:
+        def __init__(self, kernel, args, grid, options):
+            self.kernel, self.args, self.grid, self.options = kernel, args, grid, options
+            self.compiled = None
+
+        def __call__(self):
+            pass
+
+    def fake_prepare_triton(kernel, args, grid, **options):
+        op = FakePrepared(kernel, args, grid, options)
+        recorded.append(op)
+        return op
+
+    monkeypatch.setattr(ms, "prepare_triton", fake_prepare_triton)
+    depth, vocab, rank = 7, 1024, 256
+    state = DeviceRequestState.allocate("cpu", vocab_size=vocab, capacity=max(4, batch))
+    op = ms.PreparedMarkovProposals(
+        torch.zeros((batch, depth, vocab), dtype=torch.bfloat16),
+        torch.zeros((vocab, rank), dtype=torch.bfloat16),
+        torch.zeros((vocab, rank), dtype=torch.bfloat16),
+        torch.zeros((batch,), dtype=torch.int64),
+        torch.zeros((batch, depth), dtype=torch.int64),
+        torch.zeros((batch, depth, vocab), dtype=torch.float32),
+        torch.zeros((batch, depth), dtype=torch.bool),
+        state,
+        torch.arange(batch, dtype=torch.int32),
+        torch.zeros((batch,), dtype=torch.int64),
+        torch.tensor([batch], dtype=torch.int32),
+        torch.zeros((batch,), dtype=torch.int64),
+        torch.zeros((batch,), dtype=torch.int64),
+    )
+    op.prepare()
+    assert op.pre_resolve is True
+    assert len(op.step_ops) == depth
+    assert op.resolve_ops[0] is None
+    assert all(r is not None and r.grid == (batch, 1, 1) for r in op.resolve_ops[1:])
+    assert op.reduce_lse_op is not None and op.reduce_lse_op.grid == (batch, depth, 1)
+    assert op.norm_op.kernel.__name__ == "_normalize_fast"
+    assert op.norm_op.grid == (vocab // 256, batch, depth)
+    for sop in op.step_ops:
+        assert sop.kernel.__name__ == expected_kernel
+        assert sop.grid == expected_grid
+        assert sop.options["CHUNK"] == expected_chunk
+        assert sop.options["num_warps"] == expected_warps
+
+
+@pytest.mark.parametrize("batch,expected_fused", [(1, True), (2, True), (4, True), (8, True), (16, True), (32, True)])
+def test_parallel_draft_round_enables_fused_markov_for_batches_16_and_32(monkeypatch, batch, expected_fused):
+    import hyperflare_recipes.components.markov_sampling as ms
+    import hyperflare_recipes.components.parallel_draft as pd
+    from ignition.components.sampling import DeviceRequestState
+
+    fused_calls = []
+
+    class FakeMarkovProposals:
+        def __init__(self, *args, **kwargs):
+            fused_calls.append((args, kwargs))
+
+        def prepare(self):
+            pass
+
+        def functional(self, **kwargs):
+            return self
+
+    class FakeTokenBroadcast:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(ms, "PreparedMarkovProposals", FakeMarkovProposals)
+    monkeypatch.setattr(ms, "PreparedDraftTokenBroadcast", FakeTokenBroadcast)
+    monkeypatch.setattr(pd, "prepare_sampling_broadcasts", lambda *args, **kwargs: None)
+
+    vocab, depth = 128, 7
+    state = DeviceRequestState.allocate("cpu", vocab_size=vocab, capacity=max(4, batch))
+    head = torch.zeros((vocab, 64), dtype=torch.bfloat16)
+    owner = SimpleNamespace(
+        requests=state,
+        inputs=SimpleNamespace(
+            row_slot_ids=torch.zeros(batch, dtype=torch.int32),
+            row_generations=torch.zeros(batch, dtype=torch.int64),
+            live_rows=torch.tensor([batch], dtype=torch.int32),
+            query_lengths=torch.full((batch,), depth + 1, dtype=torch.int32),
+        ),
+        weights=SimpleNamespace(draft=SimpleNamespace(
+            markov_head=head, markov_embedding=torch.zeros_like(head))),
+        block_proposal_broadcast=True,
+        markov_runtime=None,
+        logit_offset=0,
+        session=None,
+        collectives={"vocabulary_runtime": None, "coordinator": None},
+    )
+    op = object.__new__(pd.PreparedParallelDraftRound)
+    op.owner, op.batch, op.width = owner, batch, depth + 1
+    op.vocabulary_parallel = False
+    op.generate_proposals = True
+    op.proposal_only = True
+    op.target_token_capacity = batch * (depth + 1)
+    op.name = f"proposal{batch}x{depth + 1}"
+    op.operations = None
+    op.selector = None
+    op.shortlisted_selector = None
+    op.markov = object()
+    op.draft = SimpleNamespace(logit_shape=(batch * depth, vocab), logit_dtype=torch.bfloat16,
+                               release_outputs=lambda: None)
+    op.validator = SimpleNamespace(functional=lambda: None)
+    op.validation = SimpleNamespace(functional=lambda **kw: None)
+    op.context = None
+    op.logits = torch.zeros((batch, 1, vocab), dtype=torch.float32)
+    op.drafts = torch.zeros((batch, depth), dtype=torch.int64)
+    op.probabilities = torch.zeros((batch, depth, vocab), dtype=torch.float32)
+    op.valid = torch.zeros((batch, depth), dtype=torch.bool)
+    op.markov_token = torch.zeros((batch,), dtype=torch.int64)
+    op.seed = torch.zeros((batch,), dtype=torch.int64)
+    op.offset = torch.zeros((batch,), dtype=torch.int64)
+    op.base_offset = torch.zeros((batch,), dtype=torch.int64)
+    op.sampled = torch.zeros((batch,), dtype=torch.int64)
+    op.full_proposal = None
+    op.proposal_block = None
+    op.prepare()
+    assert (op.full_proposal is not None) == expected_fused
+    assert len(fused_calls) == (1 if expected_fused else 0)

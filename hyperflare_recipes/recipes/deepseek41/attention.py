@@ -261,6 +261,30 @@ class AttentionScratch:
             zeros((tokens, 32, 128)), zeros((tokens, 32)), zeros((tokens, 128)), zeros((tokens, 128)))
 
 
+@triton.jit
+def _commit_ratio2_pending(
+    Values, Gates, QueryStart, Starts, StateRows, Counts,
+    DestValues, DestGates, DestPosition,
+    vs, gs, dvs, dgs, dps,
+    MAX_ROW: tl.constexpr, WIDTH: tl.constexpr, BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    count = tl.load(Counts + row).to(tl.int64)
+    if count <= 0:
+        return
+    slot = tl.load(StateRows + row).to(tl.int64)
+    position = tl.load(Starts + row).to(tl.int64) + count - 1
+    is_even = (position & 1) == 0
+    tl.store(DestPosition + slot * dps, tl.where(is_even, position, -1))
+    if is_even:
+        src = tl.load(QueryStart + row).to(tl.int64) + count - 1
+        src = tl.minimum(tl.maximum(src, 0), MAX_ROW)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < WIDTH
+        tl.store(DestValues + slot * dvs + cols, tl.load(Values + src * vs + cols, mask=mask), mask=mask)
+        tl.store(DestGates + slot * dgs + cols, tl.load(Gates + src * gs + cols, mask=mask), mask=mask)
+
+
 class PreparedCompressor:
     def __init__(self, layer, weights, source, metadata, pool, slots, *, session, name,
                  deferred=False, examples=None, proj_tokens=None, compress_tokens=None):
@@ -416,13 +440,25 @@ class PreparedCompressor:
             return
         m = metadata
         values, gates = records
+        dest_values = self.pool.region(f"layer{self.layer}.pending_values")
+        dest_gates = self.pool.region(f"layer{self.layer}.pending_gates")
+        dest_position = self.pool.region(f"layer{self.layer}.pending_position")
+        if dest_values.is_cuda:
+            torch.library.wrap_triton(_commit_ratio2_pending)[(m.starts.numel(),)](
+                values, gates, m.query_start_loc, m.starts, m.state_rows, counts,
+                dest_values, dest_gates, dest_position,
+                values.stride(0), gates.stride(0),
+                dest_values.stride(0), dest_gates.stride(0), dest_position.stride(0),
+                values.shape[0] - 1, values.shape[1], triton.next_power_of_2(values.shape[1]),
+            )
+            return
         last = (m.query_start_loc[:-1] + counts - 1).long().clamp(0, values.shape[0] - 1)
         position = m.starts + counts - 1
         pending = (counts > 0) & (position % 2 == 0)
-        for key, source in (("pending_values", values), ("pending_gates", gates)):
-            save_hidden(source[last], self.pool.region(f"layer{self.layer}.{key}"), m.state_rows, pending)
+        for source, destination in ((values, dest_values), (gates, dest_gates)):
+            save_hidden(source[last], destination, m.state_rows, pending)
         tags = torch.where(position % 2 == 0, position, -1).view(-1, 1)
-        save_hidden(tags, self.pool.region(f"layer{self.layer}.pending_position"), m.state_rows, counts > 0)
+        save_hidden(tags, dest_position, m.state_rows, counts > 0)
 
 
 class PreparedGlobalKV:
@@ -697,12 +733,24 @@ class PreparedAttention:
             for w in (weights["qkv_a"], q_b_weight))
         use_a16_qkv = (paired_mxfp8 and prefix_tokens <= 28
                        and not getattr(session, "native_dense_activations", False))
+        norm_quant_kv_rope_dim = (
+            64 if (self.angles is not None and self.angles.split
+                   and getattr(PreparedMLANormQuant, "supports_kv_rope", lambda: False)())
+            else 0
+        )
+        norm_quant_rope_kwargs = (
+            {"kv_rope_dim": norm_quant_kv_rope_dim, "angles": self.angles.values[:prefix_tokens]}
+            if norm_quant_kv_rope_dim > 0 else {}
+        )
         self.norm_quant = (PreparedMLANormQuant(scratch.projected[:prefix_tokens],
             (weights["q_norm"], weights["kv_norm"]), scratch.query_low[:prefix_tokens],
             scratch.window_values[:prefix_tokens],
             eps=self.eps, session=session, name=name + ".qkv_norm",
-            release_dependents=prefix_tokens <= 8, examples=examples)
+            release_dependents=True, examples=examples, **norm_quant_rope_kwargs)
             if paired_mxfp8 and not use_a16_qkv and self.eps == 1e-20 and mla_norm_mxfp8.is_supported(device) else None)
+        self.norm_quant_fused_kv_rope = (
+            self.norm_quant is not None and getattr(self.norm_quant, "kv_rope_dim", 0) > 0
+        )
         for key, w, values, out in (
             ("qkv_a", weights["qkv_a"], source[:prefix_tokens], scratch.projected[:prefix_tokens]),
             ("q_b", q_b_weight, scratch.query_low[:prefix_tokens], query_buf.view(prefix_tokens, -1)),
@@ -1001,6 +1049,9 @@ class PreparedAttention:
             query_low = self.query_norm(projected[:, :1280])
             window_values = self.window_norm(projected[:, 1280:])
             self.angles.apply(window_values, layer_angles)
+        elif getattr(self, "norm_quant_fused_kv_rope", False):
+            query_low, window_values, encoded_bases = self.norm_quant(
+                projected, cos=layer_angles[:, :32], sin=layer_angles[:, 32:])
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
             self.angles.apply(window_values, layer_angles)
@@ -1167,6 +1218,9 @@ class PreparedAttention:
             query_low = self.query_norm(projected[:, :1280])
             window_values = self.window_norm(projected[:, 1280:])
             self.angles.apply(window_values, layer_angles)
+        elif getattr(self, "norm_quant_fused_kv_rope", False):
+            query_low, window_values, encoded_bases = self.norm_quant(
+                projected, cos=layer_angles[:, :32], sin=layer_angles[:, 32:])
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
             self.angles.apply(window_values, layer_angles)
@@ -1198,6 +1252,9 @@ class PreparedAttention:
             query_low = self.query_norm(projected[:, :1280])
             window_values = self.window_norm(projected[:, 1280:])
             self.angles.apply(window_values, layer_angles)
+        elif getattr(self, "norm_quant_fused_kv_rope", False):
+            query_low, window_values, encoded_bases = self.norm_quant(
+                projected, cos=layer_angles[:, :32], sin=layer_angles[:, 32:])
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
             self.angles.apply(window_values, layer_angles)
@@ -1273,6 +1330,9 @@ class PreparedAttention:
                 projected, self.q_norm_weight, self.kv_norm_weight, layer_angles, self.eps)
         elif self.norm_quant is None:
             query_low = self.query_norm(projected[:, :1280])
+        elif getattr(self, "norm_quant_fused_kv_rope", False):
+            query_low, window_values, encoded_bases = self.norm_quant(
+                projected, cos=layer_angles[:, :32], sin=layer_angles[:, 32:])
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
         pending = None
@@ -1281,7 +1341,7 @@ class PreparedAttention:
                 query_low, source, layer_angles,
                 index_angles=indices.angles[(True, 0)] if self.concurrent_query.has_indexer else None,
                 encoded_bases=encoded_bases)
-        if not self.fused_qkv_norm_rope:
+        if not self.fused_qkv_norm_rope and not getattr(self, "norm_quant_fused_kv_rope", False):
             if self.window_norm is not None:
                 window_values = self.window_norm(projected[:, 1280:])
             self.angles.apply(window_values, layer_angles)

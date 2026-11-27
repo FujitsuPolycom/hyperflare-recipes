@@ -13,7 +13,7 @@ import triton.language as tl
 from b12x.attention.dsa_indexer import glm_pool
 from flashinfer.triton.norm import rms_norm, rms_norm_add_residual
 
-from ignition.components.collectives import PreparedAllReduce
+from ignition.components.collectives import PreparedAllReduce, PreparedAllReduceRMSNorm
 from hyperflare_recipes.components.embedding import PreparedEmbedding
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
@@ -242,12 +242,26 @@ class PreparedMTP:
             state, metadata.indexed, mode=mode, session=session, name=f"{name}.mla", workspace=workspace,
             max_cache_pages=max_cache_pages, context=context)
         if not cache_only:
-            self.attention_reduce = PreparedAllReduce(scratch.attention.output, self.attention_output,
-                runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.attention_reduce")
+            self.fused_attention_reduce = PreparedAllReduceRMSNorm.fits(runtime, scratch.attention.output)
+            if self.fused_attention_reduce:
+                self.attention_reduce = PreparedAllReduceRMSNorm(scratch.attention.output, self.residual,
+                    weights.mtp.tensors["post_attention_layernorm"], self.normalized,
+                    eps=self.eps, runtime=runtime, coordinator=coordinator, session=session,
+                    name=f"{name}.attention_reduce_norm")
+            else:
+                self.attention_reduce = PreparedAllReduce(scratch.attention.output, self.attention_output,
+                    runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.attention_reduce")
             self.moe = PreparedGlmMoe(moe, self.normalized, weights.mtp.mlp,
                 scratch.moe, session=session, name=f"{name}.moe", workspace=workspace)
-            self.mlp_reduce = PreparedAllReduce(self.moe.output, self.mlp_output,
-                runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.mlp_reduce")
+            self.fused_mlp_reduce = PreparedAllReduceRMSNorm.fits(runtime, self.moe.output)
+            if self.fused_mlp_reduce:
+                self.mlp_reduce = PreparedAllReduceRMSNorm(self.moe.output, self.residual,
+                    weights.mtp.tensors["shared_head.norm"], self.hidden,
+                    eps=self.eps, runtime=runtime, coordinator=coordinator, session=session,
+                    name=f"{name}.mlp_reduce_norm")
+            else:
+                self.mlp_reduce = PreparedAllReduce(self.moe.output, self.mlp_output,
+                    runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.mlp_reduce")
             self.local_logits = buffer(rows, 154880 // weights.shard.world_size)
             self.logits = buffer(rows, 154880)
             head = weights.mtp.draft_head if weights.mtp.draft_head is not None else weights.head
@@ -296,9 +310,15 @@ class PreparedMTP:
                 m.indexed.query_start_loc, key, gate, index.ape, m.indexed.token_slots,
                 m.indexed.positions, plan=index.pool_plan)
             return
-        attended = self.attention_reduce(self.attention(normalized, m.indexed))
-        rms_norm_add_residual(attended, residual, w["post_attention_layernorm"], self.eps, x_out=normalized)
-        mlp = self.mlp_reduce(self.moe(normalized))
-        hidden = torch.empty_like(normalized)
-        rms_norm_add_residual(mlp, residual, w["shared_head.norm"], self.eps, x_out=hidden)
+        if getattr(self, "fused_attention_reduce", False):
+            normalized = self.attention_reduce(self.attention(normalized, m.indexed), residual)
+        else:
+            attended = self.attention_reduce(self.attention(normalized, m.indexed))
+            rms_norm_add_residual(attended, residual, w["post_attention_layernorm"], self.eps, x_out=normalized)
+        if getattr(self, "fused_mlp_reduce", False):
+            hidden = self.mlp_reduce(self.moe(normalized), residual)
+        else:
+            mlp = self.mlp_reduce(self.moe(normalized))
+            hidden = torch.empty_like(normalized)
+            rms_norm_add_residual(mlp, residual, w["shared_head.norm"], self.eps, x_out=hidden)
         return hidden, self.head(hidden)

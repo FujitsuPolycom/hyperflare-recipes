@@ -871,18 +871,23 @@ def test_prepared_decoder_row_shard_attention_layer_routing_and_kv_runtime(monke
             self.replicated_attention = kwargs.get("replicated_attention")
             self.kv_runtime = kwargs.get("kv_runtime")
             self.engram_min_gather_chunks = kwargs.get("engram_min_gather_chunks")
+            self.incoming_post = kwargs.get("incoming_post")
+            self.defer_mlp_b = kwargs.get("defer_mlp_b")
             self.row_shard_attention = bool(self.row_shard_dma and self.replicated_attention is not None)
             self.p2p_kv_gather = bool(
-                self.row_shard_attention and self.pipelined_attn == "full"
+                self.row_shard_attention and self.pipelined_attn in ("full", "mla_wo")
                 and self.pipelined_attn_hc and self.kv_runtime is not None
             )
             self.kv_gather_0 = SimpleNamespace(plan=SimpleNamespace(tag=f"kv0_{index}")) if self.p2p_kv_gather else None
             self.shard_prep_plans = (SimpleNamespace(tag=f"prep_{index}"),)
             self.ffn_compute_plans = (SimpleNamespace(tag=f"ffn_{index}"),)
             self.boundary = kwargs["boundary"]
-            self.engram = None
+            self.engram = (
+                SimpleNamespace(mix_plan=SimpleNamespace(tag=f"eng_mix_{index}"), use_all_gather=False, reduce=None)
+                if args[0].engram is not None else None
+            )
             self.attention = SimpleNamespace(selectors=[object()], plans=lambda: (SimpleNamespace(tag=f"attn_{index}"),))
-            self.post = None if kwargs["defer_post"] else object()
+            self.post = None if kwargs["defer_post"] else SimpleNamespace(plan=SimpleNamespace(tag=f"post_{index}"))
             self.cr_mlp_1 = SimpleNamespace(reduce=SimpleNamespace(plan=SimpleNamespace(tag=f"mlp1_{index}")))
             self.attention_hc = SimpleNamespace(plan=SimpleNamespace(tag=f"hc_{index}"))
             seen_layers.append(self)
@@ -964,8 +969,9 @@ def test_prepared_decoder_row_shard_attention_layer_routing_and_kv_runtime(monke
         )
         return dec, list(seen_layers), arena
 
-    fake_kv_rt = SimpleNamespace(world_size=4, max_batch_size=2048, heads_per_rank=8, query_head_dim=64)
-    expected_p2p_layers = (3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19)
+    fake_kv_rt = SimpleNamespace(world_size=4, max_batch_size=10240, heads_per_rank=8, query_head_dim=64)
+    expected_p2p_layers = tuple(range(1, 20))
+    expected_full_p2p_layers = (1, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19)
 
     for tokens in (8192, 16384):
         dec_on, layers_on, arena = build(tokens=tokens, row_shard_attention=True, kv_runtime=fake_kv_rt)
@@ -974,18 +980,27 @@ def test_prepared_decoder_row_shard_attention_layer_routing_and_kv_runtime(monke
         assert sharded_indices == EXPECTED_ROW_SHARD_ENCODER_LAYERS
         p2p_indices = tuple(l.index for l in layers_on if l.kv_runtime is not None)
         assert p2p_indices == expected_p2p_layers
+        assert layers_on[0].defer_mlp_b is True and layers_on[13].defer_mlp_b is True
+        assert layers_on[1].incoming_post is layers_on[0].post
+        assert layers_on[14].incoming_post is layers_on[13].post
         assert layers_on[1].engram_min_gather_chunks == 2
         assert layers_on[14].engram_min_gather_chunks == 4
-        # Verify ScratchArena.register_parallel covers both mla_wo carry-in (2, 8) and p2p_kv_gather (15 layers).
-        for idx in (2, 8, *expected_p2p_layers):
+        # Verify ScratchArena.register_parallel covers all 19 carry-in transitions including Engram mix & mla_wo.
+        for idx in expected_p2p_layers:
             prev_plan = layers_on[idx - 1].cr_mlp_1.reduce.plan
             assert (prev_plan, layers_on[idx].attention_hc.plan) in arena._parallel_plans
             for p in layers_on[idx].attention.plans():
                 assert (prev_plan, p) in arena._parallel_plans
-            if idx in expected_p2p_layers:
-                assert (prev_plan, layers_on[idx].kv_gather_0.plan) in arena._parallel_plans
-                for p in layers_on[idx].shard_prep_plans:
-                    assert (prev_plan, p) in arena._parallel_plans
+            assert (prev_plan, layers_on[idx].kv_gather_0.plan) in arena._parallel_plans
+            for p in layers_on[idx].shard_prep_plans:
+                assert (prev_plan, p) in arena._parallel_plans
+            if idx in (1, 14):
+                assert (prev_plan, layers_on[idx].engram.mix_plan) in arena._parallel_plans
+
+    # 1x-sized kv_runtime (max_batch_size=2048) enables p2p on all 16 full layers and falls back on mla_wo.
+    full_only_kv_rt = SimpleNamespace(world_size=4, max_batch_size=2048, heads_per_rank=8, query_head_dim=64)
+    _, layers_full_only, _ = build(tokens=16384, row_shard_attention=True, kv_runtime=full_only_kv_rt)
+    assert tuple(l.index for l in layers_full_only if l.kv_runtime is not None) == expected_full_p2p_layers
 
     # Oversized chunk relative to kv_runtime.max_batch_size falls back cleanly to prefill_collective.
     small_kv_rt = SimpleNamespace(world_size=4, max_batch_size=1024, heads_per_rank=8, query_head_dim=64)
@@ -1024,8 +1039,8 @@ def test_prepared_decoder_row_shard_attention_layer_routing_and_kv_runtime(monke
     coord_remote = SimpleNamespace(spans_hosts=True)
     storage = SimpleNamespace(peer_storage="ipc")
     for chunk_sz, rsa, coord, expected_kv in (
-        (8192, True, coord_local, "ag_1024_2048"),
-        (16384, True, coord_local, "ag_2048_2048"),
+        (8192, True, coord_local, "ag_5120_2048"),
+        (16384, True, coord_local, "ag_10240_2048"),
         (8192, False, coord_local, None),
         (512, True, coord_local, None),
         (8192, True, coord_remote, None),

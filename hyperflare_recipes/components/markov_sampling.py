@@ -802,26 +802,27 @@ def _markov_step_batched8(
     EMBED_FP8: tl.constexpr,
 ):
     block = tl.program_id(0)
+    row_base = tl.program_id(1) * 8
     token = block * BLOCK + tl.arange(0, BLOCK)
     inside = token < V
     if STEP == 0:
-        p0 = tl.minimum(tl.maximum(tl.load(Pending + 0), 0), V - 1)
-        p1 = tl.minimum(tl.maximum(tl.load(Pending + 1), 0), V - 1)
-        p2 = tl.minimum(tl.maximum(tl.load(Pending + 2), 0), V - 1)
-        p3 = tl.minimum(tl.maximum(tl.load(Pending + 3), 0), V - 1)
-        p4 = tl.minimum(tl.maximum(tl.load(Pending + 4), 0), V - 1)
-        p5 = tl.minimum(tl.maximum(tl.load(Pending + 5), 0), V - 1)
-        p6 = tl.minimum(tl.maximum(tl.load(Pending + 6), 0), V - 1)
-        p7 = tl.minimum(tl.maximum(tl.load(Pending + 7), 0), V - 1)
+        p0 = tl.minimum(tl.maximum(tl.load(Pending + row_base + 0), 0), V - 1)
+        p1 = tl.minimum(tl.maximum(tl.load(Pending + row_base + 1), 0), V - 1)
+        p2 = tl.minimum(tl.maximum(tl.load(Pending + row_base + 2), 0), V - 1)
+        p3 = tl.minimum(tl.maximum(tl.load(Pending + row_base + 3), 0), V - 1)
+        p4 = tl.minimum(tl.maximum(tl.load(Pending + row_base + 4), 0), V - 1)
+        p5 = tl.minimum(tl.maximum(tl.load(Pending + row_base + 5), 0), V - 1)
+        p6 = tl.minimum(tl.maximum(tl.load(Pending + row_base + 6), 0), V - 1)
+        p7 = tl.minimum(tl.maximum(tl.load(Pending + row_base + 7), 0), V - 1)
     else:
-        p0 = tl.minimum(tl.maximum(tl.load(Tokens + 0 * DEPTH + STEP - 1), 0), V - 1)
-        p1 = tl.minimum(tl.maximum(tl.load(Tokens + 1 * DEPTH + STEP - 1), 0), V - 1)
-        p2 = tl.minimum(tl.maximum(tl.load(Tokens + 2 * DEPTH + STEP - 1), 0), V - 1)
-        p3 = tl.minimum(tl.maximum(tl.load(Tokens + 3 * DEPTH + STEP - 1), 0), V - 1)
-        p4 = tl.minimum(tl.maximum(tl.load(Tokens + 4 * DEPTH + STEP - 1), 0), V - 1)
-        p5 = tl.minimum(tl.maximum(tl.load(Tokens + 5 * DEPTH + STEP - 1), 0), V - 1)
-        p6 = tl.minimum(tl.maximum(tl.load(Tokens + 6 * DEPTH + STEP - 1), 0), V - 1)
-        p7 = tl.minimum(tl.maximum(tl.load(Tokens + 7 * DEPTH + STEP - 1), 0), V - 1)
+        p0 = tl.minimum(tl.maximum(tl.load(Tokens + (row_base + 0) * DEPTH + STEP - 1), 0), V - 1)
+        p1 = tl.minimum(tl.maximum(tl.load(Tokens + (row_base + 1) * DEPTH + STEP - 1), 0), V - 1)
+        p2 = tl.minimum(tl.maximum(tl.load(Tokens + (row_base + 2) * DEPTH + STEP - 1), 0), V - 1)
+        p3 = tl.minimum(tl.maximum(tl.load(Tokens + (row_base + 3) * DEPTH + STEP - 1), 0), V - 1)
+        p4 = tl.minimum(tl.maximum(tl.load(Tokens + (row_base + 4) * DEPTH + STEP - 1), 0), V - 1)
+        p5 = tl.minimum(tl.maximum(tl.load(Tokens + (row_base + 5) * DEPTH + STEP - 1), 0), V - 1)
+        p6 = tl.minimum(tl.maximum(tl.load(Tokens + (row_base + 6) * DEPTH + STEP - 1), 0), V - 1)
+        p7 = tl.minimum(tl.maximum(tl.load(Tokens + (row_base + 7) * DEPTH + STEP - 1), 0), V - 1)
     if RANK >= 64:
         acc = tl.zeros((BLOCK, 16), dtype=tl.float32)
         cols = tl.arange(0, 16)
@@ -886,7 +887,7 @@ def _markov_step_batched8(
             if EMBED_FP8:
                 br *= tl.load(EmbedScale + pr).to(tl.float32)
             _finish_markov_row(
-                r_idx, pr, br, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
+                row_base + r_idx, pr, br, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
                 Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
                 base_row_stride, base_step_stride, hist_stride, mask_stride,
                 block, token, inside, V, DEPTH, STEP, BLOCKS, CAPACITY, BLOCK,
@@ -905,7 +906,7 @@ def _markov_step_batched8(
             br = _transition_bias(Embed, EmbedScale, Head, HeadScale, pr, token, inside,
                                   RANK, CHUNK, BLOCK, FP8, EMBED_FP8)
             _finish_markov_row(
-                r_idx, pr, br, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
+                row_base + r_idx, pr, br, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
                 Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
                 base_row_stride, base_step_stride, hist_stride, mask_stride,
                 block, token, inside, V, DEPTH, STEP, BLOCKS, CAPACITY, BLOCK,
@@ -964,22 +965,7 @@ def _markov_step(
     if STEP == 0:
         previous = tl.load(Pending + row)
     else:
-        previous = _previous(PreviousMax, PreviousArg, row, BLOCKS, PAD)
-        prior_block = tl.arange(0, PAD)
-        previous_maxima = tl.load(
-            LseMax + (row * DEPTH + STEP - 1) * BLOCKS + prior_block, prior_block < BLOCKS, other=-float("inf")
-        )
-        previous_bad = tl.load(Bad + (row * DEPTH + STEP - 1) * BLOCKS + prior_block, prior_block < BLOCKS, other=0)
-        previous_maximum = tl.max(previous_maxima, 0)
-        previous_valid = (
-            _row_live(Slots, Generations, LiveRows, Generation, Status, row, CAPACITY, BATCH, RUNNING)
-            & (tl.sum(previous_bad.to(tl.int32), 0) == 0)
-            & (previous_maximum == previous_maximum)
-            & (tl.abs(previous_maximum) < float("inf"))
-        )
-        previous = tl.where(previous_valid, previous, 0)
-        if block == 0:
-            tl.store(Tokens + row * DEPTH + STEP - 1, previous)
+        previous = tl.load(Tokens + row * DEPTH + STEP - 1)
     previous = tl.minimum(tl.maximum(previous, 0), V - 1)
     if RANK >= 64:
         acc = tl.zeros((BLOCK, 16), dtype=tl.float32)
@@ -1215,8 +1201,8 @@ class PreparedMarkovProposals:
         b, d, v, block = self.batch, self.depth, self.vocab, self.block
         n = triton.cdiv(v, block)
         rank = self.head_values.shape[1]
-        chunk = 128 if (b in (2, 4, 8) and rank >= 128 and rank % 128 == 0) else 64
-        step_warps = 2 if (b in (4, 8) and rank >= 256) else 4
+        chunk = 128 if ((b in (2, 4) or (b >= 8 and b % 8 == 0)) and rank >= 128 and rank % 128 == 0) else 64
+        step_warps = 2 if ((b == 4 or (b >= 8 and b % 8 == 0)) and rank >= 256) else 4
         common = dict(
             V=v,
             RANK=rank,
@@ -1235,10 +1221,10 @@ class PreparedMarkovProposals:
         )
         kernels = []
         s = self.scratch
-        self.pre_resolve = b in (4, 8) or (b > 1 and b % 2 == 0)
-        if b == 8:
+        self.pre_resolve = True
+        if b >= 8 and b % 8 == 0:
             step_kernel = _markov_step_batched8
-            step_grid = (n, 1, 1)
+            step_grid = (n, b // 8, 1)
         elif b == 4:
             step_kernel = _markov_step_batched4
             step_grid = (n, 1, 1)

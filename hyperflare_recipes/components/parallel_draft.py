@@ -370,8 +370,8 @@ class PreparedParallelDraftRound:
         head = getattr(getattr(o.weights, "draft", None), "markov_head", None)
         from .markov_sampling import RowScaledFP8MarkovWeight
 
-        # Full-vocabulary transition fusion shares transition weight loads across b=1,2,4,8 rows.
-        fuse_markov = (b in (1, 2, 4, 8) and w > 1 and self.generate_proposals
+        # Full-vocabulary transition fusion shares transition weight loads across b=1,2,4 and 8-row batches.
+        fuse_markov = ((b in (1, 2, 4) or (b >= 8 and b % 8 == 0)) and w > 1 and self.generate_proposals
             and getattr(o, "block_proposal_broadcast", False) and o.markov_runtime is None
             and self.selector is None and self.markov is not None
             and ((isinstance(head, torch.Tensor) and head.dtype == torch.bfloat16 and head.is_contiguous())
@@ -800,21 +800,22 @@ class PreparedParallelDraftRound:
         o.offset.copy_(torch.where(matches.any(1), base + 4 * drafts, o.offset))
         o.generation.copy_(torch.where(matches.any(1), o.requests.generation, o.generation))
 
-    def verify(self, proposal_valid=None, *, probabilities, proposal):
+    def verify(self, proposal_valid=None, *, probabilities, proposal, token_limits=None):
         o, b, w = self.owner, self.batch, self.width
         target, _, verify, commit = self.operations
         slots = o.inputs.row_slot_ids[:b].long()
         safe = slots.clamp(0, o.requests.capacity - 1)
         active = proposal.active if proposal_valid is None else proposal.active & proposal_valid
-        limits = torch.where(active, o.inputs.query_lengths[:b], 0)
+        query_limits = o.inputs.query_lengths[:b] if token_limits is None else token_limits
+        limits = torch.where(active, query_limits, 0)
         states = o.inputs.request_state_rows[safe, 0]
         metadata = Metadata.pack(proposal.before, limits, states, o.inputs.page_tables[safe],
             proposal.candidates, o.inputs.live_rows, token_capacity=self.target_token_capacity,
             sample_count=b * w, max_query_tokens=w, rotary_offset=proposal.rotary_offsets)
         hidden, logits, auxiliary, records = self.decoder(metadata)
+        limit_kwargs = {} if token_limits is None else {"token_limits": query_limits}
         if self.vocabulary_parallel:
             target_tile_masses = torch.empty(self.target_mass_shape, dtype=torch.float32, device=logits.device)
-            query_limits = o.inputs.query_lengths[:b]
             target_probabilities, target_valid, _ = target.run(logits.view(b, w, -1), proposal.drafts,
                 tile_masses=target_tile_masses, token_limits=query_limits)
             if proposal.tile_masses is None:
@@ -832,12 +833,13 @@ class PreparedParallelDraftRound:
                               for name, (shape, dtype) in target.layout.items()}
             verify_scratch = {name: torch.empty(shape, dtype=dtype, device=logits.device)
                               for name, (shape, dtype) in verify.layout.items()}
-            target.run(target_scratch, logits.view(b, w, -1), candidates=proposal.drafts)
+            target.run(target_scratch, logits.view(b, w, -1), candidates=proposal.drafts, **limit_kwargs)
             acceptance = verify.run(verify_scratch, probabilities, target_scratch["probabilities"],
-                target_scratch["valid"], disjoint=True, drafts=proposal.drafts, draft_valid=proposal.valid)
+                target_scratch["valid"], disjoint=True, drafts=proposal.drafts, draft_valid=proposal.valid,
+                **limit_kwargs)
         if proposal_valid is not None:
             acceptance.valid.logical_and_(proposal_valid)
-        commit_kwargs = {}
+        commit_kwargs = dict(limit_kwargs)
         if proposal.copy_offered_mask is not None:
             offered = (limits - 1).clamp(0, max(0, w - 1)).to(torch.int64)
             offered_mask = torch.where(
@@ -856,3 +858,105 @@ class PreparedParallelDraftRound:
         if self.context is not None:
             self.context(auxiliary, counts, metadata)
         return metadata, acceptance, committed
+
+
+class PreparedCopyOnlySpeculativeRound:
+    """Target-only wide copy-verify round that skips DSpark and Markov drafting.
+
+    Host copy proposals are validated for slot liveness, generation, cursor
+    freshness, unconstrained grammar, and contiguous in-vocabulary token IDs,
+    then verified directly through the target decoder with point-mass ``q=1.0``
+    proposals. Accepted target feedback updates ``PreparedContext`` so the next
+    learned draft round retains exact draft context KV state.
+    """
+
+    def __init__(self, target, *, name=None):
+        if (target.generate_proposals or target.proposal_only or target.width <= 1
+                or target.draft is not None or target.markov is not None):
+            raise ValueError("copy-only speculative round requires a target-only verification round with width > 1")
+        copy_ids = getattr(target.owner, "copy_ids", None)
+        if copy_ids is None or copy_ids.shape[1] < target.width - 1:
+            raise ValueError("copy-only speculative round requires copy_token_ids covering width - 1 drafts")
+        self.target = target
+        self.name = target.name if name is None else name
+        o = target.owner
+        vocab_parallel = getattr(target, "vocabulary_parallel", False)
+        local_vocab = target.probability_shape[-1] if vocab_parallel else 0
+        self.local_vocab_start = persistent_copy(torch.tensor(
+            [o.weights.shard.rank * local_vocab if vocab_parallel else 0],
+            dtype=torch.int64,
+            device=copy_ids.device,
+        ))
+
+    def _round(self):
+        t = self.target
+        o, b, w = t.owner, t.batch, t.width
+        device = o.requests.histogram.device
+        validation_input, present = t.validator.validate()
+        validated = t.validator.begin(t.validation(validation_input), present=present)
+        active = validated.lengths > 0
+        offsets = row_rotary_offsets(validated)
+        slots = o.inputs.row_slot_ids[:b].long()
+        safe = slots.clamp(0, o.requests.capacity - 1)
+        before = o.requests.consumed_tokens[safe]
+        limits = torch.where(active, o.inputs.query_lengths[:b], 0)
+        candidates = torch.zeros((b, w), dtype=torch.int64, device=device)
+        candidates[:, 0].copy_(o.requests.pending_token[safe])
+        drafts = torch.zeros((b, w - 1), dtype=torch.int64, device=device)
+        valid = torch.zeros((b, w - 1), dtype=torch.bool, device=device)
+        probabilities = torch.zeros(t.probability_shape, dtype=torch.float32, device=device)
+        draft_tile_masses = (
+            torch.zeros(t.draft_mass_shape, dtype=torch.float32, device=device)
+            if t.vocabulary_parallel
+            else None
+        )
+        copy_active, copy_tokens = _resolve_copy_proposals(o, active, safe, before, limits, w - 1)
+        copy_offered_mask = _apply_copy_proposals(
+            drafts,
+            probabilities,
+            valid,
+            copy_active,
+            copy_tokens,
+            vocab_start=self.local_vocab_start if t.vocabulary_parallel else 0,
+            tile_masses=draft_tile_masses,
+        )
+        candidates[:, 1:].copy_(drafts)
+        effective_count = copy_active.to(torch.int32).sum(dim=1)
+        effective_limits = torch.where(active, (effective_count + 1).clamp_max(limits), 0)
+        base_offset = torch.zeros(b, dtype=torch.int64, device=device)
+        proposal = DraftProposalState(
+            before,
+            active,
+            candidates,
+            drafts,
+            valid,
+            base_offset,
+            None,
+            None,
+            offsets,
+            draft_tile_masses,
+            copy_offered_mask,
+        )
+        result = t.verify(
+            probabilities=probabilities,
+            proposal=proposal,
+            token_limits=effective_limits,
+        )
+        return proposal, result
+
+    def __call__(self):
+        _, result = self._round()
+        return result
+
+    def observe(self):
+        """Execute one copy-only round and return its metadata and acceptance for diagnostics."""
+        _, result = self._round()
+        metadata, acceptance, committed = result
+        values = {}
+        for field in ("live_counts", "starts", "lengths", "query_start_loc"):
+            values[f"target.{field}"] = getattr(metadata, field)
+        for field in ("offered_drafts", "accepted_drafts", "survival", "valid"):
+            values[f"acceptance.{field}"] = getattr(acceptance, field)
+        for field in ("accepted_drafts", "emitted_count", "emitted_ids"):
+            values[f"commit.{field}"] = getattr(committed, field)
+        return values
