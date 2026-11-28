@@ -30,6 +30,15 @@ class Inputs:
         state.write_index_keys(keys, index_k_cache=a["index_k_cache"],
                                slot_mapping=torch.arange(pages * page_size, device=device))
         a["page_table"].copy_(torch.arange(pages, dtype=torch.int32, device=device)[None])
+        self.expanded_page_table = None
+        if a.get("request_ids") is not None:
+            rows = a["request_ids"].shape[0]
+            num_requests = a["page_table"].shape[0]
+            a["request_ids"].copy_(
+                (torch.arange(rows, dtype=torch.int32, device=device) * num_requests) // max(rows, 1)
+            )
+            if num_requests not in (1, rows):
+                self.expanded_page_table = a["page_table"][a["request_ids"].long()].contiguous()
         a["active_width"].fill_(pages * page_size)
         if a["candidate_indices"] is not None:
             width = a["candidate_indices"].shape[1]
@@ -40,9 +49,24 @@ class Inputs:
                                for length in sorted({min(512, pages * page_size), pages * page_size}))
         self.producers[-1]()
 
+    def bind_arguments(self, state):
+        if self.arguments.get("request_ids") is None:
+            return self.arguments
+        uses_multiquery = (
+            getattr(state, "multiquery_dense", None) is not None
+            or getattr(state, "multiquery_hierarchical", None) is not None
+        )
+        if uses_multiquery:
+            return self.arguments
+        adapted = {key: value for key, value in self.arguments.items() if key != "request_ids"}
+        if self.expanded_page_table is not None:
+            adapted["page_table"] = self.expanded_page_table
+        return adapted
+
     @property
     def nbytes(self):
-        return self.query.nbytes + sum(t.nbytes for t in self.arguments.values() if t is not None)
+        extra = 0 if self.expanded_page_table is None else self.expanded_page_table.nbytes
+        return self.query.nbytes + extra + sum(t.nbytes for t in self.arguments.values() if t is not None)
 
 
 def acquire_inputs(state, arguments, session):
@@ -55,6 +79,6 @@ def acquire_inputs(state, arguments, session):
 def benchmark_call(state, *, arguments, session, workspace):
     inputs = acquire_inputs(state, arguments, session)
     scratch = planned_scratch(state.layout.scratch_specs(), workspace)
-    binding = state.bind(scratch=scratch, **inputs.arguments)
+    binding = state.bind(scratch=scratch, **inputs.bind_arguments(state))
     return PreparedCall(run=lambda: state.run(binding), produce=inputs.producers[0],
         benchmark_producers=inputs.producers, owners=(inputs, scratch, binding))

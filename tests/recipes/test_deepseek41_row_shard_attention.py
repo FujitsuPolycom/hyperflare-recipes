@@ -78,7 +78,7 @@ def _sm120_gpus(count: int, capability: tuple[int, int] = (12, 0)) -> tuple[Gpu,
 def test_replicated_attention_layer_schedule_and_exact_byte_accounting(monkeypatch):
     cfg = _qualified_model_config()
     assert cfg.decoder_start == 20
-    assert ds_attention.INDEXER_QUERY_ROWS == 512
+    assert ds_attention.INDEXER_QUERY_ROWS == 2048
 
     full_layers = ds_config.full_attention_encoder_layers(cfg)
     assert full_layers == EXPECTED_FULL_ATTN_ENCODER_LAYERS
@@ -659,14 +659,16 @@ def test_prepared_attention_shard_validation_and_rank_invariant_execution(monkey
         lambda self, pos: torch.zeros((pos.numel(), 64), dtype=torch.float32, device=pos.device),
     )
 
-    # Verify INDEXER_QUERY_ROWS=512 selector batching across st = 128, 256, 512, 768, 1024, 2048!
+    # Verify INDEXER_QUERY_ROWS=2048 selector batching across single- and multi-batch shard sizes.
     for test_st, expected_batches in (
         (128, [128]),
         (256, [256]),
         (512, [512]),
-        (768, [512, 256]),
-        (1024, [512, 512]),
-        (2048, [512, 512, 512, 512]),
+        (768, [768]),
+        (1024, [1024]),
+        (2048, [2048]),
+        (2560, [2048, 512]),
+        (4096, [2048, 2048]),
     ):
         selector_decls.clear()
         tok = test_st * 8
