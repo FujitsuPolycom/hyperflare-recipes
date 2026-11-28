@@ -504,12 +504,15 @@ def test_finalize_precompiles_all_slot_phases_and_tracks_live_epoch(monkeypatch)
     assert len(finalizers) == 1
     finalizers[0]()
 
+    from hyperflare_recipes.components.mhc_overlap import _allreduce_cluster_size_for_tokens
+
     assert fused.emit_mxfp8 is True
     assert len(compiled_log) == 3
     assert len(loaded_log) == 3
     phases = [(spec[9], spec[10]) for spec in compiled_log]
     assert phases == [(False, 0), (True, 0), (True, 1)]
-    assert all(spec[6] == 8 and spec[7] is True and spec[11] is True for spec in compiled_log)
+    expected_cs = _allreduce_cluster_size_for_tokens(tokens)
+    assert all(spec[6] == expected_cs and spec[7] is True and spec[11] is True for spec in compiled_log)
 
     # 1 warmup call advances eager_slot 0 -> 1 (odd phase!)
     fused(peer_xs[0], res, pp, pc, pre_mix=pm)
@@ -1410,6 +1413,7 @@ def test_transport_selection_forwarding_and_runner_cache_key_isolation(monkeypat
             _split_lagged, "compile_cluster_allreduce_post_y_norm", fake_compile_with_transport, raising=False
         )
         monkeypatch.setattr(_split_lagged, "oneshot_channel_sentinel_params", _mock_sentinel_params, raising=False)
+        monkeypatch.setattr(_split_lagged, "cluster_allreduce_cluster_size", None, raising=False)
         monkeypatch.setattr(_split_lagged, "split_lagged_cluster_size", lambda m: 8 if m <= 16 else 4, raising=False)
         monkeypatch.setattr(
             _split_lagged,
@@ -1455,6 +1459,153 @@ def test_transport_selection_forwarding_and_runner_cache_key_isolation(monkeypat
         assert len(mhc_overlap._SPLIT_MHC_RUNNERS) == 6
         tags = {runner.tag[:2] for runner in mhc_overlap._SPLIT_MHC_RUNNERS.values()}
         assert tags == {(8, "oneshot"), (8, "rsag")}
+    finally:
+        mhc_overlap._SPLIT_MHC_RUNNERS.clear()
+        mhc_overlap._SPLIT_MHC_RUNNERS.update(before_runners)
+
+
+def test_allreduce_cluster_size_uses_b12x_selector_and_fallback_while_split_lagged_keeps_non_ar(monkeypatch):
+    """Fused mHC AllReduce uses cluster_allreduce_cluster_size with fallback while SplitLaggedMHC keeps split_lagged_cluster_size."""
+    from b12x._lib import compile_plan
+    from b12x.norm.mhc import _split_lagged
+    from hyperflare_recipes.components import mhc_overlap
+
+    before_runners = dict(mhc_overlap._SPLIT_MHC_RUNNERS)
+    try:
+        mhc_overlap._SPLIT_MHC_RUNNERS.clear()
+        ar_compiled = []
+        post_y_compiled = []
+
+        def fake_supports(device, max_tokens, hidden_size, norm_dtype, world_size):
+            return True
+
+        def fake_compile_ar(
+            ordinal,
+            hidden,
+            world_size,
+            rank,
+            norm_eps,
+            norm_dtype,
+            *,
+            cluster_size=None,
+            emit_mxfp8=False,
+            has_addend=False,
+            device_slot_selection=True,
+            slot_bias=0,
+            release_dependents=False,
+            transport="auto",
+        ):
+            ar_compiled.append((cluster_size, device_slot_selection, slot_bias))
+            return SimpleNamespace(tag=("ar", cluster_size, device_slot_selection, slot_bias))
+
+        def fake_compile_post_y(
+            ordinal,
+            hidden,
+            pre_only,
+            norm_eps,
+            norm_dtype,
+            *,
+            cluster_size=None,
+            emit_mxfp8=False,
+        ):
+            post_y_compiled.append(cluster_size)
+            return SimpleNamespace(tag=("post_y", cluster_size))
+
+        def fake_compile_fn_sinkhorn(ordinal, hidden, rms_eps, hc_eps, sinkhorn_iters, max_tokens=None):
+            return SimpleNamespace(tag=("fn_sink", max_tokens))
+
+        monkeypatch.setattr(_split_lagged, "supports_cluster_allreduce_post_y_norm", fake_supports, raising=False)
+        monkeypatch.setattr(_split_lagged, "compile_cluster_allreduce_post_y_norm", fake_compile_ar, raising=False)
+        monkeypatch.setattr(_split_lagged, "oneshot_channel_sentinel_params", _mock_sentinel_params, raising=False)
+        monkeypatch.setattr(_split_lagged, "compile_cluster_post_y_norm", fake_compile_post_y, raising=False)
+        monkeypatch.setattr(_split_lagged, "compile_readonly_fn_sinkhorn", fake_compile_fn_sinkhorn, raising=False)
+        monkeypatch.setattr(
+            _split_lagged,
+            "split_lagged_cluster_size",
+            lambda m: 8 if m <= 16 else (4 if m <= 48 else 1),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            _split_lagged,
+            "cluster_allreduce_cluster_size",
+            lambda m: 4 if m <= 4 else 1,
+            raising=False,
+        )
+        monkeypatch.setattr(compile_plan, "load_programs", lambda r: None)
+        monkeypatch.setattr(
+            "hyperflare_recipes.components.mhc_overlap.register_finalizer",
+            lambda session, fn: None,
+        )
+
+        hidden, world = 5120, 4
+        runtime = _MockPCIeAllReduceRuntime(world_size=world, rank=0)
+        weights = _make_mhc_weights(hidden, torch.bfloat16, seed=91)
+
+        # 1. With cluster_allreduce_cluster_size exposed: fused AR selects 4 (M<=4) / 1 (M>=5).
+        assert mhc_overlap._allreduce_cluster_size_for_tokens(1) == 4
+        assert mhc_overlap._allreduce_cluster_size_for_tokens(4) == 4
+        assert mhc_overlap._allreduce_cluster_size_for_tokens(8) == 1
+        assert mhc_overlap._allreduce_cluster_size_for_tokens(32) == 1
+        assert mhc_overlap._cluster_size_for_tokens(4) == 8
+        assert mhc_overlap._cluster_size_for_tokens(8) == 8
+        assert mhc_overlap._cluster_size_for_tokens(32) == 4
+
+        def finalize_fused(tokens):
+            x = torch.zeros((tokens, hidden), dtype=torch.bfloat16)
+            res = torch.zeros((tokens, 4, hidden), dtype=torch.bfloat16)
+            pp = torch.ones((tokens, 4), dtype=torch.float32)
+            pc = torch.ones((tokens, 4, 4), dtype=torch.float32)
+            f = PreparedFusedMhcAllReducePostYNorm(
+                (x, res, pp, pc),
+                weights,
+                runtime=runtime,
+                session=object(),
+                norm_eps=1e-6,
+            )
+            f._finalize()
+            return f
+
+        finalize_fused(4)
+        finalize_fused(8)
+        assert [cs for cs, _, _ in ar_compiled] == [4, 4, 4, 1, 1, 1]
+        ar_key_cluster_sizes = {
+            key[7] for key in mhc_overlap._SPLIT_MHC_RUNNERS if key[0] == "fused_ar_post_y"
+        }
+        assert ar_key_cluster_sizes == {4, 1}
+
+        # Non-AR SplitLaggedMHC._finalize must keep split_lagged_cluster_size (8 for M=8, 4 for M=32).
+        for tokens, expected_cs in ((4, 8), (8, 8), (32, 4)):
+            sl = object.__new__(mhc_overlap.SplitLaggedMHC)
+            sl.experts = None
+            sl.device = torch.device("cpu")
+            sl.tokens = tokens
+            sl.hidden = hidden
+            sl.pre_only = False
+            sl.norm_eps = 1e-6
+            sl.rms_eps = 1e-6
+            sl.hc_eps = 1e-6
+            sl.sinkhorn_iters = 20
+            sl.weights = weights
+            sl.emit_mxfp8 = False
+            sl.compile_post_y = True
+            sl._finalize()
+            assert post_y_compiled[-1] == expected_cs
+
+        # 2. Without cluster_allreduce_cluster_size: falls back cleanly to _cluster_size_for_tokens.
+        ar_compiled.clear()
+        mhc_overlap._SPLIT_MHC_RUNNERS.clear()
+        monkeypatch.delattr(_split_lagged, "cluster_allreduce_cluster_size", raising=False)
+        assert mhc_overlap._allreduce_cluster_size_for_tokens(4) == 8
+        assert mhc_overlap._allreduce_cluster_size_for_tokens(8) == 8
+        assert mhc_overlap._allreduce_cluster_size_for_tokens(32) == 4
+
+        finalize_fused(8)
+        finalize_fused(32)
+        assert [cs for cs, _, _ in ar_compiled] == [8, 8, 8, 4, 4, 4]
+        fallback_key_cluster_sizes = {
+            key[7] for key in mhc_overlap._SPLIT_MHC_RUNNERS if key[0] == "fused_ar_post_y"
+        }
+        assert fallback_key_cluster_sizes == {8, 4}
     finally:
         mhc_overlap._SPLIT_MHC_RUNNERS.clear()
         mhc_overlap._SPLIT_MHC_RUNNERS.update(before_runners)

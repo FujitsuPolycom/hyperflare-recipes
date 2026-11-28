@@ -180,6 +180,15 @@ def _cluster_size_for_tokens(tokens: int) -> int:
     return 8 if selector is None else int(selector(tokens))
 
 
+def _allreduce_cluster_size_for_tokens(tokens: int) -> int:
+    from b12x.norm.mhc import _split_lagged
+
+    selector = getattr(_split_lagged, "cluster_allreduce_cluster_size", None)
+    if selector is not None:
+        return int(selector(tokens))
+    return _cluster_size_for_tokens(tokens)
+
+
 def _fn_sinkhorn_bucket(tokens: int) -> int | None:
     from b12x.norm.mhc import _split_lagged
 
@@ -856,7 +865,7 @@ class PreparedFusedMhcAllReducePostYNorm:
         from b12x.norm.mhc._split_lagged import compile_cluster_allreduce_post_y_norm
 
         ordinal = int(self.device.index or 0)
-        cluster_size = _cluster_size_for_tokens(self.tokens)
+        cluster_size = _allreduce_cluster_size_for_tokens(self.tokens)
         bias = int(slot_bias) & 1 if device_slot_selection else 0
         extra_kwargs: dict[str, object] = {}
         try:
@@ -894,7 +903,7 @@ class PreparedFusedMhcAllReducePostYNorm:
             )
         self.experts = None
         ordinal = int(self.device.index or 0)
-        cluster_size = _cluster_size_for_tokens(self.tokens)
+        cluster_size = _allreduce_cluster_size_for_tokens(self.tokens)
         transport = self._transport()
         for dev_sel, bias in ((False, 0), (True, 0), (True, 1)):
             runner = self._compile_variant(dev_sel, bias)

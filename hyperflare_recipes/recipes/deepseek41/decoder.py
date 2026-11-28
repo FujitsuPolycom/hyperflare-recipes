@@ -2095,12 +2095,14 @@ class PreparedDecoder:
                  vocabulary_runtime, coordinator, session, name, workspace,
                  vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None,
                  suffix_runtime=None, kv_runtime=None, encoder_only=False, row_shard_prefill=False,
-                 row_shard_attention=False):
+                 row_shard_attention=False, compact_logits=False):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         self.mode = mode
         self.encoder_only = bool(encoder_only)
+        self._compact_logits_requested = bool(compact_logits)
+        self.compact_logits = False
         self.vision = vision if mode == "prefill" else None
         self.table_requests = PreparedTableRequests(tables, metadata, pool, session=session, name=name + ".table_requests")
         decoder_start = weights.config.decoder_start
@@ -2510,6 +2512,15 @@ class PreparedDecoder:
         self.compact_head = scratch.hidden.shape[0] > self.output_metadata.token_ids.numel()
         head_rows = self.output_metadata.token_ids.numel() if self.compact_head else scratch.hidden.shape[0]
         self.head_hidden = scratch.hidden[:head_rows]
+        self.compact_logits = bool(self._compact_logits_requested and vocabulary_parallel and self.compact_head)
+        if self.compact_logits:
+            local_slice = scratch.local_logits[:head_rows]
+            self.head = PreparedVocabularyProjection(self.head_hidden, weights.head, local_slice,
+                local_slice, runtime=vocabulary_runtime, coordinator=coordinator, session=session,
+                name=name + ".head", row_indices=None, gather=False, workspace=workspace)
+            self.local_logits = local_slice
+            self.head.functional(session=session, dynamic_indices=False)
+            return
         head_output = scratch.logits
         if vocabulary_parallel and self.compact_head:
             # Declare expanded local logits independently of the physical projection rows.
@@ -2668,8 +2679,8 @@ class PreparedDecoder:
         else:
             hidden = torch.empty_like(collapsed)
             normalize(collapsed, self.weights.norm, hidden, self.weights.config.text["rms_norm_eps"])
-        logits = self.head(hidden, row_indices=samples if self.compact_head else None)
-        if self.compact_head:
+        logits = self.head(hidden, row_indices=samples if (self.compact_head and not self.compact_logits) else None)
+        if self.compact_head and not self.compact_logits:
             hidden = hidden[samples]
         if self.mode != "verify":
             self.table_requests.commit(source_metadata.lengths, raw_history, source_metadata)

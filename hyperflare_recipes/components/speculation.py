@@ -777,7 +777,7 @@ class PreparedSpeculativeStateCommit:
         return self
 
     def __call__(self, logits=None, *, acceptance=None, inputs=None, copy_offered_mask=None,
-                 slots=None, generations=None, live_rows=None, token_limits=None):
+                 slots=None, generations=None, live_rows=None, token_limits=None, sample_indices=None):
         functional = getattr(self, "_functional", False)
         state = self.state
         slots = self.slots if slots is None else slots
@@ -954,6 +954,9 @@ class PreparedSpeculativeStateCommit:
             self.records.index_copy_(0, self.frame.long(), record_output.unsqueeze(0))
             if logits is None:
                 self.logprobs()
+            elif sample_indices is not None:
+                self.logprobs.run(logits, slots=slots, generations=generations, live_rows=live_rows,
+                                  sample_indices=sample_indices)
             else:
                 self.logprobs.run(logits, slots=slots, generations=generations, live_rows=live_rows)
         return out
