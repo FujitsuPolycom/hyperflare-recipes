@@ -4,6 +4,9 @@
 
 """Capture a chain of dense projections alongside independent main-stream work."""
 
+import itertools
+import weakref
+
 import torch
 
 from hyperflare_recipes.components.dense_epilogues import (
@@ -459,6 +462,12 @@ def _fake_join_attn_preencoded_rope(query_low, layer_angles, dependency, q_out,
     pass
 
 
+_AUX_INDEXED_OWNERS: weakref.WeakValueDictionary[int, "ConcurrentAttentionAux"] = (
+    weakref.WeakValueDictionary()
+)
+_AUX_INDEXED_HANDLES = itertools.count(1)
+
+
 @torch.library.custom_op(
     "flare::start_attention_aux_indexed",
     mutates_args=("q_out", "iq_out", "iw_out", "packed_list", "scales_list", "workspace"),
@@ -476,7 +485,7 @@ def _start_attn_aux_indexed(
     packed_list: list[torch.Tensor], scales_list: list[torch.Tensor],
     selector_handles: list[int], selector_starts: list[int], selector_ends: list[int],
     workspace: torch.Tensor, q_head_dim: int, iq_head_dim: int, rope_dim: int,
-    iw_scale: float, stream: int,
+    iw_scale: float, stream: int, handle: int,
 ) -> None:
     from b12x.attention import dsa_indexer as dsa
     from b12x.preparation.types import plan_from_handle
@@ -485,21 +494,26 @@ def _start_attn_aux_indexed(
     auxiliary = torch.cuda.ExternalStream(stream, device=query_low.device)
     auxiliary.wait_stream(torch.cuda.current_stream(query_low.device))
     with torch.cuda.stream(auxiliary):
+        # Run indexer preparation first and record an internal event before q_b so the
+        # main stream can overlap MXFP4 selection with q_b (+ RoPE) on the auxiliary stream.
+        _run_mxfp8_with_rope(query_low, iq_w, iq_s, iq_gain, iq_act_scale, iq_scale_kind,
+                             iq_out, workspace, iq_plan, index_angles, iq_head_dim, rope_dim, auxiliary)
+        bf16_out(source, iw_w, iw_out, iw_plan)
+        iw_out.mul_(iw_scale)
+        iq_view = iq_out.view(query_low.shape[0], 32, iq_head_dim)
+        for sel_handle, first, last, packed, scales in zip(
+                selector_handles, selector_starts, selector_ends, packed_list, scales_list, strict=True):
+            dsa.quantize_q_mxfp4(plan_from_handle(sel_handle), iq_view[first:last],
+                                 q_mxfp4=packed, q_scales=scales)
+        owner = _AUX_INDEXED_OWNERS[handle]
+        if owner.index_ready_event is not None:
+            owner.index_ready_event.record(auxiliary)
         if q_values_base is not None:
             _run_encoded_with_rope(q_values_base, q_mma_base, q_w, q_s, q_out, workspace,
                                    q_plan, layer_angles, q_head_dim, rope_dim, stream=auxiliary)
         else:
             _run_mxfp8_with_rope(query_low, q_w, q_s, q_gain, q_act_scale, q_scale_kind,
                                  q_out, workspace, q_plan, layer_angles, q_head_dim, rope_dim, auxiliary)
-        _run_mxfp8_with_rope(query_low, iq_w, iq_s, iq_gain, iq_act_scale, iq_scale_kind,
-                             iq_out, workspace, iq_plan, index_angles, iq_head_dim, rope_dim, auxiliary)
-        bf16_out(source, iw_w, iw_out, iw_plan)
-        iw_out.mul_(iw_scale)
-        iq_view = iq_out.view(query_low.shape[0], 32, iq_head_dim)
-        for handle, first, last, packed, scales in zip(
-                selector_handles, selector_starts, selector_ends, packed_list, scales_list, strict=True):
-            dsa.quantize_q_mxfp4(plan_from_handle(handle), iq_view[first:last],
-                                 q_mxfp4=packed, q_scales=scales)
 
 
 @_start_attn_aux_indexed.register_fake
@@ -509,23 +523,47 @@ def _fake_start_attn_aux_indexed(
     iq_w, iq_s, iq_gain, iq_act_scale, iq_scale_kind, iq_plan, iw_w, iw_plan,
     q_out, iq_out, iw_out, packed_list, scales_list,
     selector_handles, selector_starts, selector_ends, workspace,
-    q_head_dim, iq_head_dim, rope_dim, iw_scale, stream,
+    q_head_dim, iq_head_dim, rope_dim, iw_scale, stream, handle,
+):
+    pass
+
+
+@torch.library.custom_op(
+    "flare::join_attention_aux_indexer",
+    mutates_args=("iq_out", "iw_out", "packed_list", "scales_list"),
+)
+def _join_attn_aux_indexer(
+    query_low: torch.Tensor, source: torch.Tensor, index_angles: torch.Tensor,
+    dep_window: torch.Tensor, dep_global: torch.Tensor,
+    iq_out: torch.Tensor, iw_out: torch.Tensor,
+    packed_list: list[torch.Tensor], scales_list: list[torch.Tensor],
+    stream: int, handle: int,
+) -> None:
+    owner = _AUX_INDEXED_OWNERS[handle]
+    current = torch.cuda.current_stream(query_low.device)
+    if owner.index_ready_event is not None:
+        current.wait_event(owner.index_ready_event)
+    else:
+        current.wait_stream(torch.cuda.ExternalStream(stream, device=query_low.device))
+
+
+@_join_attn_aux_indexer.register_fake
+def _fake_join_attn_aux_indexer(
+    query_low, source, index_angles, dep_window, dep_global,
+    iq_out, iw_out, packed_list, scales_list, stream, handle,
 ):
     pass
 
 
 @torch.library.custom_op(
     "flare::join_attention_aux_indexed",
-    mutates_args=("q_out", "iq_out", "iw_out", "packed_list", "scales_list", "workspace"),
+    mutates_args=("q_out", "workspace"),
 )
 def _join_attn_aux_indexed(
-    query_low: torch.Tensor, source: torch.Tensor,
-    layer_angles: torch.Tensor, index_angles: torch.Tensor,
-    dep_window: torch.Tensor, dep_global: torch.Tensor,
+    query_low: torch.Tensor, layer_angles: torch.Tensor,
+    dependency: torch.Tensor,
     q_values_base: torch.Tensor | None, q_row_base: torch.Tensor | None, q_mma_base: torch.Tensor | None,
-    q_out: torch.Tensor, iq_out: torch.Tensor, iw_out: torch.Tensor,
-    packed_list: list[torch.Tensor], scales_list: list[torch.Tensor],
-    workspace: torch.Tensor, stream: int,
+    q_out: torch.Tensor, workspace: torch.Tensor, stream: int,
 ) -> None:
     torch.cuda.current_stream(query_low.device).wait_stream(
         torch.cuda.ExternalStream(stream, device=query_low.device))
@@ -533,15 +571,14 @@ def _join_attn_aux_indexed(
 
 @_join_attn_aux_indexed.register_fake
 def _fake_join_attn_aux_indexed(
-    query_low, source, layer_angles, index_angles, dep_window, dep_global,
-    q_values_base, q_row_base, q_mma_base, q_out, iq_out, iw_out,
-    packed_list, scales_list, workspace, stream,
+    query_low, layer_angles, dependency,
+    q_values_base, q_row_base, q_mma_base, q_out, workspace, stream,
 ):
     pass
 
 
 class ConcurrentAttentionAux:
-    """Overlap q_b (+ fused RoPE) and optional indexer query/weight/quantize on auxiliary stream."""
+    """Overlap indexer preparation and q_b (+ fused RoPE) on an auxiliary stream."""
 
     def __init__(self, q_b: QuantizedProjection, *, parallel_plans, session, workspace: ScratchArena,
                  index_query: QuantizedProjection | None = None,
@@ -583,6 +620,8 @@ class ConcurrentAttentionAux:
         self.index_weight = index_weight
         self.selectors = tuple(selectors)
         self.selector_rows = int(selector_rows)
+        self.handle = None
+        self.index_ready_event = None
         side_plans = [q_b.plan]
         if self.has_indexer:
             if index_query.encoded is not None or index_query.bias is not None or index_weight.bias is not None:
@@ -597,7 +636,15 @@ class ConcurrentAttentionAux:
                 index_query.weight.global_scale_kind if fp4 else "none")
             self.iw_weight = index_weight.weight
             side_plans.extend((index_query.plan, index_weight.plan))
-        for main in self.parallel_plans:
+            self.handle = next(_AUX_INDEXED_HANDLES)
+            _AUX_INDEXED_OWNERS[self.handle] = self
+            if q_b.output.device.type == "cuda":
+                self.index_ready_event = torch.cuda.Event()
+                self.index_ready_event.record(self.stream)
+            for selector in self.selectors:
+                workspace.register_parallel(selector.plan, q_b.plan)
+            self.parallel_plans = (*self.parallel_plans, *(selector.plan for selector in self.selectors))
+        for main in parallel_plans:
             for side in side_plans:
                 workspace.register_parallel(main, side)
         self.side_plans = tuple(side_plans)
@@ -678,7 +725,7 @@ class ConcurrentAttentionAux:
                 q_out, iq_out, iw_out, packed_list, scales_list,
                 self.selector_handles, self.selector_starts, self.selector_ends,
                 workspace, self.q_head_dim, self.iq_head_dim, self.rope_dim,
-                float(128 ** -.5 * 32 ** -.5), self.stream_handle)
+                float(128 ** -.5 * 32 ** -.5), self.stream_handle, self.handle)
             return (query_low, source, layer_angles, index_angles, encoded_bases,
                     q_out, iq_out, iw_out, packed_list, scales_list, workspace)
         if self.q_preencoded:
@@ -693,19 +740,29 @@ class ConcurrentAttentionAux:
                                workspace, self.q_handle, self.q_head_dim, self.rope_dim, self.stream_handle)
         return (query_low, layer_angles, encoded_bases, q_out, workspace)
 
+    def finish_indexer(self, pending, dependency, *, global_dependency=None):
+        """Wait for auxiliary indexer preparation while q_b (+ RoPE) continues overlapping."""
+        if not self.has_indexer:
+            raise RuntimeError("finish_indexer requires an overlapped indexer branch")
+        (query_low, source, _layer_angles, index_angles, _encoded_bases,
+         _q_out, iq_out, iw_out, packed_list, scales_list, _workspace) = pending
+        _join_attn_aux_indexer(
+            query_low, source, index_angles,
+            dependency, dependency if global_dependency is None else global_dependency,
+            iq_out, iw_out, packed_list, scales_list, self.stream_handle, self.handle)
+        return iq_out, iw_out, tuple(zip(packed_list, scales_list, strict=True))
+
     def finish(self, pending, dependency, *, global_dependency=None):
         if self.has_indexer:
-            (query_low, source, layer_angles, index_angles, encoded_bases,
-             q_out, iq_out, iw_out, packed_list, scales_list, workspace) = pending
+            (query_low, _source, layer_angles, _index_angles, encoded_bases,
+             q_out, _iq_out, _iw_out, _packed_list, _scales_list, workspace) = pending
             q_vb = None if encoded_bases is None else encoded_bases[0]
             q_rb = None if encoded_bases is None else encoded_bases[1]
             q_mb = None if encoded_bases is None else encoded_bases[2]
             _join_attn_aux_indexed(
-                query_low, source, layer_angles, index_angles,
-                dependency, dependency if global_dependency is None else global_dependency,
-                q_vb, q_rb, q_mb, q_out, iq_out, iw_out, packed_list, scales_list,
-                workspace, self.stream_handle)
-            return q_out, iq_out, iw_out, tuple(zip(packed_list, scales_list, strict=True))
+                query_low, layer_angles, dependency,
+                q_vb, q_rb, q_mb, q_out, workspace, self.stream_handle)
+            return q_out
         query_low, layer_angles, encoded_bases, q_out, workspace = pending
         if self.q_preencoded:
             _join_attn_preencoded_rope(query_low, layer_angles, dependency, q_out,

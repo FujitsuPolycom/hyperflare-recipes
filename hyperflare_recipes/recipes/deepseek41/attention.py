@@ -27,7 +27,10 @@ from hyperflare_recipes.components.linear import (
     UnquantizedProjection,
 )
 from hyperflare_recipes.components.mla_norm_quant import PreparedMLANormQuant
-from hyperflare_recipes.components.mxfp4_indexer import PreparedMXFP4Indexer
+from hyperflare_recipes.components.mxfp4_indexer import (
+    PreparedMXFP4Indexer,
+    supports_mxfp4_request_ids,
+)
 from hyperflare_recipes.components.projection_overlap import (
     ConcurrentAttentionAux,
     register_tc_gemv_rope,
@@ -49,7 +52,7 @@ from .pool import PAGE_TOKENS
 
 
 # Bound indexer workspace while amortizing prefill selection launches.
-INDEXER_QUERY_ROWS = 512
+INDEXER_QUERY_ROWS = 2048
 
 
 @dataclass(frozen=True)
@@ -598,6 +601,29 @@ class PreparedBF16GroupedOutputProjection:
         return self.wo_b(mid)
 
 
+def _should_use_request_page_table(
+    *,
+    mode: str,
+    row_shard_attention: bool,
+    layer: int,
+    candidate_source: int,
+    idx_tokens: int,
+    num_requests: int,
+    width_cap: int,
+) -> bool:
+    """Return True when decode/speculative indexing should pass [B, blocks] pages with request_ids."""
+    return (
+        mode in ("decode", "verify", "draft")
+        and not row_shard_attention
+        and supports_mxfp4_request_ids()
+        and layer <= candidate_source
+        and 2 <= idx_tokens <= INDEXER_QUERY_ROWS
+        and 1 <= num_requests < idx_tokens
+        and width_cap > 512
+        and (layer < candidate_source or (width_cap + 7) // 8 <= 32768)
+    )
+
+
 class PreparedAttention:
     q_b_fused_rope = False
     q_b_dense_rope = False
@@ -816,6 +842,7 @@ class PreparedAttention:
                 proj_tokens=self.shard_tokens if self.row_shard_attention else None,
                 compress_tokens=self.half_tokens if self.row_shard_attention else None)
         self.kv_pack_cols = 512 + (0 if self.global_kv is None else (2048 if self.ratio == 2 else 512))
+        self.use_request_page_table = False
         if "index_q" in weights:
             idx_tokens = self.shard_tokens if self.row_shard_attention else tokens
             self.index_query = QuantizedProjection(scratch.query_low[:idx_tokens], weights["index_q"],
@@ -827,6 +854,23 @@ class PreparedAttention:
             candidate_source = config.text["candidate_source_layer_id"]
             if layer >= candidate_source and scratch.candidates.shape[0] < idx_tokens:
                 raise ValueError("hierarchical selection exceeds candidate row capacity")
+            index_page_size = 128 // self.ratio
+            width_cap = metadata.page_table.shape[1] * index_page_size
+            num_requests = metadata.page_table.shape[0]
+            self.use_request_page_table = _should_use_request_page_table(
+                mode=mode,
+                row_shard_attention=self.row_shard_attention,
+                layer=layer,
+                candidate_source=candidate_source,
+                idx_tokens=idx_tokens,
+                num_requests=num_requests,
+                width_cap=width_cap,
+            )
+            decl_request_ids = (
+                metadata.requests[:idx_tokens].clamp(0, num_requests - 1).to(torch.int32).contiguous()
+                if self.use_request_page_table
+                else None
+            )
             for first in range(0, idx_tokens, INDEXER_QUERY_ROWS):
                 last = min(idx_tokens, first + INDEXER_QUERY_ROWS)
                 candidates = {}
@@ -836,10 +880,12 @@ class PreparedAttention:
                     candidates = dict(candidates=scratch.candidates[first:last], counts=scratch.candidate_counts[first:last])
                 selector = PreparedMXFP4Indexer(scratch.index_query[first:last], scratch.index_weights[first:last],
                     pool.pages[f"layer{self.source.layer}.index_page"],
-                    self.page_table[first:last],
+                    metadata.page_table if self.use_request_page_table else self.page_table[first:last],
                     self.lengths[first:last], self.active_width, scratch.selected[first:last],
-                    page_size=128 // self.ratio, session=session, name=f"{name}.index{first}", workspace=workspace,
-                    mode="prefill" if mode == "prefill" else "decode", **candidates)
+                    page_size=index_page_size, session=session, name=f"{name}.index{first}", workspace=workspace,
+                    mode="prefill" if mode == "prefill" else "decode",
+                    request_ids=None if decl_request_ids is None else decl_request_ids[first:last],
+                    **candidates)
                 self.selectors.append(selector)
         indexed = ({} if (not self.ratio and not self.dfly_indexed) else dict(
             indexed=pool.pages[f"layer{self.source.layer}.latent_page"],
@@ -1352,7 +1398,6 @@ class PreparedAttention:
         dependency = window_cache
         selected, candidates, candidate_counts = selection
         records = None
-        joined_query = False
         if self.ratio:
             geometry = indices.compressed(self.ratio)
             global_dep = None
@@ -1363,24 +1408,29 @@ class PreparedAttention:
             if self.selectors:
                 quantized_list = None
                 if self.concurrent_query is not None and self.concurrent_query.has_indexer:
-                    q_flat, iq_flat, index_weights, quantized_list = self.concurrent_query.finish(
+                    iq_flat, index_weights, quantized_list = self.concurrent_query.finish_indexer(
                         pending, window_cache, global_dependency=global_dep)
-                    query = q_flat.view(self.query_shape)
                     index_query = iq_flat.view(source.shape[0], 32, 128)
-                    joined_query = True
                 else:
                     index_query = self._project_index_q_with_rope(query_low, indices.angles[(True, 0)], source.shape[0])
                     index_weights = self.index_weight(source)
                     index_weights.mul_(128 ** -.5 * 32 ** -.5)
+                selector_req_ids = (
+                    m.requests.clamp(0, m.page_table.shape[0] - 1).to(torch.int32).contiguous()
+                    if self.use_request_page_table
+                    else None
+                )
                 outputs, candidate_outputs, count_outputs = [], [], []
                 for ordinal, selector in enumerate(self.selectors):
                     first = ordinal * INDEXER_QUERY_ROWS
                     last = min(source.shape[0], first + INDEXER_QUERY_ROWS)
                     result = selector(index_query[first:last], index_weights[first:last],
-                        m.token_page_table[first:last], geometry.lengths[first:last], geometry.active_width,
+                        m.page_table if self.use_request_page_table else m.token_page_table[first:last],
+                        geometry.lengths[first:last], geometry.active_width,
                         candidates=None if self.layer <= self.candidate_source else candidates[first:last],
                         counts=None if self.layer <= self.candidate_source else candidate_counts[first:last],
-                        quantized=None if quantized_list is None else quantized_list[ordinal])
+                        quantized=None if quantized_list is None else quantized_list[ordinal],
+                        request_ids=None if selector_req_ids is None else selector_req_ids[first:last])
                     if self.layer == self.candidate_source:
                         result, next_candidates, next_counts = result
                         candidate_outputs.append(next_candidates)
@@ -1391,7 +1441,7 @@ class PreparedAttention:
                     candidates = candidate_outputs[0] if len(candidate_outputs) == 1 else torch.cat(candidate_outputs, dim=0)
                     candidate_counts = count_outputs[0] if len(count_outputs) == 1 else torch.cat(count_outputs, dim=0)
                 dependency = selected
-        if self.concurrent_query is not None and not joined_query:
+        if self.concurrent_query is not None:
             query = self.concurrent_query.finish(pending, dependency).view(self.query_shape)
         if self.dfly_indexed:
             attended = self.attention(query, indices.window_indices, indices.window_lengths,
