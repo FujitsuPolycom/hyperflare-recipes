@@ -395,3 +395,175 @@ def test_overlapped_dspark_context_0ulp_parity_and_cudagraph(tokens):
         finally:
             g_sync.reset()
             g_ovlp.reset()
+
+
+class _StepGateFwd:
+    def __init__(self, op_eager, verify_op, logits, pending, seeds, offsets, limits,
+                 target_p, target_v, target_tm, out_q, out_v, out_t, out_tm, out_conf,
+                 out_acc_valid, out_acc_offered):
+        self.op_eager, self.verify_op = op_eager, verify_op
+        self.logits, self.pending, self.seeds, self.offsets, self.limits = logits, pending, seeds, offsets, limits
+        self.target_p, self.target_v, self.target_tm = target_p, target_v, target_tm
+        self.out_q, self.out_v, self.out_t, self.out_tm, self.out_conf = out_q, out_v, out_t, out_tm, out_conf
+        self.out_acc_valid, self.out_acc_offered = out_acc_valid, out_acc_offered
+
+    def __call__(self):
+        self.op_eager.run(
+            self.logits, self.out_t, pending=self.pending, seeds=self.seeds, offsets=self.offsets,
+            probabilities=self.out_q, valid=self.out_v, tokens=self.out_t,
+            tile_masses=self.out_tm, token_limits=self.limits, confidence=self.out_conf,
+        )
+        acc = self.verify_op.run(
+            self.out_q, self.out_t, self.target_p, self.out_v, self.target_v,
+            token_limits=self.limits, draft_tile_masses=self.out_tm, target_tile_masses=self.target_tm,
+        )
+        self.out_acc_valid.copy_(acc.valid)
+        self.out_acc_offered.copy_(acc.offered_drafts)
+
+
+@pytest.mark.parametrize("batch,width,fp8", [(1, 7, True), (4, 7, True), (16, 7, False)])
+@torch.no_grad()
+def test_proposal_step_gates_skip_inactive_steps_0ulp_and_cudagraph(batch, width, fp8):
+    """Per-step proposal gating skips steps >= max(limits - 1) with 0-ULP parity under CUDAGraph."""
+    from hyperflare_recipes.components.markov_sampling import fp8_markov_head
+    from hyperflare_recipes.components.speculation import DRAFT_RNG_DOMAIN
+
+    torch._dynamo.reset()
+    device = torch.device("cuda:0")
+    vocab = 1024
+    rank = 64
+    blocks = (vocab + 255) // 256
+    gen = torch.Generator(device="cpu").manual_seed(777 + batch * 17 + int(fp8))
+
+    state = DeviceRequestState.allocate(device, vocab_size=vocab, capacity=max(16, batch))
+    state.status.fill_(RUNNING)
+    state.generation.fill_(11)
+    state.seed[:batch].copy_(torch.arange(batch, dtype=torch.int64) + 9001)
+    state.parameters[:batch].copy_(torch.tensor([0.8, 1.0, 0.0, 1.0, 0.0, 0.0]))
+    state.top_k.fill_(-1)
+    slots = torch.arange(batch, dtype=torch.int32, device=device)
+    epochs = torch.full((batch,), 11, dtype=torch.int64, device=device)
+    live = torch.tensor([batch], dtype=torch.int32, device=device)
+
+    emb = (torch.randn((vocab, rank), generator=gen) * 0.1).to(device=device, dtype=torch.bfloat16)
+    head_bf16 = (torch.randn((vocab, rank), generator=gen) * 0.1).to(device=device, dtype=torch.bfloat16)
+    head = fp8_markov_head(head_bf16) if fp8 else head_bf16
+    logits = (torch.randn((batch, width, vocab), generator=gen) * 0.5).to(device=device, dtype=torch.bfloat16)
+    pending = torch.randint(0, vocab, (batch,), generator=gen, dtype=torch.int64).to(device)
+    seeds = state.seed[:batch].view(torch.int64) ^ DRAFT_RNG_DOMAIN
+    offsets = torch.full((batch,), 123, dtype=torch.int64, device=device)
+    limits = torch.full((batch,), 3, dtype=torch.int32, device=device)
+
+    # Eager check: verify step_gates tensor values and skipped-step storage preservation.
+    e_probs = torch.full((batch, width, vocab), -99.0, dtype=torch.float32, device=device)
+    e_valid = torch.ones((batch, width), dtype=torch.bool, device=device)
+    e_tokens = torch.full((batch, width), -7, dtype=torch.int64, device=device)
+    e_masses = torch.full((batch, width, blocks), -55.0, dtype=torch.float32, device=device)
+    e_conf = torch.full((batch, width), -33.0, dtype=torch.float32, device=device)
+    op_eager = PreparedVocabularySoftmax(
+        logits, e_probs, e_valid, state, slots, epochs, live, e_tokens,
+        start=0, runtime=None, session=None, coordinator=None, name="stepgate.eager",
+        embedding=emb, head=head, pending=pending, seeds=seeds, offsets=offsets,
+        tokens=e_tokens, tile_masses=e_masses, token_limits=limits, confidence=e_conf,
+    )
+    assert op_eager.step_gated
+    op_eager.prepare()
+    # Reference without token_limits (computes all steps unconditionally).
+    ref_probs = torch.empty((batch, width, vocab), dtype=torch.float32, device=device)
+    ref_valid = torch.empty((batch, width), dtype=torch.bool, device=device)
+    ref_tokens = torch.zeros((batch, width), dtype=torch.int64, device=device)
+    ref_masses = torch.empty((batch, width, blocks), dtype=torch.float32, device=device)
+    ref_conf = torch.empty((batch, width), dtype=torch.float32, device=device)
+    op_ref = PreparedVocabularySoftmax(
+        logits, ref_probs, ref_valid, state, slots, epochs, live, ref_tokens,
+        start=0, runtime=None, session=None, coordinator=None, name="stepgate.ref",
+        embedding=emb, head=head, pending=pending, seeds=seeds, offsets=offsets,
+        tokens=ref_tokens, tile_masses=ref_masses, token_limits=None, confidence=ref_conf,
+    )
+    assert not op_ref.step_gated
+    op_ref.prepare()
+
+    op_eager()
+    op_ref()
+    torch.cuda.synchronize()
+    # max(limits - 1) == 2 -> steps 0, 1 open; steps 2..6 closed.
+    gates = op_eager.scratch["step_gates"][:, 0].tolist()
+    assert gates == [1, 1] + [0] * (width - 2)
+    assert e_valid[:, :2].all() and not e_valid[:, 2:].any()
+    assert (e_tokens[:, 2:] == 0).all()
+    assert (e_conf[:, 2:] == 0.0).all()
+    assert torch.equal(e_tokens[:, :2], ref_tokens[:, :2])
+    assert torch.equal(e_probs[:, :2].view(torch.int32), ref_probs[:, :2].view(torch.int32))
+    assert torch.equal(e_masses[:, :2].view(torch.int32), ref_masses[:, :2].view(torch.int32))
+    assert torch.equal(e_conf[:, :2].view(torch.int32), ref_conf[:, :2].view(torch.int32))
+    # Inactive steps >= max_drafts did NOT touch tile_masses (sentinel preserved).
+    assert (e_masses[:, 2:] == -55.0).all()
+
+    # Functional + AOT + CUDAGraph replay across varying dynamic token_limits + BlockVerification.
+    rng_g = SpeculativeRngState.allocate(device, capacity=max(16, batch))
+    rng_g.generation.fill_(11)
+    target_p = torch.full((batch, width + 1, vocab), 1.0 / vocab, dtype=torch.float32, device=device)
+    target_tm = torch.full((batch, width + 1, blocks), 256.0 / vocab, dtype=torch.float32, device=device)
+    target_v = torch.ones((batch, width + 1), dtype=torch.bool, device=device)
+
+    verify_op = PreparedVocabularyBlockVerification(
+        e_probs, e_tokens, target_p, state, slots, epochs, live,
+        start=0, runtime=None, session=None, coordinator=None, name="stepgate.verify",
+        rng=rng_g, draft_valid=e_valid, target_valid=target_v, token_limits=limits,
+        draft_tile_masses=e_masses, target_tile_masses=target_tm,
+    )
+    verify_op.prepare()
+    op_eager.functional(session=None)
+    verify_op.functional(session=None)
+
+    out_q = torch.empty((batch, width, vocab), dtype=torch.float32, device=device)
+    out_v = torch.empty((batch, width), dtype=torch.bool, device=device)
+    out_t = torch.empty((batch, width), dtype=torch.int64, device=device)
+    out_tm = torch.empty((batch, width, blocks), dtype=torch.float32, device=device)
+    out_conf = torch.empty((batch, width), dtype=torch.float32, device=device)
+    out_acc_valid = torch.empty((batch,), dtype=torch.bool, device=device)
+    out_acc_offered = torch.empty((batch,), dtype=torch.int32, device=device)
+
+    fwd = _StepGateFwd(
+        op_eager, verify_op, logits, pending, seeds, offsets, limits,
+        target_p, target_v, target_tm, out_q, out_v, out_t, out_tm, out_conf,
+        out_acc_valid, out_acc_offered,
+    )
+    compiled = aot_forward(fwd)
+    compiled(fwd)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled(fwd)
+    try:
+        # Test dynamic limit transitions: 1 (0 drafts), mixed [4, 2, ...], full 8 (7 drafts).
+        test_schedules = [
+            [1] * batch,
+            [min(width + 1, 2 + (r % 4)) for r in range(batch)],
+            [width + 1] * batch,
+        ]
+        for sched in test_schedules:
+            limits.copy_(torch.tensor(sched, dtype=torch.int32, device=device))
+            out_tm.fill_(float("nan"))
+            out_v.fill_(True)
+            out_t.fill_(-1)
+            out_conf.fill_(float("nan"))
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+            assert out_acc_valid.all()
+            for r, lim in enumerate(sched):
+                nd = lim - 1
+                assert int(out_acc_offered[r].item()) == nd
+                if nd > 0:
+                    assert out_v[r, :nd].all()
+                    assert torch.equal(out_t[r, :nd], ref_tokens[r, :nd])
+                    assert torch.equal(out_q[r, :nd].view(torch.int32), ref_probs[r, :nd].view(torch.int32))
+                    assert torch.equal(out_conf[r, :nd].view(torch.int32), ref_conf[r, :nd].view(torch.int32))
+                if nd < width:
+                    assert not out_v[r, nd:].any()
+                    assert (out_t[r, nd:] == 0).all()
+                    assert (out_conf[r, nd:] == 0.0).all()
+    finally:
+        graph.reset()

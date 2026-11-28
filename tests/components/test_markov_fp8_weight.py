@@ -135,6 +135,7 @@ def _score_tiles_markov_cases():
             limits,
             None,
             None,
+            None,
             logits.stride(0),
             logits.stride(1),
             histogram.stride(0),

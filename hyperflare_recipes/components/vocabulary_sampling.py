@@ -27,6 +27,38 @@ _TARGET_DOMAIN = tl.constexpr(TARGET_RNG_DOMAIN)
 
 
 @triton.jit
+def _prepare_proposal_step_gates(
+    Limits,
+    Valid,
+    Tokens,
+    Confidence,
+    StepGates,
+    BATCH: tl.constexpr,
+    WIDTH: tl.constexpr,
+    ACTIVE_STEPS: tl.constexpr,
+    BATCH_PAD: tl.constexpr,
+    STEP_PAD: tl.constexpr,
+    HAS_CONFIDENCE: tl.constexpr = False,
+):
+    """Compute per-step proposal execution gates and clear inactive slots."""
+    row = tl.arange(0, BATCH_PAD)
+    step = tl.arange(0, STEP_PAD)
+    row_ok = row < BATCH
+    limits = tl.load(Limits + row, row_ok, other=0)
+    drafts = tl.maximum(limits - 1, 0)
+    max_drafts = tl.max(tl.where(row_ok, drafts, 0), 0)
+    gate_val = tl.where(step < max_drafts, 1, 0).to(tl.int32)
+    # 4-int32 (16-byte) stride keeps every per-step gate view 16-byte aligned.
+    tl.store(StepGates + step * 4, gate_val, step < ACTIVE_STEPS)
+    inactive = row_ok[:, None] & (step[None, :] < WIDTH) & (step[None, :] >= drafts[:, None])
+    idx = row[:, None] * WIDTH + step[None, :]
+    tl.store(Valid + idx, False, mask=inactive)
+    tl.store(Tokens + idx, 0, mask=inactive)
+    if HAS_CONFIDENCE:
+        tl.store(Confidence + idx, 0.0, mask=inactive)
+
+
+@triton.jit
 def _score_tiles(
     VocabularyOffset,
     Logits,
@@ -50,6 +82,7 @@ def _score_tiles(
     Seeds,
     Offsets,
     Limits,
+    Gate,
     SampleIndices,
     SampleLimits,
     logit_row_stride,
@@ -72,8 +105,12 @@ def _score_tiles(
     STEP: tl.constexpr,
     BLOCK: tl.constexpr,
     HAS_LIMITS: tl.constexpr = False,
+    HAS_GATE: tl.constexpr = False,
     HAS_INDICES: tl.constexpr = False,
 ):
+    if HAS_GATE:
+        if tl.load(Gate) == 0:
+            return
     tile, lane_row = tl.program_id(0), tl.program_id(1)
     position = STEP if SAMPLE else lane_row % WIDTH
     request_row = lane_row if SAMPLE else lane_row // WIDTH
@@ -184,6 +221,7 @@ def _score_tiles_markov_batched(
     Seeds,
     Offsets,
     Limits,
+    Gate,
     logit_row_stride,
     logit_step_stride,
     hist_stride,
@@ -205,8 +243,12 @@ def _score_tiles_markov_batched(
     BLOCK: tl.constexpr,
     ROWS_PER_CTA: tl.constexpr,
     HAS_LIMITS: tl.constexpr = False,
+    HAS_GATE: tl.constexpr = False,
 ):
     """Multi-row Tensor-Core Markov proposal scorer sharing Head loads across ROWS_PER_CTA requests."""
+    if HAS_GATE:
+        if tl.load(Gate) == 0:
+            return
     tile = tl.program_id(0)
     r_base = tl.program_id(1) * ROWS_PER_CTA
     cols = tl.arange(0, 16)
@@ -330,7 +372,10 @@ def _score_tiles_markov_batched(
 
 
 @triton.jit
-def _softmax_records(Partials, Summary, BLOCKS: tl.constexpr, PAD: tl.constexpr):
+def _softmax_records(Partials, Summary, Gate, BLOCKS: tl.constexpr, PAD: tl.constexpr, HAS_GATE: tl.constexpr = False):
+    if HAS_GATE:
+        if tl.load(Gate) == 0:
+            return
     row = tl.program_id(0)
     tile = tl.arange(0, PAD)
     base = Partials + row * 6 * BLOCKS + tile
@@ -386,6 +431,7 @@ def _finish_distribution(
     Params,
     CopyActive,
     CopyTokens,
+    Gate,
     SampleIndices,
     SampleLimits,
     LOCAL: tl.constexpr,
@@ -404,8 +450,12 @@ def _finish_distribution(
     HAS_LIMITS: tl.constexpr = False,
     HAS_CONFIDENCE: tl.constexpr = False,
     HAS_COPY: tl.constexpr = False,
+    HAS_GATE: tl.constexpr = False,
     HAS_INDICES: tl.constexpr = False,
 ):
+    if HAS_GATE:
+        if tl.load(Gate) == 0:
+            return
     tile, distribution = tl.program_id(0), tl.program_id(1)
     row = distribution if SAMPLE else distribution // WIDTH
     position = STEP if SAMPLE else distribution % WIDTH
@@ -557,11 +607,10 @@ def _selected_records(
         if (not HAS_LIMITS) or (step < limit):
             if PRECOMPUTED_MASSES:
                 pmass = tl.sum(tl.load(PMass + (row * WIDTH + step) * BLOCKS + tile, tile < BLOCKS, other=0.0), 0)
-                qmass = (
-                    tl.sum(tl.load(QMass + (row * (WIDTH - 1) + step) * BLOCKS + tile, tile < BLOCKS, other=0.0), 0)
-                    if step < WIDTH - 1
-                    else tl.full((), 0.0, tl.float32)
-                )
+                if (step < WIDTH - 1) and ((not HAS_LIMITS) or (step < limit - 1)):
+                    qmass = tl.sum(tl.load(QMass + (row * (WIDTH - 1) + step) * BLOCKS + tile, tile < BLOCKS, other=0.0), 0)
+                else:
+                    qmass = tl.full((), 0.0, tl.float32)
             else:
                 base = Partials + (row * WIDTH + step) * 3 * BLOCKS + tile
                 pmass = tl.sum(tl.load(base, tile < BLOCKS, other=0.0), 0)
@@ -928,15 +977,24 @@ class PreparedVocabularySoftmax:
         self.vocabulary_offset = persistent_copy(torch.tensor([start], dtype=torch.int32, device=device))
         self.embedding, self.head, self.scale, self.pending = embedding, values, scale, pending
         self.seeds, self.offsets, self.tokens, self.sample = seeds, offsets, tokens, sample
+        self.step_gated = bool(sample and self.has_token_limits and self.active_steps > 1)
         summary_rows = b if sample else b * w
+        scratch_spec = dict(
+            partials=((summary_rows, 6, blocks), torch.float32),
+            summary=((summary_rows, SUMMARY_WORDS), torch.float32),
+            gathered=((summary_rows, world * SUMMARY_WORDS), torch.float32),
+        )
+        if self.step_gated:
+            scratch_spec["step_gates"] = ((self.active_steps, 4), torch.int32)
         self.scratch = bind_scratch(
-            dict(
-                partials=((summary_rows, 6, blocks), torch.float32),
-                summary=((summary_rows, SUMMARY_WORDS), torch.float32),
-                gathered=((summary_rows, world * SUMMARY_WORDS), torch.float32),
-            ),
+            scratch_spec,
             device=device,
             workspace=workspace,
+        )
+        self._step_gate_views = (
+            tuple(self.scratch["step_gates"][i, :1] for i in range(self.active_steps))
+            if self.step_gated
+            else ()
         )
         self.gather = PreparedAllGather(
             self.scratch["summary"],
@@ -945,7 +1003,9 @@ class PreparedVocabularySoftmax:
             session=session,
             coordinator=coordinator,
             name=name + ".statistics",
+            has_gate=self.step_gated,
         )
+        self.step_gate_kernel = None
         self.steps = None
 
     def prepare(self):
@@ -955,10 +1015,24 @@ class PreparedVocabularySoftmax:
         blocks = triton.cdiv(local, 256)
         use_batched_markov = self.markov and self.sample and b >= 2 and self.head.shape[1] >= 64
         rows_per_cta = min(b, 8) if use_batched_markov else 1
+        if self.step_gated:
+            self.step_gate_kernel = prepare_triton(
+                _prepare_proposal_step_gates,
+                (self.limits, self.valid, self.tokens, self.confidence, s["step_gates"]),
+                (1, 1, 1),
+                BATCH=b,
+                WIDTH=w,
+                ACTIVE_STEPS=self.active_steps,
+                BATCH_PAD=triton.next_power_of_2(b),
+                STEP_PAD=triton.next_power_of_2(w),
+                HAS_CONFIDENCE=self.has_confidence,
+                num_warps=4,
+            )
         steps = []
         logit_step_stride = 0 if self.has_indices else self.logits.stride(1)
         for step in range(self.active_steps if self.sample else 1):
             summary_rows = b if self.sample else b * w
+            step_gate_arg = self._step_gate_views[step] if self.step_gated else None
             score_prefix_args = (
                 self.vocabulary_offset,
                 self.logits,
@@ -982,6 +1056,7 @@ class PreparedVocabularySoftmax:
                 self.seeds,
                 self.offsets,
                 self.limits,
+                step_gate_arg,
             )
             score_stride_args = (
                 self.logits.stride(0),
@@ -1006,6 +1081,7 @@ class PreparedVocabularySoftmax:
                 STEP=step,
                 BLOCK=256,
                 HAS_LIMITS=self.has_token_limits,
+                HAS_GATE=self.step_gated,
                 num_warps=4,
                 enable_fp_fusion=False,
             )
@@ -1027,10 +1103,11 @@ class PreparedVocabularySoftmax:
                 )
             summary = prepare_triton(
                 _softmax_records,
-                (s["partials"], s["summary"]),
+                (s["partials"], s["summary"], step_gate_arg),
                 (summary_rows, 1, 1),
                 BLOCKS=blocks,
                 PAD=triton.next_power_of_2(blocks),
+                HAS_GATE=self.step_gated,
                 num_warps=4,
             )
             normalize = prepare_triton(
@@ -1052,6 +1129,7 @@ class PreparedVocabularySoftmax:
                     state.parameters,
                     self.copy_active,
                     self.copy_tokens,
+                    step_gate_arg,
                     self.sample_indices,
                     self.sample_limits,
                 ),
@@ -1072,6 +1150,7 @@ class PreparedVocabularySoftmax:
                 HAS_LIMITS=self.has_token_limits,
                 HAS_CONFIDENCE=self.has_confidence,
                 HAS_COPY=self.has_copy,
+                HAS_GATE=self.step_gated,
                 HAS_INDICES=self.has_indices,
                 num_warps=4,
                 enable_fp_fusion=False,
@@ -1091,6 +1170,13 @@ class PreparedVocabularySoftmax:
         self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()
                              if value is not None}
         names = {id(value): name for name, value in values.items() if value is not None}
+        for i, view in enumerate(self._step_gate_views):
+            names[id(view)] = f"step_gate_{i}"
+        if self.step_gate_kernel is not None:
+            op = self.step_gate_kernel
+            op.local_slots = tuple((index, names[id(value)]) for index, value in enumerate(op.args)
+                                   if id(value) in names)
+            op.args = tuple(None if id(value) in names else value for value in op.args)
         for operations in self.steps:
             for operation in operations:
                 operation.local_slots = tuple((index, names[id(value)]) for index, value in enumerate(operation.args)
@@ -1100,6 +1186,7 @@ class PreparedVocabularySoftmax:
         self.logits = self.probabilities = self.valid = self.candidates = self.pending = None
         self.seeds = self.offsets = self.tokens = self.scratch = self.tile_masses = self.limits = self.confidence = None
         self.copy_active = self.copy_tokens = self.sample_indices = self.sample_limits = None
+        self._step_gate_views = ()
         return self
 
     def run(self, logits, candidates, *, pending=None, seeds=None, offsets=None,
@@ -1109,7 +1196,7 @@ class PreparedVocabularySoftmax:
             offsets=offsets, probabilities=probabilities, valid=valid, tokens=tokens,
             tile_masses=tile_masses, token_limits=token_limits,
             confidence=confidence, copy_active=copy_active, copy_tokens=copy_tokens,
-            sample_indices=sample_indices, sample_limits=sample_limits)
+            sample_indices=sample_indices, sample_limits=sample_limits, start_step=0)
 
     def run_step(self, step, logits, candidates, *, pending=None, seeds=None, offsets=None,
                  probabilities=None, valid=None, tokens=None, tile_masses=None, token_limits=None,
@@ -1121,11 +1208,11 @@ class PreparedVocabularySoftmax:
             seeds=seeds, offsets=offsets, probabilities=probabilities, valid=valid, tokens=tokens,
             tile_masses=tile_masses, token_limits=token_limits,
             confidence=confidence, copy_active=copy_active, copy_tokens=copy_tokens,
-            sample_indices=sample_indices, sample_limits=sample_limits)
+            sample_indices=sample_indices, sample_limits=sample_limits, start_step=step)
 
     def _run_steps(self, steps, logits, candidates, *, pending, seeds, offsets, probabilities, valid, tokens,
                    tile_masses=None, token_limits=None, confidence=None, copy_active=None, copy_tokens=None,
-                   sample_indices=None, sample_limits=None):
+                   sample_indices=None, sample_limits=None, start_step=0):
         if (token_limits is not None) != self.has_token_limits:
             raise ValueError("vocabulary distribution token limits must match the prepared mask contract")
         if self.has_masses and tile_masses is None:
@@ -1148,13 +1235,24 @@ class PreparedVocabularySoftmax:
                             ("tile_masses", tile_masses), ("confidence", confidence)):
             if value is not None:
                 local[name] = value
-        for score, summary, normalize in steps:
+        if self.step_gate_kernel is not None:
+            op = self.step_gate_kernel
+            args = list(op.args)
+            for index, name in op.local_slots:
+                args[index] = local[name]
+            launch_triton(op.kernel, op.compiled, tuple(args), op.grid, **op.options)
+            step_gates = local["step_gates"]
+            for idx in range(self.active_steps):
+                local[f"step_gate_{idx}"] = step_gates[idx, :1]
+        for offset, (score, summary, normalize) in enumerate(steps):
+            step_idx = start_step + offset
+            step_gate = local[f"step_gate_{step_idx}"] if self.step_gated else None
             for operation in (score, summary):
                 args = list(operation.args)
                 for index, name in operation.local_slots:
                     args[index] = local[name]
                 launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
-            local["gathered"] = self.gather(local["summary"])
+            local["gathered"] = self.gather(local["summary"], gate=step_gate)
             args = list(normalize.args)
             for index, name in normalize.local_slots:
                 args[index] = local[name]
@@ -1164,10 +1262,13 @@ class PreparedVocabularySoftmax:
     def __call__(self):
         if self.steps is None:
             raise RuntimeError("vocabulary distributions require preparation")
-        for score, summary, normalize in self.steps:
+        if self.step_gate_kernel is not None:
+            self.step_gate_kernel()
+        for step_idx, (score, summary, normalize) in enumerate(self.steps):
+            step_gate = self._step_gate_views[step_idx] if self.step_gated else None
             score()
             summary()
-            self.gather(self.scratch["summary"])
+            self.gather(self.scratch["summary"], gate=step_gate)
             normalize()
         return self.probabilities
 
