@@ -50,6 +50,8 @@ def _score_tiles(
     Seeds,
     Offsets,
     Limits,
+    SampleIndices,
+    SampleLimits,
     logit_row_stride,
     logit_step_stride,
     hist_stride,
@@ -70,11 +72,22 @@ def _score_tiles(
     STEP: tl.constexpr,
     BLOCK: tl.constexpr,
     HAS_LIMITS: tl.constexpr = False,
+    HAS_INDICES: tl.constexpr = False,
 ):
     tile, lane_row = tl.program_id(0), tl.program_id(1)
     position = STEP if SAMPLE else lane_row % WIDTH
     request_row = lane_row if SAMPLE else lane_row // WIDTH
     partial = Partials + lane_row * 6 * BLOCKS + tile
+    if HAS_INDICES:
+        sample_limit = tl.load(SampleLimits + request_row)
+        if position >= sample_limit:
+            tl.store(partial, -float("inf"))
+            tl.store(partial + BLOCKS, 0.0)
+            tl.store(partial + 2 * BLOCKS, -float("inf"))
+            tl.store(partial + 3 * BLOCKS, 0.0)
+            tl.store(partial + 4 * BLOCKS, 1.0)
+            tl.store(partial + 5 * BLOCKS, 0.0)
+            return
     if HAS_LIMITS:
         limit = tl.load(Limits + request_row)
         active = (position < limit - 1) if SAMPLE else (position < limit)
@@ -89,9 +102,13 @@ def _score_tiles(
     local_id = tile * BLOCK + tl.arange(0, BLOCK)
     global_id = tl.load(VocabularyOffset) + local_id
     present = (local_id < LOCAL) & (global_id < VOCAB)
-    value = tl.load(
-        Logits + request_row * logit_row_stride + position * logit_step_stride + local_id, present, other=0
-    ).to(tl.float32)
+    phys = tl.load(SampleIndices + lane_row) if HAS_INDICES else (request_row * WIDTH + position)
+    if HAS_INDICES:
+        value = tl.load(Logits + phys * logit_row_stride + local_id, present, other=0).to(tl.float32)
+    else:
+        value = tl.load(
+            Logits + request_row * logit_row_stride + position * logit_step_stride + local_id, present, other=0
+        ).to(tl.float32)
     if MARKOV:
         predecessor = tl.load(Pending + request_row) if STEP == 0 else tl.load(Drafts + request_row * DRAFTS + STEP - 1)
         predecessor = tl.minimum(tl.maximum(predecessor, 0), VOCAB - 1)
@@ -134,7 +151,7 @@ def _score_tiles(
         choice += _token_noise(tl.load(Seeds + request_row), tl.load(Offsets + request_row) + 4 * STEP, global_id)
     winner = tl.argmax(choice, 0, tie_break_left=True)
     # Scores are consumed before this same region becomes retained probabilities.
-    tl.store(Probabilities + (request_row * WIDTH + position) * LOCAL + local_id, value, local_id < LOCAL)
+    tl.store(Probabilities + phys * LOCAL + local_id, value, local_id < LOCAL)
     tl.store(partial, maximum)
     tl.store(partial + BLOCKS, mass)
     tl.store(partial + 2 * BLOCKS, tl.max(choice, 0))
@@ -369,6 +386,8 @@ def _finish_distribution(
     Params,
     CopyActive,
     CopyTokens,
+    SampleIndices,
+    SampleLimits,
     LOCAL: tl.constexpr,
     VOCAB: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -385,10 +404,21 @@ def _finish_distribution(
     HAS_LIMITS: tl.constexpr = False,
     HAS_CONFIDENCE: tl.constexpr = False,
     HAS_COPY: tl.constexpr = False,
+    HAS_INDICES: tl.constexpr = False,
 ):
     tile, distribution = tl.program_id(0), tl.program_id(1)
     row = distribution if SAMPLE else distribution // WIDTH
     position = STEP if SAMPLE else distribution % WIDTH
+    if HAS_INDICES:
+        sample_limit = tl.load(SampleLimits + row)
+        if position >= sample_limit:
+            if HAS_MASSES:
+                tl.store(TileMass + (row * WIDTH + position) * BLOCKS + tile, 0.0)
+            if tile == 0:
+                tl.store(Valid + row * WIDTH + position, False)
+                if HAS_CONFIDENCE:
+                    tl.store(Confidence + row * WIDTH + position, 0.0)
+            return
     if HAS_LIMITS:
         limit = tl.load(Limits + row)
         active = (position < limit - 1) if SAMPLE else (position < limit)
@@ -442,7 +472,8 @@ def _finish_distribution(
     token = tl.sum(tl.where(rank == winning_rank, ids, 0.0), 0).to(tl.int64)
     col = tile * BLOCK + tl.arange(0, BLOCK)
     token_id = tl.load(VocabularyOffset) + col
-    destination = Probabilities + (row * WIDTH + position) * LOCAL + col
+    prob_row = tl.load(SampleIndices + distribution) if HAS_INDICES else (row * WIDTH + position)
+    destination = Probabilities + prob_row * LOCAL + col
     score = tl.load(destination, col < LOCAL, other=-float("inf"))
     probability = tl.exp(score - maximum) / total
     if not SAMPLE:
@@ -504,38 +535,49 @@ def _selected_records(
     PMass,
     QMass,
     Summary,
+    Limits,
+    SampleIndices,
+    SampleLimits,
     LOCAL: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCKS: tl.constexpr,
     PAD: tl.constexpr,
     WORDS: tl.constexpr,
     PRECOMPUTED_MASSES: tl.constexpr = False,
+    HAS_LIMITS: tl.constexpr = False,
+    HAS_INDICES: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     word = tl.arange(0, WORDS)
     tl.store(Summary + row * WORDS + word, 0.0)
     tile = tl.arange(0, PAD)
+    limit = tl.load(Limits + row) if HAS_LIMITS else WIDTH
+    sample_limit = tl.load(SampleLimits + row) if HAS_INDICES else limit
     for step in tl.static_range(WIDTH):
-        if PRECOMPUTED_MASSES:
-            pmass = tl.sum(tl.load(PMass + (row * WIDTH + step) * BLOCKS + tile, tile < BLOCKS, other=0.0), 0)
-            qmass = (
-                tl.sum(tl.load(QMass + (row * (WIDTH - 1) + step) * BLOCKS + tile, tile < BLOCKS, other=0.0), 0)
-                if step < WIDTH - 1
-                else tl.full((), 0.0, tl.float32)
-            )
-        else:
-            base = Partials + (row * WIDTH + step) * 3 * BLOCKS + tile
-            pmass = tl.sum(tl.load(base, tile < BLOCKS, other=0.0), 0)
-            qmass = tl.sum(tl.load(base + BLOCKS, tile < BLOCKS, other=0.0), 0)
-        tl.store(Summary + row * WORDS + 2 * (WORDS // 4) + step, pmass)
-        tl.store(Summary + row * WORDS + 3 * (WORDS // 4) + step, qmass)
-        if step < WIDTH - 1:
-            local_token = tl.load(Drafts + row * (WIDTH - 1) + step) - tl.load(VocabularyOffset)
-            present = (local_token >= 0) & (local_token < LOCAL)
-            p = tl.load(P + (row * WIDTH + step) * LOCAL + local_token, present, other=0.0)
-            q = tl.load(Q + (row * (WIDTH - 1) + step) * LOCAL + local_token, present, other=0.0)
-            tl.store(Summary + row * WORDS + step, p)
-            tl.store(Summary + row * WORDS + WORDS // 4 + step, q)
+        if (not HAS_LIMITS) or (step < limit):
+            if PRECOMPUTED_MASSES:
+                pmass = tl.sum(tl.load(PMass + (row * WIDTH + step) * BLOCKS + tile, tile < BLOCKS, other=0.0), 0)
+                qmass = (
+                    tl.sum(tl.load(QMass + (row * (WIDTH - 1) + step) * BLOCKS + tile, tile < BLOCKS, other=0.0), 0)
+                    if step < WIDTH - 1
+                    else tl.full((), 0.0, tl.float32)
+                )
+            else:
+                base = Partials + (row * WIDTH + step) * 3 * BLOCKS + tile
+                pmass = tl.sum(tl.load(base, tile < BLOCKS, other=0.0), 0)
+                qmass = tl.sum(tl.load(base + BLOCKS, tile < BLOCKS, other=0.0), 0)
+            tl.store(Summary + row * WORDS + 2 * (WORDS // 4) + step, pmass)
+            tl.store(Summary + row * WORDS + 3 * (WORDS // 4) + step, qmass)
+            if step < WIDTH - 1:
+                if (not HAS_LIMITS) or (step < limit - 1):
+                    local_token = tl.load(Drafts + row * (WIDTH - 1) + step) - tl.load(VocabularyOffset)
+                    present = (local_token >= 0) & (local_token < LOCAL)
+                    p_row = tl.load(SampleIndices + row * WIDTH + step) if HAS_INDICES else (row * WIDTH + step)
+                    p_present = present & ((step < sample_limit) if HAS_INDICES else True)
+                    p = tl.load(P + p_row * LOCAL + local_token, p_present, other=0.0)
+                    q = tl.load(Q + (row * (WIDTH - 1) + step) * LOCAL + local_token, present, other=0.0)
+                    tl.store(Summary + row * WORDS + step, p)
+                    tl.store(Summary + row * WORDS + WORDS // 4 + step, q)
 
 
 @triton.jit
@@ -551,6 +593,8 @@ def _correction_tiles(
     RngOffset,
     Slots,
     Generations,
+    SampleIndices,
+    SampleLimits,
     CAPACITY: tl.constexpr,
     LOCAL: tl.constexpr,
     VOCAB: tl.constexpr,
@@ -562,6 +606,7 @@ def _correction_tiles(
     BLOCK: tl.constexpr,
     HAS_LIMITS: tl.constexpr,
     WORDS: tl.constexpr,
+    HAS_INDICES: tl.constexpr = False,
 ):
     tile, row = tl.program_id(0), tl.program_id(1)
     first_position = tl.program_id(2) * POS_PAD
@@ -590,7 +635,13 @@ def _correction_tiles(
     token = tl.load(VocabularyOffset) + local
     active_pos = (position < limit) if HAS_LIMITS else (position < WIDTH)
     inside = active_pos[:, None] & (position[:, None] < WIDTH) & (local[None, :] < LOCAL) & (token[None, :] < VOCAB)
-    p = tl.load(P + (row * WIDTH + position[:, None]) * LOCAL + local[None, :], inside, other=0.0)
+    if HAS_INDICES:
+        sample_limit = tl.load(SampleLimits + row)
+        p_pos = active_pos & (position < sample_limit) & (position < WIDTH)
+        p_row = tl.load(SampleIndices + row * WIDTH + position, p_pos, other=0)
+        p = tl.load(P + p_row[:, None] * LOCAL + local[None, :], inside & (position[:, None] < sample_limit), other=0.0)
+    else:
+        p = tl.load(P + (row * WIDTH + position[:, None]) * LOCAL + local[None, :], inside, other=0.0)
     q = tl.load(
         Q + (row * (WIDTH - 1) + position[:, None]) * LOCAL + local[None, :],
         inside & (position[:, None] < limit - 1) & (position[:, None] < WIDTH - 1),
@@ -764,11 +815,32 @@ class PreparedVocabularySoftmax:
         confidence=None,
         copy_active=None,
         copy_tokens=None,
+        sample_indices=None,
+        sample_limits=None,
+        active_steps=None,
     ):
-        if logits.ndim != 3 or logits.dtype not in (torch.bfloat16, torch.float32) or logits.stride(-1) != 1:
-            raise ValueError("vocabulary logits require BF16/FP32 [batch,width,local vocabulary]")
-        b, w, local = logits.shape
         sample = tokens is not None
+        has_indices = sample_indices is not None
+        if has_indices:
+            if sample:
+                raise ValueError("indexed compact vocabulary logits apply only to target softmax")
+            if token_limits is None or sample_limits is None:
+                raise ValueError("indexed compact vocabulary logits require token_limits and sample_limits")
+            if (
+                logits.ndim != 2
+                or logits.dtype not in (torch.bfloat16, torch.float32)
+                or logits.stride(-1) != 1
+                or valid.ndim != 2
+            ):
+                raise ValueError("indexed vocabulary logits require 2D BF16/FP32 [tokens,local vocabulary] and 2D valid")
+            b, w = valid.shape
+            local = logits.shape[1]
+            prob_shape = tuple(logits.shape)
+        else:
+            if logits.ndim != 3 or logits.dtype not in (torch.bfloat16, torch.float32) or logits.stride(-1) != 1:
+                raise ValueError("vocabulary logits require BF16/FP32 [batch,width,local vocabulary]")
+            b, w, local = logits.shape
+            prob_shape = (b, w, local)
         _geometry(b, w + 1 if sample else w)
         world = 1 if runtime is None else runtime.world_size
         if (
@@ -782,9 +854,17 @@ class PreparedVocabularySoftmax:
             raise ValueError("vocabulary shards require equal contiguous partitions covering exactly the vocabulary")
         device = logits.device
         _metadata(requests, slots, generations, live_rows, b, device)
-        _tensor(probabilities, (b, w, local), torch.float32, device, "local probabilities")
+        _tensor(probabilities, prob_shape, torch.float32, device, "local probabilities")
         _tensor(valid, (b, w), torch.bool, device, "distribution validity")
         _tensor(candidates, (b, w if sample else w - 1), torch.int64, device, "candidate prefix IDs")
+        if has_indices:
+            _tensor(sample_indices, (b * w,), torch.int64, device, "sample indices")
+            _tensor(sample_limits, (b,), torch.int32, device, "sample limits")
+        if active_steps is not None:
+            if not sample or type(active_steps) is not int or not 0 <= active_steps <= w:
+                raise ValueError("active_steps must be an integer within 0..=width for proposal sampling")
+        self.active_steps = w if (not sample or active_steps is None) else active_steps
+        self.sample_indices, self.sample_limits, self.has_indices = sample_indices, sample_limits, has_indices
         blocks = triton.cdiv(local, 256)
         if tile_masses is not None:
             _tensor(tile_masses, (b, w, blocks), torch.float32, device, "tile probability masses")
@@ -876,9 +956,10 @@ class PreparedVocabularySoftmax:
         use_batched_markov = self.markov and self.sample and b >= 2 and self.head.shape[1] >= 64
         rows_per_cta = min(b, 8) if use_batched_markov else 1
         steps = []
-        for step in range(w if self.sample else 1):
+        logit_step_stride = 0 if self.has_indices else self.logits.stride(1)
+        for step in range(self.active_steps if self.sample else 1):
             summary_rows = b if self.sample else b * w
-            score_args = (
+            score_prefix_args = (
                 self.vocabulary_offset,
                 self.logits,
                 self.probabilities,
@@ -901,8 +982,10 @@ class PreparedVocabularySoftmax:
                 self.seeds,
                 self.offsets,
                 self.limits,
+            )
+            score_stride_args = (
                 self.logits.stride(0),
-                self.logits.stride(1),
+                logit_step_stride,
                 state.histogram.stride(0),
                 state.grammar_mask.stride(0),
             )
@@ -929,7 +1012,7 @@ class PreparedVocabularySoftmax:
             if use_batched_markov:
                 score = prepare_triton(
                     _score_tiles_markov_batched,
-                    score_args,
+                    (*score_prefix_args, *score_stride_args),
                     (blocks, triton.cdiv(b, rows_per_cta), 1),
                     ROWS_PER_CTA=rows_per_cta,
                     **score_kwargs,
@@ -937,8 +1020,9 @@ class PreparedVocabularySoftmax:
             else:
                 score = prepare_triton(
                     _score_tiles,
-                    score_args,
+                    (*score_prefix_args, self.sample_indices, self.sample_limits, *score_stride_args),
                     (blocks, summary_rows, 1),
+                    HAS_INDICES=self.has_indices,
                     **score_kwargs,
                 )
             summary = prepare_triton(
@@ -968,6 +1052,8 @@ class PreparedVocabularySoftmax:
                     state.parameters,
                     self.copy_active,
                     self.copy_tokens,
+                    self.sample_indices,
+                    self.sample_limits,
                 ),
                 (blocks, summary_rows, 1),
                 LOCAL=local,
@@ -986,6 +1072,7 @@ class PreparedVocabularySoftmax:
                 HAS_LIMITS=self.has_token_limits,
                 HAS_CONFIDENCE=self.has_confidence,
                 HAS_COPY=self.has_copy,
+                HAS_INDICES=self.has_indices,
                 num_warps=4,
                 enable_fp_fusion=False,
             )
@@ -999,7 +1086,8 @@ class PreparedVocabularySoftmax:
             valid=self.valid, candidates=self.candidates, pending=self.pending,
             seeds=self.seeds, offsets=self.offsets, tokens=self.tokens,
             tile_masses=self.tile_masses, limits=self.limits, confidence=self.confidence,
-            copy_active=self.copy_active, copy_tokens=self.copy_tokens)
+            copy_active=self.copy_active, copy_tokens=self.copy_tokens,
+            sample_indices=self.sample_indices, sample_limits=self.sample_limits)
         self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()
                              if value is not None}
         names = {id(value): name for name, value in values.items() if value is not None}
@@ -1011,30 +1099,33 @@ class PreparedVocabularySoftmax:
         self.gather.functional(session=session)
         self.logits = self.probabilities = self.valid = self.candidates = self.pending = None
         self.seeds = self.offsets = self.tokens = self.scratch = self.tile_masses = self.limits = self.confidence = None
-        self.copy_active = self.copy_tokens = None
+        self.copy_active = self.copy_tokens = self.sample_indices = self.sample_limits = None
         return self
 
     def run(self, logits, candidates, *, pending=None, seeds=None, offsets=None,
             probabilities=None, valid=None, tokens=None, tile_masses=None, token_limits=None,
-            confidence=None, copy_active=None, copy_tokens=None):
+            confidence=None, copy_active=None, copy_tokens=None, sample_indices=None, sample_limits=None):
         return self._run_steps(self.steps, logits, candidates, pending=pending, seeds=seeds,
             offsets=offsets, probabilities=probabilities, valid=valid, tokens=tokens,
             tile_masses=tile_masses, token_limits=token_limits,
-            confidence=confidence, copy_active=copy_active, copy_tokens=copy_tokens)
+            confidence=confidence, copy_active=copy_active, copy_tokens=copy_tokens,
+            sample_indices=sample_indices, sample_limits=sample_limits)
 
     def run_step(self, step, logits, candidates, *, pending=None, seeds=None, offsets=None,
                  probabilities=None, valid=None, tokens=None, tile_masses=None, token_limits=None,
-                 confidence=None, copy_active=None, copy_tokens=None):
+                 confidence=None, copy_active=None, copy_tokens=None, sample_indices=None, sample_limits=None):
         """Draw one prepared position after its recurrent correction becomes available."""
-        if not self.sample or not 0 <= step < self.width:
+        if not self.sample or not 0 <= step < self.active_steps:
             raise ValueError("a proposal step must select one prepared sampling position")
         return self._run_steps(self.steps[step:step + 1], logits, candidates, pending=pending,
             seeds=seeds, offsets=offsets, probabilities=probabilities, valid=valid, tokens=tokens,
             tile_masses=tile_masses, token_limits=token_limits,
-            confidence=confidence, copy_active=copy_active, copy_tokens=copy_tokens)
+            confidence=confidence, copy_active=copy_active, copy_tokens=copy_tokens,
+            sample_indices=sample_indices, sample_limits=sample_limits)
 
     def _run_steps(self, steps, logits, candidates, *, pending, seeds, offsets, probabilities, valid, tokens,
-                   tile_masses=None, token_limits=None, confidence=None, copy_active=None, copy_tokens=None):
+                   tile_masses=None, token_limits=None, confidence=None, copy_active=None, copy_tokens=None,
+                   sample_indices=None, sample_limits=None):
         if (token_limits is not None) != self.has_token_limits:
             raise ValueError("vocabulary distribution token limits must match the prepared mask contract")
         if self.has_masses and tile_masses is None:
@@ -1043,12 +1134,16 @@ class PreparedVocabularySoftmax:
             raise ValueError("vocabulary distribution requires caller-owned confidence when prepared with confidence")
         if (copy_active is not None) != self.has_copy or (copy_tokens is not None) != self.has_copy:
             raise ValueError("vocabulary distribution copy proposals must match the prepared copy contract")
+        if (sample_indices is not None) != self.has_indices or (sample_limits is not None) != self.has_indices:
+            raise ValueError("vocabulary distribution sample indices must match the prepared compact contract")
         local = {name: torch.empty(shape, dtype=dtype, device=logits.device)
                  for name, (shape, dtype) in self.local_layout.items()
                  if name not in ("logits", "candidates", "pending", "seeds", "offsets", "limits",
-                                 "tile_masses", "confidence", "copy_active", "copy_tokens")}
+                                 "tile_masses", "confidence", "copy_active", "copy_tokens",
+                                 "sample_indices", "sample_limits")}
         local.update(logits=logits, candidates=candidates, pending=pending, seeds=seeds, offsets=offsets,
-                     limits=token_limits, copy_active=copy_active, copy_tokens=copy_tokens)
+                     limits=token_limits, copy_active=copy_active, copy_tokens=copy_tokens,
+                     sample_indices=sample_indices, sample_limits=sample_limits)
         for name, value in (("probabilities", probabilities), ("valid", valid), ("tokens", tokens),
                             ("tile_masses", tile_masses), ("confidence", confidence)):
             if value is not None:
@@ -1121,8 +1216,23 @@ class PreparedVocabularyBlockVerification:
         workspace=None,
         draft_tile_masses=None,
         target_tile_masses=None,
+        sample_indices=None,
+        sample_limits=None,
     ):
-        b, w, local = target_probs.shape
+        has_indices = sample_indices is not None
+        if has_indices:
+            if target_probs.ndim != 2 or target_valid.ndim != 2:
+                raise ValueError("indexed block verification requires 2D [tokens,local] target_probs and 2D target_valid")
+            if token_limits is None or sample_limits is None:
+                raise ValueError("indexed block verification requires token_limits and sample_limits")
+            if draft_tile_masses is None or target_tile_masses is None:
+                raise ValueError("indexed block verification requires precomputed tile masses")
+            b, w = target_valid.shape
+            local = target_probs.shape[1]
+            target_prob_shape = tuple(target_probs.shape)
+        else:
+            b, w, local = target_probs.shape
+            target_prob_shape = (b, w, local)
         _geometry(b, w)
         device = target_probs.device
         world = 1 if runtime is None else runtime.world_size
@@ -1136,7 +1246,7 @@ class PreparedVocabularyBlockVerification:
             raise ValueError("block verification requires equal contiguous vocabulary partitions")
         for value, shape, dtype, label in (
             (draft_probs, (b, w - 1, local), torch.float32, "proposal probabilities"),
-            (target_probs, (b, w, local), torch.float32, "target probabilities"),
+            (target_probs, target_prob_shape, torch.float32, "target probabilities"),
             (drafts, (b, w - 1), torch.int64, "draft tokens"),
             (draft_valid, (b, w - 1), torch.bool, "draft validity"),
             (target_valid, (b, w), torch.bool, "target validity"),
@@ -1147,6 +1257,10 @@ class PreparedVocabularyBlockVerification:
         _metadata(requests, slots, generations, live_rows, b, device)
         if token_limits is not None:
             _tensor(token_limits, (b,), torch.int32, device, "token limits")
+        if has_indices:
+            _tensor(sample_indices, (b * w,), torch.int64, device, "sample indices")
+            _tensor(sample_limits, (b,), torch.int32, device, "sample limits")
+        self.sample_indices, self.sample_limits, self.has_indices = sample_indices, sample_limits, has_indices
         blocks = triton.cdiv(local, 256)
         if (draft_tile_masses is None) != (target_tile_masses is None):
             raise ValueError("precomputed tile masses require both draft and target tensors")
@@ -1232,6 +1346,9 @@ class PreparedVocabularyBlockVerification:
                 self.target_tile_masses,
                 self.draft_tile_masses,
                 s["selected_summary"],
+                self.limits,
+                self.sample_indices,
+                self.sample_limits,
             ),
             (b, 1, 1),
             LOCAL=local,
@@ -1240,6 +1357,8 @@ class PreparedVocabularyBlockVerification:
             PAD=triton.next_power_of_2(blocks),
             WORDS=self.summary_words,
             PRECOMPUTED_MASSES=self.precomputed_masses,
+            HAS_LIMITS=self.has_token_limits,
+            HAS_INDICES=self.has_indices,
             num_warps=4,
         )
         # Two positions share prefix work while retaining enough independent
@@ -1259,6 +1378,8 @@ class PreparedVocabularyBlockVerification:
                 self.rng.target_offset,
                 self.slots,
                 self.generations,
+                self.sample_indices,
+                self.sample_limits,
             ),
             (blocks, b, triton.cdiv(w, positions)),
             CAPACITY=state.capacity,
@@ -1272,6 +1393,7 @@ class PreparedVocabularyBlockVerification:
             BLOCK=256,
             HAS_LIMITS=self.limits is not None,
             WORDS=self.summary_words,
+            HAS_INDICES=self.has_indices,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -1337,6 +1459,9 @@ class PreparedVocabularyBlockVerification:
         if self.precomputed_masses:
             values["draft_tile_masses"] = self.draft_tile_masses
             values["target_tile_masses"] = self.target_tile_masses
+        if self.has_indices:
+            values["sample_indices"] = self.sample_indices
+            values["sample_limits"] = self.sample_limits
         values.update({"output." + name: getattr(self.output, name) for name in self.output.__dataclass_fields__})
         self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()}
         names = {id(value): name for name, value in values.items()}
@@ -1349,27 +1474,31 @@ class PreparedVocabularyBlockVerification:
         self.selected_gather.functional(session=session)
         self.residual_gather.functional(session=session)
         self.p = self.q = self.drafts = self.draft_valid = self.target_valid = self.output = self.scratch = self.limits = None
-        self.draft_tile_masses = self.target_tile_masses = None
+        self.draft_tile_masses = self.target_tile_masses = self.sample_indices = self.sample_limits = None
         return self
 
     def run(self, draft_probs, drafts, target_probs, draft_valid, target_valid, *, token_limits=None,
-            draft_tile_masses=None, target_tile_masses=None):
+            draft_tile_masses=None, target_tile_masses=None, sample_indices=None, sample_limits=None):
         if (token_limits is not None) != self.has_token_limits:
             raise ValueError("vocabulary verification token limits must match the prepared mask contract")
         if (draft_tile_masses is not None) != self.precomputed_masses or (
             target_tile_masses is not None
         ) != self.precomputed_masses:
             raise ValueError("vocabulary verification tile masses must match the prepared contract")
+        if (sample_indices is not None) != self.has_indices or (sample_limits is not None) != self.has_indices:
+            raise ValueError("vocabulary verification sample indices must match the prepared compact contract")
         if token_limits is not None:
             _tensor(token_limits, (self.batch,), torch.int32, target_probs.device, "token limits")
         out = SpeculativeAcceptance.allocate(self.batch, self.width, target_probs.device)
         local = {name: torch.empty(shape, dtype=dtype, device=target_probs.device)
                  for name, (shape, dtype) in self.local_layout.items()
                  if name not in ("p", "q", "drafts", "draft_valid", "target_valid", "limits",
-                                 "draft_tile_masses", "target_tile_masses") and not name.startswith("output.")}
+                                 "draft_tile_masses", "target_tile_masses",
+                                 "sample_indices", "sample_limits") and not name.startswith("output.")}
         local.update(p=target_probs, q=draft_probs, drafts=drafts,
                      draft_valid=draft_valid, target_valid=target_valid, limits=token_limits,
-                     draft_tile_masses=draft_tile_masses, target_tile_masses=target_tile_masses)
+                     draft_tile_masses=draft_tile_masses, target_tile_masses=target_tile_masses,
+                     sample_indices=sample_indices, sample_limits=sample_limits)
         local.update({"output." + name: getattr(out, name) for name in out.__dataclass_fields__})
         partials, selected, residual, summary, finish = self.kernels
         for operation in (partials, selected, residual, summary, finish):

@@ -38,10 +38,10 @@ def _check_requested(Requested, Slots, Live, Gate,
 
 
 @triton.jit
-def _statistics(Logits, Records, Frame, Requested, Slots, Epochs, Live, Stats, Gate,
+def _statistics(Logits, Records, Frame, Requested, Slots, Epochs, Live, Stats, Gate, SampleIndices,
                 LOCAL: tl.constexpr, V: tl.constexpr, Offset,
                 WIDTH: tl.constexpr, TILES: tl.constexpr, SLOTS: tl.constexpr,
-                FIELDS: tl.constexpr, BLOCK: tl.constexpr):
+                FIELDS: tl.constexpr, BLOCK: tl.constexpr, HAS_INDICES: tl.constexpr = False):
     if tl.load(Gate) == 0:
         return
     row, col, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -49,7 +49,8 @@ def _statistics(Logits, Records, Frame, Requested, Slots, Epochs, Live, Stats, G
     _, _, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
     if valid:
         ids = tile * BLOCK + tl.arange(0, BLOCK)
-        x = tl.load(Logits + (row * WIDTH + col) * LOCAL + ids,
+        logit_row = tl.load(SampleIndices + row * WIDTH + col) if HAS_INDICES else (row * WIDTH + col)
+        x = tl.load(Logits + logit_row * LOCAL + ids,
                     (ids < LOCAL) & (ids + offset < V), other=-float("inf")).to(tl.float32)
         maximum = tl.max(x, 0)
         mass = tl.sum(tl.exp(x - tl.where(maximum == -float("inf"), 0., maximum)), 0)
@@ -98,10 +99,11 @@ def _global_normalization(Records, Frame, Requested, Slots, Epochs, Live, Gather
 
 
 @triton.jit
-def _candidates(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, Lse, Keys, Gate,
+def _candidates(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, Lse, Keys, Gate, SampleIndices,
                 LOCAL: tl.constexpr, V: tl.constexpr, Offset,
                 WIDTH: tl.constexpr, TILES: tl.constexpr, SLOTS: tl.constexpr,
-                FIELDS: tl.constexpr, BLOCK: tl.constexpr, CANDIDATES: tl.constexpr):
+                FIELDS: tl.constexpr, BLOCK: tl.constexpr, CANDIDATES: tl.constexpr,
+                HAS_INDICES: tl.constexpr = False):
     if tl.load(Gate) == 0:
         return
     row, col, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -111,7 +113,8 @@ def _candidates(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, 
         if tl.load(Counts + slot) == 0:
             ids = tile * BLOCK + tl.arange(0, BLOCK)
             inside = (ids < LOCAL) & (ids + offset < V)
-            x = tl.load(Logits + (row * WIDTH + col) * LOCAL + ids, inside, other=-float("inf")).to(tl.float32)
+            logit_row = tl.load(SampleIndices + row * WIDTH + col) if HAS_INDICES else (row * WIDTH + col)
+            x = tl.load(Logits + logit_row * LOCAL + ids, inside, other=-float("inf")).to(tl.float32)
             x -= tl.load(Lse + row * WIDTH + col)
             # Sort the reported FP32 values, including ties created by subtraction.
             keys = tl.sort(tl.where(inside, _sort_key(x, ids + offset), 0), descending=True)
@@ -121,11 +124,12 @@ def _candidates(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, 
 
 
 @triton.jit
-def _pack(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, TokenIds, Keys, Summary, Gate,
+def _pack(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, TokenIds, Keys, Summary, Gate, SampleIndices,
           LOCAL: tl.constexpr, V: tl.constexpr, Offset, WIDTH: tl.constexpr,
           TILES: tl.constexpr, SLOTS: tl.constexpr, FIELDS: tl.constexpr,
           BLOCK: tl.constexpr, CANDIDATES: tl.constexpr, IDS: tl.constexpr,
-          WORDS: tl.constexpr, CHOSEN: tl.constexpr, REQUESTED: tl.constexpr):
+          WORDS: tl.constexpr, CHOSEN: tl.constexpr, REQUESTED: tl.constexpr,
+          HAS_INDICES: tl.constexpr = False):
     if tl.load(Gate) == 0:
         return
     row, col = tl.program_id(0), tl.program_id(1)
@@ -133,8 +137,9 @@ def _pack(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, TokenI
     slot, token, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
     if valid:
         index = row * WIDTH + col
+        logit_row = tl.load(SampleIndices + index) if HAS_INDICES else index
         owned = (token >= offset) & (token < offset + LOCAL) & (token < V)
-        chosen = tl.load(Logits + index * LOCAL + token - offset, owned, other=0.).to(tl.float32)
+        chosen = tl.load(Logits + logit_row * LOCAL + token - offset, owned, other=0.).to(tl.float32)
         tl.store(Summary + index * WORDS + CHOSEN, chosen)
         count = tl.load(Counts + slot)
         if count > 0:
@@ -142,7 +147,7 @@ def _pack(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, TokenI
             ids = tl.load(TokenIds + slot * IDS + requested_lane, requested_lane < count, other=-1)
             requested_owned = ((requested_lane < count) & (ids >= offset)
                                & (ids < offset + LOCAL) & (ids < V))
-            values = tl.load(Logits + index * LOCAL + ids - offset, requested_owned, other=0.).to(tl.float32)
+            values = tl.load(Logits + logit_row * LOCAL + ids - offset, requested_owned, other=0.).to(tl.float32)
             tl.store(Summary + index * WORDS + REQUESTED + requested_lane, values, requested_lane < count)
         else:
             k = tl.arange(0, BLOCK)
@@ -197,13 +202,25 @@ class PreparedVocabularyParallelLogprobs:
     """Exchange raw normalizers and requested scores while retaining vocabulary shards."""
 
     def __init__(self, logits, completion, slots, epochs, live, frame, *, vocabulary,
-                 offset, runtime, session, coordinator, name):
+                 offset, runtime, session, coordinator, name, sample_indices=None, batch=None, width=None):
         validate_completion_buffers(completion.buffers(), completion.records.shape[1])
-        if logits.ndim == 2:
-            logits = logits[:, None, :]
-        if logits.ndim != 3 or not logits.is_contiguous() or logits.dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError("vocabulary-sharded raw logits require contiguous BF16 or FP32 rows")
-        batch, width, local = logits.shape
+        self.has_indices = sample_indices is not None
+        if self.has_indices:
+            if (logits.ndim != 2 or not logits.is_contiguous()
+                    or logits.dtype not in (torch.bfloat16, torch.float32)):
+                raise ValueError("indexed vocabulary-sharded raw logits require contiguous 2D BF16 or FP32 rows")
+            if type(batch) is not int or type(width) is not int or batch <= 0 or width <= 0:
+                raise ValueError("indexed vocabulary logprobs require positive batch and width dimensions")
+            if (sample_indices.shape != (batch * width,) or sample_indices.dtype != torch.int64
+                    or sample_indices.device != logits.device or not sample_indices.is_contiguous()):
+                raise ValueError("indexed vocabulary logprobs require contiguous int64 sample_indices of shape (batch * width,)")
+            local = logits.shape[1]
+        else:
+            if logits.ndim == 2:
+                logits = logits[:, None, :]
+            if logits.ndim != 3 or not logits.is_contiguous() or logits.dtype not in (torch.bfloat16, torch.float32):
+                raise ValueError("vocabulary-sharded raw logits require contiguous BF16 or FP32 rows")
+            batch, width, local = logits.shape
         world = 1 if runtime is None else runtime.world_size
         if (min(batch, width, local, vocabulary) <= 0 or width > completion.token_capacity
                 or offset < 0 or offset % local
@@ -224,6 +241,7 @@ class PreparedVocabularyParallelLogprobs:
             runtime=runtime, session=session, coordinator=coordinator, name=name + ".exchange",
             has_gate=True)
         self.logits = logits
+        self.sample_indices = sample_indices
         self.row_inputs = dict(slots=slots, generations=epochs, live_rows=live)
         common = (logits, completion.records, frame, completion.requested, slots, epochs, live)
         geometry = (local, vocabulary, self.offset, width, tiles, completion.records.shape[1], completion.records.shape[2])
@@ -231,16 +249,17 @@ class PreparedVocabularyParallelLogprobs:
         self._preparation = (
             (_check_requested, (completion.requested, slots, live, self.gate, batch,
                 completion.records.shape[1], max(16, triton.next_power_of_2(batch))), (1, 1, 1), 1),
-            (_statistics, (*common, self.stats, self.gate, *geometry, _TILE), (batch, width, tiles), 4),
+            (_statistics, (*common, self.stats, self.gate, self.sample_indices, *geometry, _TILE, self.has_indices),
+                (batch, width, tiles), 4),
             (_local_normalization, (*common[1:], self.stats, self.summary, self.gate, *geometry[3:],
                 triton.next_power_of_2(tiles), _SUMMARY), rows, 4),
             (_global_normalization, (*common[1:], self.gathered, self.lse, self.gate, width, *geometry[5:],
                 world, triton.next_power_of_2(world), _SUMMARY), rows, 4),
-            (_candidates, (*common, completion.token_id_counts, self.lse, self.keys, self.gate, *geometry,
-                _TILE, _CANDIDATES), (batch, width, tiles), 4),
+            (_candidates, (*common, completion.token_id_counts, self.lse, self.keys, self.gate, self.sample_indices,
+                *geometry, _TILE, _CANDIDATES, self.has_indices), (batch, width, tiles), 4),
             (_pack, (*common, completion.token_id_counts, completion.token_ids, self.keys, self.summary, self.gate,
-                *geometry, triton.next_power_of_2(tiles * _CANDIDATES), _CANDIDATES,
-                MAX_LOGPROB_TOKEN_IDS, _SUMMARY, _CHOSEN, _REQUESTED), rows, 8),
+                self.sample_indices, *geometry, triton.next_power_of_2(tiles * _CANDIDATES), _CANDIDATES,
+                MAX_LOGPROB_TOKEN_IDS, _SUMMARY, _CHOSEN, _REQUESTED, self.has_indices), rows, 8),
             (_finish, (*common[1:], completion.token_id_counts, completion.token_ids,
                 self.gathered, self.lse, completion.logprobs, self.gate, local, vocabulary, width,
                 *geometry[5:], world, _SUMMARY, _CANDIDATES,
@@ -259,6 +278,8 @@ class PreparedVocabularyParallelLogprobs:
         if not self.operations:
             raise RuntimeError("vocabulary logprobs require preparation before functional conversion")
         values = {name: getattr(self, name) for name in ("logits", "stats", "lse", "keys", "summary", "gathered", "gate")}
+        if self.has_indices:
+            values["sample_indices"] = self.sample_indices
         self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()}
         names = {id(value): name for name, value in {**values, **self.row_inputs}.items()}
         for operation in self.operations:
@@ -272,12 +293,16 @@ class PreparedVocabularyParallelLogprobs:
             setattr(self, name, None)
         return self
 
-    def run(self, logits, *, slots=None, generations=None, live_rows=None):
-        if logits.ndim == 2:
+    def run(self, logits, *, slots=None, generations=None, live_rows=None, sample_indices=None):
+        if (sample_indices is not None) != self.has_indices:
+            raise ValueError("vocabulary logprobs sample_indices must match the prepared contract")
+        if not self.has_indices and logits.ndim == 2:
             logits = logits[:, None, :]
         local = {name: torch.empty(shape, dtype=dtype, device=logits.device)
-                 for name, (shape, dtype) in self.local_layout.items() if name != "logits"}
+                 for name, (shape, dtype) in self.local_layout.items() if name not in ("logits", "sample_indices")}
         local["logits"] = logits
+        if self.has_indices:
+            local["sample_indices"] = sample_indices
         for name, value in (("slots", slots), ("generations", generations), ("live_rows", live_rows)):
             local[name] = self.row_inputs[name] if value is None else value
             if local[name] is None:

@@ -5,6 +5,7 @@
 """Parallel draft proposals, stochastic target verification and accepted-state commits."""
 
 from dataclasses import dataclass
+import inspect
 
 import torch
 import triton
@@ -21,6 +22,13 @@ from .speculation import (
     PreparedStochasticVerification,
 )
 from ignition.components.state import save_hidden
+
+
+def _supports_compact_logits(decoder_factory) -> bool:
+    try:
+        return "compact_logits" in inspect.signature(decoder_factory).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def prepare_sampling_broadcasts(proposals, verification, *, collectives, session, name, result_runtime=None):
@@ -259,6 +267,12 @@ class PreparedParallelDraftRound:
             session=o.session,
             name=name + ".validation",
         )
+        self.use_compact_target_logits = (
+            self.vocabulary_parallel
+            and not proposal_only
+            and tokens < b * w
+            and _supports_compact_logits(forwards.decoder)
+        )
         self.decoder = None if proposal_only else forwards.decoder(
             o.weights,
             o.tables,
@@ -271,6 +285,7 @@ class PreparedParallelDraftRound:
             workspace=o.workspace,
             **o.collectives,
             **({"vocabulary_parallel": True} if self.vocabulary_parallel else {}),
+            **({"compact_logits": True} if self.use_compact_target_logits else {}),
         )
         self.context = None if proposal_only else forwards.context(
             o.weights,
@@ -547,38 +562,58 @@ class PreparedParallelDraftRound:
                 if getattr(o, "copy_ids", None) is not None
                 else {}
             )
+            active_steps = (
+                min(w - 1, self.target_token_capacity - 1)
+                if not self.proposal_only and self.target_token_capacity < b * w
+                else None
+            )
             self.full_proposal = PreparedVocabularySoftmax(base, self.probabilities, self.valid, *args,
                 self.drafts, **options, name=self.name + ".proposal", workspace=None,
                 **transition,
                 pending=self.markov_token, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts,
                 tile_masses=self.draft_tile_masses, token_limits=o.inputs.query_lengths[:b],
-                confidence=self.draft_confidence, **copy_options)
+                confidence=self.draft_confidence, active_steps=active_steps, **copy_options)
             self.full_proposal.prepare()
         if self.proposal_only:
             self.operations = None, (), None, None
             self._release_examples()
             return
-        logits = self.decoder.local_logits.view(b, w, -1)
+        compact_target = bool(getattr(self.decoder, "compact_logits", False))
+        self.use_compact_target_logits = compact_target
+        self.overlap_context = bool(
+            self.context is not None
+            and getattr(self.context, "can_overlap_with", None) is not None
+            and self.context.can_overlap_with(o.sampling_runtime, o.logprob_runtime)
+        )
+        logits = self.decoder.local_logits if compact_target else self.decoder.local_logits.view(b, w, -1)
         from ignition.preparation.scratch import bind_scratch
 
         retained = bind_scratch(dict(probabilities=(tuple(logits.shape), torch.float32),
             valid=((b, w), torch.bool),
             tile_masses=(self.target_mass_shape, torch.float32)), device=logits.device, workspace=None)
+        index_kwargs = (
+            dict(sample_indices=self.metadata.sample_indices, sample_limits=self.metadata.lengths)
+            if compact_target else {}
+        )
         target = PreparedVocabularySoftmax(logits, retained["probabilities"], retained["valid"], *args,
             self.drafts, **options, name=self.name + ".target", workspace=None,
-            tile_masses=retained["tile_masses"], token_limits=o.inputs.query_lengths[:b])
+            tile_masses=retained["tile_masses"], token_limits=o.inputs.query_lengths[:b], **index_kwargs)
         target.prepare()
         verify = PreparedVocabularyBlockVerification(self.probabilities, self.drafts, target.probabilities, *args,
             **options, name=self.name + ".verification", rng=o.rng, draft_valid=self.valid,
             target_valid=target.valid, token_limits=o.inputs.query_lengths[:b], workspace=None,
-            draft_tile_masses=self.draft_tile_masses, target_tile_masses=retained["tile_masses"])
+            draft_tile_masses=self.draft_tile_masses, target_tile_masses=retained["tile_masses"], **index_kwargs)
         verify.prepare()
         from .vocabulary_logprobs import PreparedVocabularyParallelLogprobs
 
+        logprobs_kwargs = (
+            dict(sample_indices=self.metadata.sample_indices, batch=b, width=w)
+            if compact_target else {}
+        )
         logprobs = PreparedVocabularyParallelLogprobs(logits, o.completion,
             o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows, o.frame,
             vocabulary=o.requests.vocab_size, offset=start, runtime=o.logprob_runtime, session=o.session,
-            coordinator=o.collectives["coordinator"], name=self.name + ".logprobs")
+            coordinator=o.collectives["coordinator"], name=self.name + ".logprobs", **logprobs_kwargs)
         commit = PreparedSpeculativeCommit(o.requests, verify.output, self.candidates,
             o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows,
             o.completion, o.frame, o.sequence, rng=o.rng, draft_context_lag=0,
@@ -680,7 +715,8 @@ class PreparedParallelDraftRound:
                         base = draft_logits[:, o.logit_offset:o.logit_offset + w - 1]
                         scores = torch.empty_like(draft_logits)[:, o.logit_offset:o.logit_offset + w - 1]
                     copy_kwargs = dict(copy_active=copy_active, copy_tokens=copy_tokens) if fused_copy else {}
-                    for index in range(w - 1):
+                    proposal_steps = getattr(self.full_proposal, "active_steps", w - 1)
+                    for index in range(proposal_steps):
                         state, logits = self.recurrent.step(state, markov_token,
                             hidden[:, index + o.logit_offset].contiguous(), context,
                             None if base is None else base[:, index])
@@ -702,7 +738,8 @@ class PreparedParallelDraftRound:
                             copy_active=copy_active, copy_tokens=copy_tokens, **conf_kw)
                         copy_applied = True
                     elif copy_active is not None:
-                        for index in range(w - 1):
+                        proposal_steps = getattr(self.full_proposal, "active_steps", w - 1)
+                        for index in range(proposal_steps):
                             self.full_proposal.run_step(index, base, drafts, pending=markov_token,
                                 seeds=seed, offsets=base_offset, probabilities=probabilities, valid=valid,
                                 tokens=drafts, tile_masses=draft_tile_masses, token_limits=limits, **conf_kw)
@@ -813,11 +850,20 @@ class PreparedParallelDraftRound:
             proposal.candidates, o.inputs.live_rows, token_capacity=self.target_token_capacity,
             sample_count=b * w, max_query_tokens=w, rotary_offset=proposal.rotary_offsets)
         hidden, logits, auxiliary, records = self.decoder(metadata)
+        pending_context = None
+        use_compact = bool(getattr(self, "use_compact_target_logits", False))
+        if getattr(self, "overlap_context", False):
+            pending_context = self.context.start_prepare(auxiliary, metadata)
         limit_kwargs = {} if token_limits is None else {"token_limits": query_limits}
         if self.vocabulary_parallel:
             target_tile_masses = torch.empty(self.target_mass_shape, dtype=torch.float32, device=logits.device)
-            target_probabilities, target_valid, _ = target.run(logits.view(b, w, -1), proposal.drafts,
-                tile_masses=target_tile_masses, token_limits=query_limits)
+            if use_compact:
+                target_probabilities, target_valid, _ = target.run(logits, proposal.drafts,
+                    tile_masses=target_tile_masses, token_limits=query_limits,
+                    sample_indices=metadata.sample_indices, sample_limits=metadata.lengths)
+            else:
+                target_probabilities, target_valid, _ = target.run(logits.view(b, w, -1), proposal.drafts,
+                    tile_masses=target_tile_masses, token_limits=query_limits)
             if proposal.tile_masses is None:
                 if w > 1:
                     raise ValueError(
@@ -826,8 +872,13 @@ class PreparedParallelDraftRound:
                 draft_masses = torch.empty(self.draft_mass_shape, dtype=torch.float32, device=logits.device)
             else:
                 draft_masses = proposal.tile_masses
-            acceptance = verify.run(probabilities, proposal.drafts, target_probabilities, proposal.valid, target_valid,
-                token_limits=query_limits, draft_tile_masses=draft_masses, target_tile_masses=target_tile_masses)
+            if use_compact:
+                acceptance = verify.run(probabilities, proposal.drafts, target_probabilities, proposal.valid, target_valid,
+                    token_limits=query_limits, draft_tile_masses=draft_masses, target_tile_masses=target_tile_masses,
+                    sample_indices=metadata.sample_indices, sample_limits=metadata.lengths)
+            else:
+                acceptance = verify.run(probabilities, proposal.drafts, target_probabilities, proposal.valid, target_valid,
+                    token_limits=query_limits, draft_tile_masses=draft_masses, target_tile_masses=target_tile_masses)
         else:
             target_scratch = {name: torch.empty(shape, dtype=dtype, device=logits.device)
                               for name, (shape, dtype) in target.layout.items()}
@@ -848,14 +899,24 @@ class PreparedParallelDraftRound:
                 (torch.ones_like(offered) << offered.clamp_max(62)) - 1,
             )
             commit_kwargs["copy_offered_mask"] = proposal.copy_offered_mask & offered_mask
-        committed = commit(logits.view(b, w, -1), acceptance=acceptance, inputs=proposal.candidates, **commit_kwargs)
+        if use_compact:
+            committed = commit(logits, acceptance=acceptance, inputs=proposal.candidates,
+                               sample_indices=metadata.sample_indices, **commit_kwargs)
+        else:
+            committed = commit(logits.view(b, w, -1), acceptance=acceptance, inputs=proposal.candidates, **commit_kwargs)
         counts = committed.emitted_count
         if w > 1:
             self.decoder.commit(counts, records, metadata)
         rows = torch.arange(b, device=hidden.device)
-        hidden = hidden.view(b, w, o.weights.config.text["hidden_size"])[rows, (counts - 1).long().clamp_min(0)]
+        if use_compact:
+            last_indices = metadata.sample_indices.view(b, w)[rows, (counts - 1).long().clamp_min(0)]
+            hidden = hidden[last_indices]
+        else:
+            hidden = hidden.view(b, w, o.weights.config.text["hidden_size"])[rows, (counts - 1).long().clamp_min(0)]
         save_hidden(hidden, o.pool.last_hidden, metadata.state_rows, counts > 0)
-        if self.context is not None:
+        if pending_context is not None:
+            self.context.commit_prepared(pending_context, counts, metadata)
+        elif self.context is not None:
             self.context(auxiliary, counts, metadata)
         return metadata, acceptance, committed
 

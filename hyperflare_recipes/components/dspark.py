@@ -5,6 +5,8 @@
 """Captured DSpark proposals, packed target verification, and accepted-state commits."""
 
 from dataclasses import dataclass
+import itertools
+import weakref
 
 import torch
 import triton
@@ -14,7 +16,9 @@ from hyperflare_recipes.components.speculation import SpeculativeRngState
 
 from hyperflare_recipes.components.collectives import PreparedAllGather
 from ignition.preparation.persistent import persistent_copy
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tensor_metadata import record_numeric_tensor
+from ignition.preparation.tuning import register_finalizer
 from .compressed_mla import PreparedCompressedCacheWriter
 from .embedding import PreparedEmbedding
 from .linear import QuantizedProjection, UnquantizedProjection
@@ -169,11 +173,67 @@ def _context_kv_norm_rope_kernel(
     tl.store(dst + 448 + 2 * pair + 1, (a * sin + b * cos).to(tl.bfloat16))
 
 
+_CONTEXT_OWNERS = weakref.WeakValueDictionary()
+_CONTEXT_HANDLES = itertools.count()
+
+
+@torch.library.custom_op(
+    "flare::start_dspark_context",
+    mutates_args=("buffers", "workspace", "normalized_all"),
+)
+def _start_dspark_context(
+    auxiliary: torch.Tensor,
+    positions: torch.Tensor,
+    buffers: list[torch.Tensor],
+    workspace: torch.Tensor,
+    normalized_all: torch.Tensor,
+    handle: int,
+    stream: int,
+) -> None:
+    owner = _CONTEXT_OWNERS[handle]
+    aux = torch.cuda.ExternalStream(stream, device=auxiliary.device)
+    aux.wait_stream(torch.cuda.current_stream(auxiliary.device))
+    with torch.cuda.stream(aux):
+        owner._run_prepare_inplace(auxiliary, positions, buffers, workspace, normalized_all)
+
+
+@_start_dspark_context.register_fake
+def _fake_start_dspark_context(auxiliary, positions, buffers, workspace, normalized_all, handle, stream):
+    pass
+
+
+@torch.library.custom_op(
+    "flare::join_dspark_context",
+    mutates_args=("buffers", "workspace", "normalized_all"),
+)
+def _join_dspark_context(
+    dependency: torch.Tensor,
+    auxiliary: torch.Tensor,
+    positions: torch.Tensor,
+    buffers: list[torch.Tensor],
+    workspace: torch.Tensor,
+    normalized_all: torch.Tensor,
+    stream: int,
+) -> None:
+    torch.cuda.current_stream(normalized_all.device).wait_stream(
+        torch.cuda.ExternalStream(stream, device=normalized_all.device)
+    )
+
+
+@_join_dspark_context.register_fake
+def _fake_join_dspark_context(
+    dependency, auxiliary, positions, buffers, workspace, normalized_all, stream
+):
+    pass
+
+
 class PreparedContext:
     """Project accepted target feedback into persistent draft context rings."""
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace,
                  cache_format="deepseek_v41", compact_prefill=False, runtime=None, coordinator=None):
+        from hyperflare_recipes.components import collectives
+
         tokens, device = auxiliary.shape[0], auxiliary.device
         self.compact = compact_prefill and metadata.starts.numel() == 1 and metadata.positions.numel() > 128
         if self.compact and tokens != 128:
@@ -187,10 +247,13 @@ class PreparedContext:
         kv = torch.empty((tokens, 512 * len(weights.draft.layers)), dtype=torch.bfloat16, device=device)
         normalized = torch.empty((tokens, 512), dtype=torch.bfloat16, device=device)
         slots = torch.full((tokens,), -1, dtype=torch.int64, device=device)
+        self._gather_runtime = runtime
         if local_hidden == hidden:
             self.gather = None
-            self.project = QuantizedProjection(auxiliary, main_weight, projected,
+            self._main_proj_op = QuantizedProjection(auxiliary, main_weight, projected,
                 session=session, name=name + ".main", workspace=workspace, activation_mode="auto").functional(session=session)
+            self.project = self._main_proj_op
+            overlap_buffers = [projected, main, kv]
         else:
             if world_size < 2 or hidden % world_size != 0 or local_hidden != hidden // world_size:
                 raise ValueError(
@@ -200,11 +263,12 @@ class PreparedContext:
             if runtime is None:
                 raise ValueError("output-sharded draft main_projection requires a collective all-gather runtime")
             local_projected = torch.empty((tokens, local_hidden), dtype=torch.bfloat16, device=device)
-            local_project = QuantizedProjection(auxiliary, main_weight, local_projected,
+            self._main_proj_op = QuantizedProjection(auxiliary, main_weight, local_projected,
                 session=session, name=name + ".main", workspace=workspace, activation_mode="auto").functional(session=session)
             self.gather = _prepare_context_gather(local_projected, projected, runtime=runtime,
                 coordinator=coordinator, session=session, name=name + ".main_gather")
-            self.project = _ShardedMainProjection(local_project, self.gather)
+            self.project = _ShardedMainProjection(self._main_proj_op, self.gather)
+            overlap_buffers = [local_projected, projected, main, kv]
         self.norm = PreparedRMSNorm(projected, weights.draft.main_norm, main,
             eps=weights.config.text["rms_norm_eps"], session=session, name=name + ".main_norm").functional()
         self.context_projection = QuantizedProjection(main, weights.draft.context_kv, kv,
@@ -227,6 +291,105 @@ class PreparedContext:
             writer = PreparedCompressedCacheWriter(normalized, pool.window(index, draft=True), slots,
                 page_size=128, kind="swa", session=session, name=f"{name}.{index}.write", cache_format=cache_format)
             self.stages.append((norm, writer.functional(session=session)))
+        self.handle = next(_CONTEXT_HANDLES)
+        _CONTEXT_OWNERS[self.handle] = self
+        self.stream_handle = (
+            workspace.auxiliary_stream.cuda_stream
+            if isinstance(workspace, ScratchArena) and getattr(workspace, "overlap", False)
+            else None
+        )
+        self._overlap_buffer_layouts = tuple((tuple(t.shape), t.dtype) for t in overlap_buffers)
+        self._overlap_workspace_nbytes = 1
+        self._overlap_supported = (
+            not self.compact
+            and self.fused_stage_norm_rope
+            and self.stream_handle is not None
+            and not isinstance(main_weight, torch.Tensor)
+            and not isinstance(weights.draft.context_kv, torch.Tensor)
+            and not getattr(self._main_proj_op, "sm103", True)
+            and not getattr(self.context_projection, "sm103", True)
+            and getattr(self._main_proj_op, "encoded", None) is None
+            and getattr(self.context_projection, "encoded", None) is None
+            and getattr(self._main_proj_op, "bias", None) is None
+            and getattr(self.context_projection, "bias", None) is None
+            and not getattr(self.norm, "add_residual", True)
+            and not getattr(self.norm, "stage_source", True)
+            and (self.gather is None or (hasattr(self.gather, "parts") and not collectives._roce(runtime)))
+        )
+        if self._overlap_supported:
+            register_finalizer(session, self._finalize_overlap)
+
+    def _finalize_overlap(self):
+        main_bytes = getattr(self._main_proj_op, "workspace_nbytes", None)
+        if main_bytes is None:
+            main_bytes = self._main_proj_op.plan.memory_requirements().scratch_nbytes
+        kv_bytes = getattr(self.context_projection, "workspace_nbytes", None)
+        if kv_bytes is None:
+            kv_bytes = self.context_projection.plan.memory_requirements().scratch_nbytes
+        self._overlap_workspace_nbytes = max(256, ((max(int(main_bytes), int(kv_bytes)) + 255) // 256) * 256)
+
+    def can_overlap_with(self, *other_runtimes) -> bool:
+        return self._overlap_supported and (
+            self._gather_runtime is None or all(rt is not self._gather_runtime for rt in other_runtimes)
+        )
+
+    def _run_prepare_inplace(self, auxiliary, positions, buffers, workspace_buf, normalized_all):
+        from b12x.gemm import blockscaled
+
+        if self.gather is None:
+            projected, main, kv = buffers
+            blockscaled.mm(
+                auxiliary, self._main_proj_op.weight, out=projected,
+                plan=self._main_proj_op.plan, workspace=workspace_buf,
+            )
+        else:
+            local_projected, projected, main, kv = buffers
+            blockscaled.mm(
+                auxiliary, self._main_proj_op.weight, out=local_projected,
+                plan=self._main_proj_op.plan, workspace=workspace_buf,
+            )
+            for (begin, end), part in zip(self.gather.bounds, self.gather.parts, strict=True):
+                part.run_eager(local_projected[begin:end], projected[begin:end])
+        torch.ops.b12x.hyperconnection_grouped_rmsnorm(
+            projected, self.norm.weight, main, self.norm.eps, self.norm.plan.handle, self.norm.zero_centered,
+        )
+        blockscaled.mm(
+            main, self.context_projection.weight, out=kv,
+            plan=self.context_projection.plan, workspace=workspace_buf,
+        )
+        _context_kv_norm_rope_kernel[(kv.shape[0], len(self.stages))](
+            kv, self.kv_norm_weights, positions, self.rotary.frequencies[False], normalized_all,
+            kv.stride(0), normalized_all.stride(0), normalized_all.stride(1), self.eps, num_warps=4,
+        )
+
+    def start_prepare(self, auxiliary, metadata):
+        """Launch context projection, gather, RMSNorm, and RoPE on the auxiliary stream."""
+        device = auxiliary.device
+        buffers = [torch.empty(shape, dtype=dtype, device=device) for shape, dtype in self._overlap_buffer_layouts]
+        workspace_buf = torch.empty((self._overlap_workspace_nbytes,), dtype=torch.uint8, device=device)
+        normalized_all = torch.empty(
+            (len(self.stages), auxiliary.shape[0], 512), dtype=torch.bfloat16, device=device
+        )
+        _start_dspark_context(
+            auxiliary, metadata.positions, buffers, workspace_buf, normalized_all,
+            self.handle, self.stream_handle,
+        )
+        return auxiliary, metadata.positions, buffers, workspace_buf, normalized_all
+
+    def commit_prepared(self, state, counts, metadata):
+        """Join the auxiliary context preparation stream and commit accepted KV rows."""
+        auxiliary, positions, buffers, workspace_buf, normalized_all = state
+        _join_dspark_context(
+            counts, auxiliary, positions, buffers, workspace_buf, normalized_all, self.stream_handle
+        )
+        m = metadata
+        positions = m.positions
+        offset = positions - m.starts[m.requests]
+        count = counts[m.requests]
+        live = (positions >= 0) & (offset < count) & (offset >= (count - 128).clamp_min(0))
+        slots = torch.where(live, m.state_rows[m.requests] * 128 + positions % 128, -1)
+        for index, (_, writer) in enumerate(self.stages):
+            writer(normalized_all[index], slots)
 
     def functional(self):
         return self
